@@ -20,13 +20,29 @@ Analisi per ALCOR basata su ROOT/RDataFrame. Lavora **direttamente sui decoded**
   - `decoder/bin/` binari finali usati dagli script
 
 ## Pipeline consigliata (decoded → output)
-1) **(opz.) Scan raw**
-   - verifica spill/rollover/hits nei `.dat`
-
-2) **Decode raw → decoded ROOT**
+1) **Decode raw → decoded ROOT**
    - `script/decode_raw.sh /path/to/raw_or_run [--force]`
    - usa il decoder e scrive in `../data/<run>/kc705-196/decoded/alcdaq.fifo_*.root`
    - default decoder: `decoder/bin/decoder` (risolto via `ALCOR_ANA_GE`) (override con `DECODER_BIN=...`)
+
+2) **Fine calibration (laser)**
+   - `script/run_fine_calibration.sh -i ../data/calibration`
+   - output: `calibration/fine_calibration.root` + `output/fine_calibration.pdf`
+   - contiene: `hFineMin`, `hFineMax`, `hFineEntries`, `hFineTdc0..3`, **`hFineLut` (CDF)**
+
+3) **Channel calibration (laser)**
+   - `script/run_channel_calibration.sh -i ../data/calibration -k calibration/fine_calibration.root`
+   - output: `calibration/channel_calibration.root`
+   - curve ToT→correzione per canale, riferite al canale di riferimento (default 19)
+
+4) **Coincidence (run di test)**
+   - `script/run_coincidence.sh -i ../data/<run_test> -p config/coincidence_17_19.txt -k calibration/fine_calibration.root -K calibration/channel_calibration.root`
+   - output: PDF + ROOT + TXT in `output/`
+   - include: search/coinc window, FWHM, 2D Δt vs fine (search e coinc-only), profili
+
+5) **(Opz.) Validazione LUT fine**
+   - `script/run_fine_validation.sh -i ../data/calibration`
+   - output: PDF + ROOT + TXT in `output/`
 
 ## Decoder (self‑contained)
 - Sorgenti: `decoder/src/`
@@ -36,30 +52,6 @@ Analisi per ALCOR basata su ROOT/RDataFrame. Lavora **direttamente sui decoded**
   - output principale: `decoder/bin/decoder`
   - usa dipendenze di sistema (ROOT/Boost; uHAL solo per readout tools)
 
-3) **Fine calibration (laser)**
-   - `script/run_fine_calibration.sh -i ../data/calibration`
-   - output: `calibration/fine_calibration.root` + `output/fine_calibration.pdf`
-   - contiene: `hFineMin`, `hFineMax`, `hFineEntries`, `hFineTdc0..3`, **`hFineLut` (CDF)**
-
-4) **Channel calibration (laser)**
-   - `script/run_channel_calibration.sh -i ../data/calibration -k calibration/fine_calibration.root`
-   - output: `calibration/channel_calibration.root`
-   - curve ToT→correzione per canale, riferite al canale di riferimento (default 19)
-
-5) **Coincidence (golden run)**
-   - `script/run_coincidence.sh -i ../data/golden_run -p config/coincidence_17_19.txt -k calibration/fine_calibration.root`
-   - output: PDF + ROOT + TXT in `output/`
-   - include: search/coinc window, FWHM, 2D Δt vs fine (search e coinc-only), profili
-
-   - output: PDF con overlay 1D e 2D (4 pannelli) + 2D coinc‑only (4 pannelli)
-
-
-   - `script/run_fine_validation.sh -i ../data/calibration`
-   - output: PDF + ROOT + TXT in `output/`
-   - include anche overlay Δt **no‑LUT vs LUT** (search + coinc) sui dati di calibrazione (ch 17/19)
-
-   - usa window=20 ns, duration=20 ns, fine_cut=0, LUT on/off
-
 ## Script (script/)
 - `decode_raw.sh` — raw `.dat` → decoded ROOT
 - `build_decoder.sh` — build del decoder da `decoder/src/`
@@ -68,8 +60,6 @@ Analisi per ALCOR basata su ROOT/RDataFrame. Lavora **direttamente sui decoded**
 - `run_channel_calibration.sh` — calibrazione ToT canale‑per‑canale
 - `run_coincidence.sh` — analisi coincidenze, PDF/ROOT/TXT
 - `run_plot.sh` — plot per canali (1D, spill)
-  (opzioni hard‑coded in testa allo script: `coinc_duration_ns`, `coinc_fine_cut`, ecc.)
-  Produce confronti: no‑fine vs fine, fine vs fine+channel, no‑fine vs fine+channel.
 
 ## Macro (macro/)
 - `analysis_io.h` — risoluzione input (decoded)
@@ -94,6 +84,9 @@ Analisi per ALCOR basata su ROOT/RDataFrame. Lavora **direttamente sui decoded**
   - Il tempo è calcolato come: `time_ns = (time_tick - fine_fraction) * tick_ns`.
   - Se `hFineLut` non è presente, si usa la mappatura lineare min/max con wrap al cut.
   - Per forzare il **no‑LUT** (solo min/max) anche se `hFineLut` esiste: `--no-lut`
+  - **Time‑walk (ToT)**: corretto dalla calibrazione canale‑per‑canale (curve ToT→Δt).
+    - Rilevante quando la ToT varia; tende a restringere il picco di coincidenza.
+    - Disattivabile con `--no-chan-calib` in `run_coincidence.sh`.
   - La calibrazione di canale è **simmetrica di default** (correzione divisa tra ref e canale).
     - Disabilita con `run_channel_calibration.sh --no-symmetrize-ref`.
     - In modalità simmetrica, il riferimento è la **media** delle correzioni dei canali coinvolti.
