@@ -1,0 +1,2292 @@
+#include <ROOT/RDataFrame.hxx>
+#include <TCanvas.h>
+#include <TFile.h>
+#include <TH1D.h>
+#include <TH2D.h>
+#include <TProfile.h>
+#include <TF1.h>
+#include <TFitResultPtr.h>
+#include <THStack.h>
+#include <TLegend.h>
+#include <TLatex.h>
+#include <TPad.h>
+#include <TParameter.h>
+#include <TRandom3.h>
+#include <TStyle.h>
+#include <TSystem.h>
+
+#include "analysis_io.h"
+#include "analysis_time.h"
+
+#include <algorithm>
+#include <array>
+#include <chrono>
+#include <cmath>
+#include <cstdlib>
+#include <cstdint>
+#include <cctype>
+#include <fstream>
+#include <iostream>
+#include <memory>
+#include <iomanip>
+#include <limits>
+#include <sstream>
+#include <string>
+#include <unordered_map>
+#include <unordered_set>
+#include <vector>
+
+namespace {
+bool WantsHelp(const char *arg)
+{
+  if (!arg) {
+    return true;
+  }
+  std::string val(arg);
+  return val == "-h" || val == "--help" || val == "help";
+}
+
+void PrintCoincidenceHelp()
+{
+  std::cout << "coincidence_rdf usage:" << std::endl;
+  std::cout << "  coincidence_rdf(\"/path/to/decoded.root\", \"pairs.txt\", \"out.pdf\", 10.0, 320.0, true,"
+               " 15.0, \"fine_calibration.root\", false, \"channel_calibration.root\", 0, \"out.root\", \"out.txt\", true)"
+            << std::endl;
+  std::cout << "Inputs:" << std::endl;
+  std::cout << "  decoded dir must contain alcdaq.fifo_*.root with TTree 'alcor'" << std::endl;
+  std::cout << "  required branches: type,column,pixel,tdc,fifo,rollover,coarse,fine" << std::endl;
+  std::cout << "  channels are 0..31, computed as column*4 + pixel when missing" << std::endl;
+  std::cout << "Pairs file format: chA chB [window_ns], '#' for comments" << std::endl;
+  std::cout << "  group lines: group ch1 ch2 ch3 [window=ns] (3+ channels)" << std::endl;
+  std::cout << "  use window=10 or 10.0 for integer windows to avoid ambiguity" << std::endl;
+  std::cout << "  use the 'group' prefix for 3+ channel coincidences" << std::endl;
+  std::cout << "Notes: type==1 hits, type==15 spill boundary, clock_mhz sets tick size" << std::endl;
+  std::cout << "  spill markers (type==15) are always used when spill is not provided" << std::endl;
+  std::cout << "  coincidence uses leading-edge timestamps with valid duration (ToT)" << std::endl;
+  std::cout << "  max duration can be set; <=0 disables duration filter (leading edges only)" << std::endl;
+  std::cout << "  group coincidence is evaluated per hit of the first channel in the group" << std::endl;
+  std::cout << "  group plots show t_i - mean for the matched timestamps" << std::endl;
+  std::cout << "  pair-mean plot: mean(t17,t19) - mean(t22,t23) using leading edges" << std::endl;
+  std::cout << "  coincidence-hit distributions are appended to the same PDF" << std::endl;
+  std::cout << "  only hits with 0 < ToT <= max_duration_ns (leading-trailing) are considered" << std::endl;
+  std::cout << "  fine calibration file uses hFineMin/hFineMax; default formula used when missing" << std::endl;
+  std::cout << "  channel calibration uses hChanCalib_chXX vs ToT; applied to leading-edge times" << std::endl;
+  std::cout << "  force_window=true ignores per-line windows in the pairs file" << std::endl;
+  std::cout << "  fine_cut excludes hits with |fine - cut| <= fine_cut (fine units)" << std::endl;
+  std::cout << "  out_root writes histograms to a ROOT file when non-empty" << std::endl;
+  std::cout << "  out_txt writes search/coincidence histograms and FWHM info when non-empty" << std::endl;
+  std::cout << "  use_lut=false disables LUT even if hFineLut is present" << std::endl;
+}
+
+struct Hit {
+  int run_id = 0;
+  int device = 0;
+  int fifo = 0;
+  int type = 0;
+  int counter = 0;
+  int column = 0;
+  int pixel = 0;
+  int tdc = 0;
+  int rollover = 0;
+  int coarse = 0;
+  int fine = 0;
+  int channel = -1;
+  long long time_tick = 0;
+  double time_ns = 0.0;
+  int spill = 0;
+};
+
+struct HitRef {
+  double time_ns = 0.0;
+  size_t index = 0;
+};
+
+struct DurationInfo {
+  std::vector<char> leading_mask;
+  std::vector<int> leading_to_trailing;
+};
+
+int BinsForRange(double lo, double hi)
+{
+  double span = hi - lo;
+  if (span <= 0.0) {
+    return 1;
+  }
+  int bins = static_cast<int>(span);
+  if (bins < 10) {
+    bins = 10;
+  }
+  if (bins > 200) {
+    bins = 200;
+  }
+  return bins;
+}
+
+
+std::string SanitizeTag(std::string value)
+{
+  for (auto &ch : value) {
+    if (!std::isalnum(static_cast<unsigned char>(ch)) && ch != '_') {
+      ch = '_';
+    }
+  }
+  return value;
+}
+
+double ComputeFwhmFromHist(const TH1D &hist, double bkg, double &x_left, double &x_right)
+{
+  x_left = std::numeric_limits<double>::quiet_NaN();
+  x_right = std::numeric_limits<double>::quiet_NaN();
+  const int nbins = hist.GetNbinsX();
+  if (nbins < 2) {
+    return std::numeric_limits<double>::quiet_NaN();
+  }
+
+  const int ib_max = hist.GetMaximumBin();
+  const double peak = hist.GetBinContent(ib_max);
+  const double peak_sub = peak - bkg;
+  if (peak_sub <= 0.0) {
+    return std::numeric_limits<double>::quiet_NaN();
+  }
+  const double half = bkg + 0.5 * peak_sub;
+
+  int i = ib_max;
+  while (i > 1 && hist.GetBinContent(i) > half) {
+    --i;
+  }
+  if (i < ib_max) {
+    const double y1 = hist.GetBinContent(i);
+    const double y2 = hist.GetBinContent(i + 1);
+    const double x1 = hist.GetBinCenter(i);
+    const double x2 = hist.GetBinCenter(i + 1);
+    if (y2 != y1) {
+      x_left = x1 + (half - y1) * (x2 - x1) / (y2 - y1);
+    } else {
+      x_left = x1;
+    }
+  }
+
+  i = ib_max;
+  while (i < nbins && hist.GetBinContent(i) > half) {
+    ++i;
+  }
+  if (i > ib_max) {
+    const double y1 = hist.GetBinContent(i - 1);
+    const double y2 = hist.GetBinContent(i);
+    const double x1 = hist.GetBinCenter(i - 1);
+    const double x2 = hist.GetBinCenter(i);
+    if (y2 != y1) {
+      x_right = x1 + (half - y1) * (x2 - x1) / (y2 - y1);
+    } else {
+      x_right = x2;
+    }
+  }
+
+  if (std::isfinite(x_left) && std::isfinite(x_right) && x_right > x_left) {
+    return x_right - x_left;
+  }
+  return std::numeric_limits<double>::quiet_NaN();
+}
+
+double FitBackgroundFromSidebandsCore(TH1D &hist_search, double window_ns)
+{
+  if (window_ns <= 0.0) {
+    return 0.0;
+  }
+  const double pad = 100.0;
+  const double band = window_ns * 4.0;
+  double left_lo = -pad - band;
+  double left_hi = -pad;
+  double right_lo = pad;
+  double right_hi = pad + band;
+
+  const double hist_lo = hist_search.GetXaxis()->GetXmin();
+  const double hist_hi = hist_search.GetXaxis()->GetXmax();
+  left_lo = std::max(left_lo, hist_lo);
+  left_hi = std::min(left_hi, hist_hi);
+  right_lo = std::max(right_lo, hist_lo);
+  right_hi = std::min(right_hi, hist_hi);
+
+  double bkg_left = 0.0;
+  double err_left = 0.0;
+  bool ok_left = false;
+  if (left_hi > left_lo) {
+    TF1 f_left("f_sideband_left", "pol0", left_lo, left_hi);
+    TFitResultPtr res_left = hist_search.Fit(&f_left, "RQN");
+    bkg_left = f_left.GetParameter(0);
+    err_left = f_left.GetParError(0);
+    ok_left = std::isfinite(bkg_left);
+  }
+
+  double bkg_right = 0.0;
+  double err_right = 0.0;
+  bool ok_right = false;
+  if (right_hi > right_lo) {
+    TF1 f_right("f_sideband_right", "pol0", right_lo, right_hi);
+    TFitResultPtr res_right = hist_search.Fit(&f_right, "RQN");
+    bkg_right = f_right.GetParameter(0);
+    err_right = f_right.GetParError(0);
+    ok_right = std::isfinite(bkg_right);
+  }
+
+  double weight_left = 0.0;
+  double weight_right = 0.0;
+  if (ok_left) {
+    weight_left = (err_left > 0.0) ? 1.0 / (err_left * err_left) : 1.0;
+  }
+  if (ok_right) {
+    weight_right = (err_right > 0.0) ? 1.0 / (err_right * err_right) : 1.0;
+  }
+
+  if (weight_left + weight_right > 0.0) {
+    return (bkg_left * weight_left + bkg_right * weight_right) / (weight_left + weight_right);
+  }
+  return 0.0;
+}
+
+double FitBackgroundFromSidebands(const TH1D &hist_search, double window_ns)
+{
+  std::unique_ptr<TH1D> tmp(static_cast<TH1D *>(hist_search.Clone("h_sideband_tmp")));
+  tmp->SetDirectory(nullptr);
+  return FitBackgroundFromSidebandsCore(*tmp, window_ns);
+}
+
+bool ComputeFwhmBootstrap(const TH1D &hist_coinc,
+                          const TH1D &hist_search,
+                          double window_ns,
+                          int trials,
+                          double &fwhm_mean,
+                          double &fwhm_sigma,
+                          double &bkg_mean,
+                          double &bkg_sigma)
+{
+  if (trials < 1) {
+    return false;
+  }
+  TRandom3 rng(0);
+  auto tmp_coinc = std::unique_ptr<TH1D>(static_cast<TH1D *>(hist_coinc.Clone("h_boot_coinc")));
+  auto tmp_search = std::unique_ptr<TH1D>(static_cast<TH1D *>(hist_search.Clone("h_boot_search")));
+  tmp_coinc->SetDirectory(nullptr);
+  tmp_search->SetDirectory(nullptr);
+
+  std::vector<double> fwhm_vals;
+  std::vector<double> bkg_vals;
+  fwhm_vals.reserve(static_cast<size_t>(trials));
+  bkg_vals.reserve(static_cast<size_t>(trials));
+
+  const int bins_coinc = hist_coinc.GetNbinsX();
+  const int bins_search = hist_search.GetNbinsX();
+
+  for (int t = 0; t < trials; ++t) {
+    for (int b = 1; b <= bins_coinc; ++b) {
+      double mu = hist_coinc.GetBinContent(b);
+      if (mu < 0.0) {
+        mu = 0.0;
+      }
+      tmp_coinc->SetBinContent(b, rng.PoissonD(mu));
+    }
+    for (int b = 1; b <= bins_search; ++b) {
+      double mu = hist_search.GetBinContent(b);
+      if (mu < 0.0) {
+        mu = 0.0;
+      }
+      tmp_search->SetBinContent(b, rng.PoissonD(mu));
+    }
+
+    const double bkg = FitBackgroundFromSidebandsCore(*tmp_search, window_ns);
+    double x_left = 0.0;
+    double x_right = 0.0;
+    const double fwhm = ComputeFwhmFromHist(*tmp_coinc, bkg, x_left, x_right);
+    if (!std::isfinite(fwhm)) {
+      continue;
+    }
+    fwhm_vals.push_back(fwhm);
+    bkg_vals.push_back(bkg);
+  }
+
+  if (fwhm_vals.empty()) {
+    return false;
+  }
+
+  auto mean_std = [](const std::vector<double> &vals, double &mean, double &sigma) {
+    double sum = 0.0;
+    for (double v : vals) {
+      sum += v;
+    }
+    mean = sum / static_cast<double>(vals.size());
+    double var = 0.0;
+    for (double v : vals) {
+      double d = v - mean;
+      var += d * d;
+    }
+    var /= static_cast<double>(vals.size());
+    sigma = std::sqrt(std::max(0.0, var));
+  };
+
+  mean_std(fwhm_vals, fwhm_mean, fwhm_sigma);
+  mean_std(bkg_vals, bkg_mean, bkg_sigma);
+  return true;
+}
+
+std::vector<int> DefaultColors()
+{
+  return {
+      kAzure + 2,
+      kOrange + 7,
+      kGreen + 2,
+      kMagenta + 1,
+      kRed + 1,
+      kCyan + 2,
+      kViolet + 1,
+      kPink + 7,
+  };
+}
+
+void GridForCount(size_t count, int &cols, int &rows)
+{
+  if (count == 0) {
+    cols = 1;
+    rows = 1;
+    return;
+  }
+  cols = static_cast<int>(std::ceil(std::sqrt(static_cast<double>(count))));
+  rows = static_cast<int>(std::ceil(static_cast<double>(count) / cols));
+}
+
+bool IsLeadingTdc(int tdc)
+{
+  return (tdc & 0x1) == 0;
+}
+
+bool IsTrailingTdc(int tdc)
+{
+  return (tdc & 0x1) == 1;
+}
+
+bool IsValidTdcId(int tdc)
+{
+  return tdc >= 0 && tdc <= 3;
+}
+
+int TdcPairIndex(int tdc)
+{
+  return tdc >> 1;
+}
+
+struct ScopedTimer {
+  std::string label;
+  std::chrono::steady_clock::time_point start;
+  explicit ScopedTimer(std::string label_in)
+      : label(std::move(label_in)),
+        start(std::chrono::steady_clock::now())
+  {}
+  ~ScopedTimer()
+  {
+    auto end = std::chrono::steady_clock::now();
+    std::chrono::duration<double> elapsed = end - start;
+    std::cout << "Elapsed time (" << label << "): " << elapsed.count() << " s" << std::endl;
+  }
+};
+
+bool StartsWith(const std::string &value, const std::string &prefix)
+{
+  return value.rfind(prefix, 0) == 0;
+}
+
+bool ParseChannelToken(const std::string &token, int &value)
+{
+  char *end = nullptr;
+  long parsed = std::strtol(token.c_str(), &end, 10);
+  if (!end || *end != '\0') {
+    return false;
+  }
+  if (parsed < 0 || parsed > 31) {
+    return false;
+  }
+  value = static_cast<int>(parsed);
+  return true;
+}
+
+bool ParseDoubleToken(const std::string &token, double &value)
+{
+  char *end = nullptr;
+  value = std::strtod(token.c_str(), &end);
+  if (!end || *end != '\0') {
+    return false;
+  }
+  return true;
+}
+
+bool ParseWindowToken(const std::string &token, double &value)
+{
+  std::string trimmed = token;
+  if (StartsWith(trimmed, "w=")) {
+    trimmed = trimmed.substr(2);
+  } else if (StartsWith(trimmed, "window=")) {
+    trimmed = trimmed.substr(7);
+  } else {
+    return false;
+  }
+  if (!ParseDoubleToken(trimmed, value)) {
+    return false;
+  }
+  return value > 0.0;
+}
+
+uint64_t GroupKey(int run_id, int channel, int spill)
+{
+  uint64_t key = static_cast<uint64_t>(run_id);
+  key = (key << 40) | (static_cast<uint64_t>(channel & 0xff) << 32) | static_cast<uint32_t>(spill);
+  return key;
+}
+
+uint64_t RunSpillKey(int run_id, int spill)
+{
+  return (static_cast<uint64_t>(run_id) << 32) | static_cast<uint32_t>(spill);
+}
+
+int ValueForVar(const Hit &hit, const std::string &var)
+{
+  if (var == "device") {
+    return hit.device;
+  }
+  if (var == "fifo") {
+    return hit.fifo;
+  }
+  if (var == "type") {
+    return hit.type;
+  }
+  if (var == "counter") {
+    return hit.counter;
+  }
+  if (var == "column") {
+    return hit.column;
+  }
+  if (var == "pixel") {
+    return hit.pixel;
+  }
+  if (var == "tdc") {
+    return hit.tdc;
+  }
+  if (var == "rollover") {
+    return hit.rollover;
+  }
+  if (var == "coarse") {
+    return hit.coarse;
+  }
+  if (var == "fine") {
+    return hit.fine;
+  }
+  return 0;
+}
+
+DurationInfo ComputeDurationInfo(const std::vector<Hit> &hits,
+                                 const analysis_time::FineCalib &fine_calib,
+                                 double tick_ns,
+                                 double max_duration_ns,
+                                 bool use_fine)
+{
+  DurationInfo info;
+  info.leading_mask.assign(hits.size(), 0);
+  info.leading_to_trailing.assign(hits.size(), -1);
+  if (hits.empty()) {
+    return info;
+  }
+
+  std::unordered_map<uint64_t, std::vector<size_t>> groups;
+  groups.reserve(hits.size());
+  for (size_t i = 0; i < hits.size(); ++i) {
+    groups[GroupKey(hits[i].run_id, hits[i].channel, hits[i].spill)].push_back(i);
+  }
+
+  struct EdgeRef {
+    long long time_tick = 0;
+    int fine = 0;
+    int tdc = 0;
+    size_t index = 0;
+  };
+
+  for (auto &kv : groups) {
+    auto &indices = kv.second;
+    std::vector<EdgeRef> edges;
+    edges.reserve(indices.size());
+    for (size_t idx : indices) {
+      edges.push_back({hits[idx].time_tick, hits[idx].fine, hits[idx].tdc, idx});
+    }
+    std::sort(edges.begin(), edges.end(), [](const EdgeRef &a, const EdgeRef &b) {
+      if (a.time_tick != b.time_tick) {
+        return a.time_tick < b.time_tick;
+      }
+      return a.fine < b.fine;
+    });
+
+    std::array<bool, 2> have_leading = {false, false};
+    std::array<double, 2> leading_time_ns = {0.0, 0.0};
+    std::array<size_t, 2> leading_idx = {0, 0};
+    std::array<int, 2> leading_tdc = {-1, -1};
+
+    for (const auto &edge : edges) {
+      if (!IsLeadingTdc(edge.tdc) && !IsTrailingTdc(edge.tdc)) {
+        continue;
+      }
+      if (!IsValidTdcId(edge.tdc)) {
+        continue;
+      }
+      int pair = TdcPairIndex(edge.tdc);
+      if (pair < 0 || pair > 1) {
+        continue;
+      }
+      const auto &hit = hits[edge.index];
+      int tdc_index = analysis_time::TdcIndex(hit.fifo, hit.column, hit.pixel, hit.tdc);
+      double time_ns =
+          analysis_time::TimeNsFromTick(fine_calib, edge.time_tick, edge.fine, tdc_index, tick_ns, use_fine);
+      if (IsLeadingTdc(edge.tdc)) {
+        leading_time_ns[pair] = time_ns;
+        leading_idx[pair] = edge.index;
+        leading_tdc[pair] = edge.tdc;
+        have_leading[pair] = true;
+        continue;
+      }
+      if (!have_leading[pair]) {
+        continue;
+      }
+      if (leading_tdc[pair] < 0 || edge.tdc != (leading_tdc[pair] ^ 0x1)) {
+        continue;
+      }
+      double dt_ns = time_ns - leading_time_ns[pair];
+      if (dt_ns > 0.0 && dt_ns <= max_duration_ns) {
+        info.leading_mask[leading_idx[pair]] = 1;
+        info.leading_to_trailing[leading_idx[pair]] = static_cast<int>(edge.index);
+      }
+      have_leading[pair] = false;
+    }
+  }
+
+  return info;
+}
+
+struct PairConfig {
+  int channel_a = -1;
+  int channel_b = -1;
+  double window_ns = 0.0;
+  double search_window_ns = 0.0;
+  long long count = 0;
+  std::unique_ptr<TH1D> hist_search;
+  std::unique_ptr<TH1D> hist_coinc;
+  std::unique_ptr<TH2D> hist_dt_fine_a;
+  std::unique_ptr<TH2D> hist_dt_fine_b;
+  std::unique_ptr<TH2D> hist_dt_fine_coinc_a;
+  std::unique_ptr<TH2D> hist_dt_fine_coinc_b;
+  std::unique_ptr<TProfile> prof_dt_fine_coinc_a;
+  std::unique_ptr<TProfile> prof_dt_fine_coinc_b;
+  std::vector<char> coincident_hits;
+};
+
+struct GroupConfig {
+  std::vector<int> channels;
+  double window_ns = 0.0;
+  long long count = 0;
+  std::vector<std::unique_ptr<TH1D>> hists;
+};
+
+struct CoincPlotGroup {
+  std::string kind;
+  std::string name;
+  std::string title;
+  std::vector<std::unique_ptr<TH1D>> hists;
+};
+
+struct CoincPlotSet {
+  std::string label;
+  std::string title_prefix;
+  std::vector<int> channels;
+  std::vector<CoincPlotGroup> groups;
+};
+
+struct PairStats {
+  double fwhm = std::numeric_limits<double>::quiet_NaN();
+  double fwhm_err = std::numeric_limits<double>::quiet_NaN();
+  double bkg = std::numeric_limits<double>::quiet_NaN();
+  double bkg_err = std::numeric_limits<double>::quiet_NaN();
+  double x_left = std::numeric_limits<double>::quiet_NaN();
+  double x_right = std::numeric_limits<double>::quiet_NaN();
+  long long entries = 0;
+  int boot_trials = 0;
+};
+
+bool FindNearestInWindow(const std::vector<HitRef> &hits, double time_ns, double window_ns, size_t &index)
+{
+  if (hits.empty()) {
+    return false;
+  }
+  const double lo = time_ns - window_ns;
+  const double hi = time_ns + window_ns;
+  auto it = std::lower_bound(hits.begin(), hits.end(), lo,
+                             [](const HitRef &hit, double value) { return hit.time_ns < value; });
+  bool found = false;
+  double best_dt = 0.0;
+  for (; it != hits.end() && it->time_ns <= hi; ++it) {
+    double dt = std::abs(it->time_ns - time_ns);
+    if (!found || dt < best_dt) {
+      found = true;
+      best_dt = dt;
+      index = it->index;
+    }
+  }
+  return found;
+}
+
+std::string ChannelListLabel(const std::vector<int> &channels)
+{
+  std::ostringstream label;
+  for (size_t i = 0; i < channels.size(); ++i) {
+    if (i > 0) {
+      label << ",";
+    }
+    label << channels[i];
+  }
+  return label.str();
+}
+
+int BinsForWindow(double window_ns)
+{
+  int bins = static_cast<int>(std::ceil(window_ns * 4.0));
+  if (bins < 50) {
+    bins = 50;
+  }
+  if (bins > 400) {
+    bins = 400;
+  }
+  return bins;
+}
+
+bool LoadCoincidenceConfig(const std::string &path,
+                           double default_window_ns,
+                           bool force_window,
+                           std::vector<PairConfig> &pairs,
+                           std::vector<GroupConfig> &groups,
+                           std::unordered_set<int> &channels)
+{
+  std::ifstream fin(path);
+  if (!fin) {
+    std::cerr << "Failed to open pairs file: " << path << std::endl;
+    return false;
+  }
+
+  std::string line;
+  int line_no = 0;
+  while (std::getline(fin, line)) {
+    ++line_no;
+    auto comment_pos = line.find('#');
+    if (comment_pos != std::string::npos) {
+      line = line.substr(0, comment_pos);
+    }
+    std::istringstream iss(line);
+    std::vector<std::string> tokens;
+    std::string token;
+    while (iss >> token) {
+      tokens.push_back(token);
+    }
+    if (tokens.empty()) {
+      continue;
+    }
+
+    bool force_group = false;
+    if (tokens[0] == "group" || tokens[0] == "multi" || tokens[0] == "nfold") {
+      force_group = true;
+      tokens.erase(tokens.begin());
+    }
+    if (tokens.empty()) {
+      std::cerr << "Skipping invalid line " << line_no << std::endl;
+      continue;
+    }
+
+    double window_ns = default_window_ns;
+    double parsed_window = 0.0;
+    if (!tokens.empty()) {
+      const std::string &last = tokens.back();
+      if (ParseWindowToken(last, parsed_window)) {
+        window_ns = parsed_window;
+        tokens.pop_back();
+      } else {
+        int tmp = 0;
+        if (!ParseChannelToken(last, tmp)) {
+          if (ParseDoubleToken(last, parsed_window)) {
+            window_ns = parsed_window;
+            tokens.pop_back();
+          }
+        }
+      }
+    }
+    if (force_window) {
+      window_ns = default_window_ns;
+    }
+    if (window_ns <= 0.0) {
+      window_ns = default_window_ns;
+    }
+
+    std::vector<int> channel_list;
+    channel_list.reserve(tokens.size());
+    std::unordered_set<int> local_seen;
+    bool bad_line = false;
+    for (const auto &tok : tokens) {
+      int ch = -1;
+      if (!ParseChannelToken(tok, ch)) {
+        bad_line = true;
+        break;
+      }
+      if (local_seen.find(ch) != local_seen.end()) {
+        bad_line = true;
+        break;
+      }
+      local_seen.insert(ch);
+      channel_list.push_back(ch);
+    }
+    if (bad_line || channel_list.size() < 2) {
+      std::cerr << "Skipping invalid line " << line_no << std::endl;
+      continue;
+    }
+
+    if (force_group) {
+      if (channel_list.size() < 3) {
+        std::cerr << "Skipping invalid group on line " << line_no << std::endl;
+        continue;
+      }
+      GroupConfig cfg;
+      cfg.channels = channel_list;
+      cfg.window_ns = window_ns;
+      groups.push_back(std::move(cfg));
+      for (int ch : channel_list) {
+        channels.insert(ch);
+      }
+      continue;
+    }
+
+    if (channel_list.size() > 2) {
+      std::cerr << "Skipping group on line " << line_no << " (use 'group' prefix)" << std::endl;
+      continue;
+    }
+
+    if (channel_list.size() != 2 || channel_list[0] == channel_list[1]) {
+      std::cerr << "Skipping invalid pair on line " << line_no << std::endl;
+      continue;
+    }
+    PairConfig cfg;
+    cfg.channel_a = channel_list[0];
+    cfg.channel_b = channel_list[1];
+    cfg.window_ns = window_ns;
+    pairs.push_back(std::move(cfg));
+    channels.insert(channel_list[0]);
+    channels.insert(channel_list[1]);
+  }
+  return true;
+}
+
+void InitGroupHists(std::vector<GroupConfig> &groups)
+{
+  if (groups.empty()) {
+    return;
+  }
+  auto colors = DefaultColors();
+  for (size_t g = 0; g < groups.size(); ++g) {
+    auto &group = groups[g];
+    if (group.channels.empty()) {
+      continue;
+    }
+    const double hist_window_ns = group.window_ns * 2.2;
+    const int bins = BinsForWindow(hist_window_ns);
+    const std::string label = ChannelListLabel(group.channels);
+
+    group.hists.clear();
+    group.hists.reserve(group.channels.size());
+    for (size_t i = 0; i < group.channels.size(); ++i) {
+      std::ostringstream title;
+      title << "group ch " << label << " (t_i - mean, window " << group.window_ns << " ns);"
+            << "#Deltat to mean [ns]; entries";
+      std::string name = "h_group_dtmean_g" + std::to_string(g) + "_ch" + std::to_string(group.channels[i]);
+      auto hist = std::make_unique<TH1D>(name.c_str(),
+                                         title.str().c_str(),
+                                         bins,
+                                         -hist_window_ns,
+                                         hist_window_ns);
+      hist->SetLineColor(colors[i % colors.size()]);
+      hist->SetLineWidth(2);
+      hist->SetDirectory(nullptr);
+      group.hists.push_back(std::move(hist));
+    }
+  }
+}
+
+void MarkCoincident(size_t index,
+                    const std::vector<int> &leading_to_trailing,
+                    std::vector<char> &coincident_hits)
+{
+  if (index >= coincident_hits.size()) {
+    return;
+  }
+  coincident_hits[index] = 1;
+  if (index < leading_to_trailing.size()) {
+    int trailing = leading_to_trailing[index];
+    if (trailing >= 0 && static_cast<size_t>(trailing) < coincident_hits.size()) {
+      coincident_hits[static_cast<size_t>(trailing)] = 1;
+    }
+  }
+}
+
+void ProcessSpill(std::unordered_map<int, std::vector<HitRef>> &hits_by_channel,
+                  std::vector<PairConfig> &pairs,
+                  const std::vector<Hit> &hits,
+                  std::unordered_map<int, long long> &hit_counts,
+                  const std::vector<int> &leading_to_trailing,
+                  std::vector<char> &coincident_hits)
+{
+  if (hits_by_channel.empty()) {
+    return;
+  }
+
+  for (auto &kv : hits_by_channel) {
+    hit_counts[kv.first] += static_cast<long long>(kv.second.size());
+    std::sort(kv.second.begin(), kv.second.end(), [](const HitRef &a, const HitRef &b) {
+      return a.time_ns < b.time_ns;
+    });
+  }
+
+  for (auto &pair : pairs) {
+    auto it_a = hits_by_channel.find(pair.channel_a);
+    auto it_b = hits_by_channel.find(pair.channel_b);
+    if (it_a == hits_by_channel.end() || it_b == hits_by_channel.end()) {
+      continue;
+    }
+    const auto &times_a = it_a->second;
+    const auto &times_b = it_b->second;
+    if (times_a.empty() || times_b.empty()) {
+      continue;
+    }
+
+    const double window = pair.window_ns;
+    const double search_window = pair.search_window_ns > 0.0 ? pair.search_window_ns : pair.window_ns * 15.0;
+    if (pair.hist_search && search_window > 0.0) {
+      size_t j_search = 0;
+      for (size_t i = 0; i < times_a.size(); ++i) {
+        const double t = times_a[i].time_ns;
+        while (j_search < times_b.size() && times_b[j_search].time_ns < t - search_window) {
+          ++j_search;
+        }
+        size_t k = j_search;
+        while (k < times_b.size() && times_b[k].time_ns <= t + search_window) {
+          const double dt = times_b[k].time_ns - t;
+          pair.hist_search->Fill(dt);
+          if (pair.hist_dt_fine_a || pair.hist_dt_fine_b) {
+            const size_t idx_a = times_a[i].index;
+            const size_t idx_b = times_b[k].index;
+            if (idx_a < hits.size() && idx_b < hits.size()) {
+              if (pair.hist_dt_fine_a) {
+                pair.hist_dt_fine_a->Fill(dt, hits[idx_a].fine);
+              }
+              if (pair.hist_dt_fine_b) {
+                pair.hist_dt_fine_b->Fill(dt, hits[idx_b].fine);
+              }
+            }
+          }
+          ++k;
+        }
+      }
+    }
+    size_t j = 0;
+    for (size_t i = 0; i < times_a.size(); ++i) {
+      const double t = times_a[i].time_ns;
+      while (j < times_b.size() && times_b[j].time_ns < t - window) {
+        ++j;
+      }
+      size_t k = j;
+      while (k < times_b.size() && times_b[k].time_ns <= t + window) {
+        const double dt = times_b[k].time_ns - t;
+        pair.hist_coinc->Fill(dt);
+        ++pair.count;
+        if (pair.hist_dt_fine_coinc_a || pair.hist_dt_fine_coinc_b) {
+          const size_t idx_a = times_a[i].index;
+          const size_t idx_b = times_b[k].index;
+          if (idx_a < hits.size() && idx_b < hits.size()) {
+            if (pair.hist_dt_fine_coinc_a) {
+              pair.hist_dt_fine_coinc_a->Fill(hits[idx_a].fine, dt);
+            }
+            if (pair.hist_dt_fine_coinc_b) {
+              pair.hist_dt_fine_coinc_b->Fill(hits[idx_b].fine, dt);
+            }
+          }
+        }
+        MarkCoincident(times_a[i].index, leading_to_trailing, coincident_hits);
+        MarkCoincident(times_b[k].index, leading_to_trailing, coincident_hits);
+        if (!pair.coincident_hits.empty()) {
+          MarkCoincident(times_a[i].index, leading_to_trailing, pair.coincident_hits);
+          MarkCoincident(times_b[k].index, leading_to_trailing, pair.coincident_hits);
+        }
+        ++k;
+      }
+    }
+  }
+}
+
+void ProcessGroupSpill(const std::unordered_map<int, std::vector<HitRef>> &hits_by_channel,
+                       std::vector<GroupConfig> &groups,
+                       const std::vector<Hit> &hits,
+                       const std::vector<int> &leading_to_trailing,
+                       std::vector<char> &coincident_hits)
+{
+  if (hits_by_channel.empty() || groups.empty()) {
+    return;
+  }
+
+  for (auto &group : groups) {
+    if (group.channels.size() < 3) {
+      continue;
+    }
+    int ref_channel = group.channels[0];
+    auto it_ref = hits_by_channel.find(ref_channel);
+    if (it_ref == hits_by_channel.end() || it_ref->second.empty()) {
+      continue;
+    }
+    const auto &ref_hits = it_ref->second;
+
+    for (const auto &ref_hit : ref_hits) {
+      std::vector<size_t> matched_indices;
+      matched_indices.reserve(group.channels.size());
+      matched_indices.push_back(ref_hit.index);
+
+      bool ok = true;
+      for (size_t i = 1; i < group.channels.size(); ++i) {
+        int ch = group.channels[i];
+        auto it = hits_by_channel.find(ch);
+        if (it == hits_by_channel.end() || it->second.empty()) {
+          ok = false;
+          break;
+        }
+        size_t match_index = 0;
+        if (!FindNearestInWindow(it->second, ref_hit.time_ns, group.window_ns, match_index)) {
+          ok = false;
+          break;
+        }
+        matched_indices.push_back(match_index);
+      }
+
+      if (!ok) {
+        continue;
+      }
+      ++group.count;
+      for (size_t idx : matched_indices) {
+        MarkCoincident(idx, leading_to_trailing, coincident_hits);
+      }
+
+      if (group.hists.size() == matched_indices.size()) {
+        double sum = 0.0;
+        for (size_t idx : matched_indices) {
+          sum += hits[idx].time_ns;
+        }
+        double mean = sum / static_cast<double>(matched_indices.size());
+        for (size_t i = 0; i < matched_indices.size(); ++i) {
+          double dt = hits[matched_indices[i]].time_ns - mean;
+          group.hists[i]->Fill(dt);
+        }
+      }
+    }
+  }
+}
+
+bool FindPairWindow(const std::vector<PairConfig> &pairs,
+                    int channel_a,
+                    int channel_b,
+                    double default_window_ns,
+                    double &window_ns)
+{
+  for (const auto &pair : pairs) {
+    if ((pair.channel_a == channel_a && pair.channel_b == channel_b) ||
+        (pair.channel_a == channel_b && pair.channel_b == channel_a)) {
+      window_ns = pair.window_ns;
+      return true;
+    }
+  }
+  window_ns = default_window_ns;
+  return false;
+}
+
+bool CollectPairMeanTimes(const std::unordered_map<int, std::vector<HitRef>> &hits_by_channel,
+                          int channel_a,
+                          int channel_b,
+                          double window_ns,
+                          std::vector<double> &means)
+{
+  means.clear();
+  auto it_a = hits_by_channel.find(channel_a);
+  auto it_b = hits_by_channel.find(channel_b);
+  if (it_a == hits_by_channel.end() || it_b == hits_by_channel.end()) {
+    return false;
+  }
+  const auto &times_a = it_a->second;
+  const auto &times_b = it_b->second;
+  if (times_a.empty() || times_b.empty()) {
+    return false;
+  }
+
+  size_t j = 0;
+  for (size_t i = 0; i < times_a.size(); ++i) {
+    const double t = times_a[i].time_ns;
+    while (j < times_b.size() && times_b[j].time_ns < t - window_ns) {
+      ++j;
+    }
+    size_t k = j;
+    while (k < times_b.size() && times_b[k].time_ns <= t + window_ns) {
+      means.push_back(0.5 * (t + times_b[k].time_ns));
+      ++k;
+    }
+  }
+  return !means.empty();
+}
+
+void FillMeanTimeDiffs(const std::vector<double> &means_a,
+                       const std::vector<double> &means_b,
+                       TH1D *hist)
+{
+  if (!hist) {
+    return;
+  }
+  for (double ta : means_a) {
+    for (double tb : means_b) {
+      hist->Fill(ta - tb);
+    }
+  }
+}
+
+void PlotGroupCoincidencePlots(const std::vector<GroupConfig> &groups, const char *out_pdf)
+{
+  if (groups.empty()) {
+    return;
+  }
+
+  for (size_t g = 0; g < groups.size(); ++g) {
+    const auto &group = groups[g];
+    if (group.hists.empty()) {
+      continue;
+    }
+    std::string label = ChannelListLabel(group.channels);
+    std::ostringstream title;
+    title << "group ch " << label << " (t_i - mean, window " << group.window_ns << " ns);"
+          << "#Deltat to mean [ns]; entries";
+
+    std::string canvas_name = "c_group_" + std::to_string(g);
+    std::string stack_name = "hs_group_" + std::to_string(g);
+    TCanvas c(canvas_name.c_str(), canvas_name.c_str(), 1600, 900);
+    THStack stack(stack_name.c_str(), title.str().c_str());
+    for (const auto &hist : group.hists) {
+      stack.Add(hist.get(), "hist");
+    }
+    gPad->SetLogy(1);
+    stack.Draw("nostack");
+
+    TLegend leg(0.65, 0.75, 0.88, 0.88);
+    for (size_t i = 0; i < group.hists.size(); ++i) {
+      std::string entry = "channel " + std::to_string(group.channels[i]);
+      leg.AddEntry(group.hists[i].get(), entry.c_str(), "l");
+    }
+    leg.Draw();
+
+    c.Print(out_pdf);
+  }
+}
+
+bool BuildCoincidentHitDistributions(const std::vector<Hit> &hits,
+                                     const analysis_time::FineCalib &fine_calib,
+                                     const std::vector<char> &coincident_hits,
+                                     const std::vector<int> &channel_list,
+                                     double tick_ns,
+                                     bool use_fine,
+                                     double duration_plot_max_ns,
+                                     const std::string &label,
+                                     const std::string &title_prefix,
+                                     CoincPlotSet &out_set)
+{
+  if (hits.empty() || coincident_hits.empty() || channel_list.empty()) {
+    return false;
+  }
+
+  std::unordered_map<int, size_t> channel_index;
+  channel_index.reserve(channel_list.size());
+  for (size_t i = 0; i < channel_list.size(); ++i) {
+    channel_index[channel_list[i]] = i;
+  }
+
+  std::vector<std::vector<const Hit *>> hits_by_channel(channel_list.size());
+  std::vector<std::string> vars = {
+      "device",
+      "fifo",
+      "type",
+      "counter",
+      "column",
+      "pixel",
+      "tdc",
+      "rollover",
+      "coarse",
+      "fine",
+  };
+
+  struct MinMax {
+    int min = 0;
+    int max = 0;
+    bool has = false;
+  };
+  std::vector<MinMax> minmax(vars.size());
+
+  size_t selected_hits = 0;
+  for (size_t i = 0; i < hits.size(); ++i) {
+    if (!coincident_hits[i]) {
+      continue;
+    }
+    auto idx_it = channel_index.find(hits[i].channel);
+    if (idx_it == channel_index.end()) {
+      continue;
+    }
+    hits_by_channel[idx_it->second].push_back(&hits[i]);
+    ++selected_hits;
+    for (size_t v = 0; v < vars.size(); ++v) {
+      int val = ValueForVar(hits[i], vars[v]);
+      if (!minmax[v].has) {
+        minmax[v].min = val;
+        minmax[v].max = val;
+        minmax[v].has = true;
+      } else {
+        minmax[v].min = std::min(minmax[v].min, val);
+        minmax[v].max = std::max(minmax[v].max, val);
+      }
+    }
+  }
+
+  if (selected_hits == 0) {
+    if (!label.empty()) {
+      std::cout << "No coincidence hits available for additional plots (" << label << ")." << std::endl;
+    } else {
+      std::cout << "No coincidence hits available for additional plots." << std::endl;
+    }
+    return false;
+  }
+
+  auto colors = DefaultColors();
+  CoincPlotSet set;
+  set.label = label;
+  set.title_prefix = title_prefix;
+  set.channels = channel_list;
+  set.groups.reserve(vars.size() + 1);
+
+  for (size_t v = 0; v < vars.size(); ++v) {
+    if (!minmax[v].has) {
+      continue;
+    }
+    const std::string &var = vars[v];
+    double lo = std::floor(static_cast<double>(minmax[v].min)) - 0.5;
+    double hi = std::ceil(static_cast<double>(minmax[v].max)) + 0.5;
+    if (lo == hi) {
+      lo -= 0.5;
+      hi += 0.5;
+    }
+    int bins = BinsForRange(lo, hi);
+
+    CoincPlotGroup group;
+    group.kind = var;
+    group.name = "coinc_" + label + "_" + var;
+    if (!title_prefix.empty()) {
+      group.title = title_prefix + ": " + var + "; " + var + "; entries";
+    } else {
+      group.title = "coincident hits: " + var + "; " + var + "; entries";
+    }
+    group.hists.reserve(channel_list.size());
+
+    for (size_t i = 0; i < channel_list.size(); ++i) {
+      std::string name = "h_coinc_" + label + "_" + var + "_ch" + std::to_string(channel_list[i]);
+      std::string ch_title;
+      if (!title_prefix.empty()) {
+        ch_title = title_prefix + " " + var + " (channel " + std::to_string(channel_list[i]) + "); " + var +
+                   "; entries";
+      } else {
+        ch_title = var + " (channel " + std::to_string(channel_list[i]) +
+                   ", coincident hits); " + var + "; entries";
+      }
+      auto hist = std::make_unique<TH1D>(name.c_str(), ch_title.c_str(), bins, lo, hi);
+      hist->SetLineColor(colors[i % colors.size()]);
+      hist->SetLineWidth(2);
+      hist->SetDirectory(nullptr);
+      for (const auto *hit : hits_by_channel[i]) {
+        hist->Fill(ValueForVar(*hit, var));
+      }
+      group.hists.push_back(std::move(hist));
+    }
+
+    set.groups.push_back(std::move(group));
+  }
+
+  const double duration_max_ns = duration_plot_max_ns > 0.0 ? duration_plot_max_ns : 0.0;
+  std::vector<std::vector<double>> durations(channel_list.size());
+
+  struct EdgeHit {
+    const Hit *hit = nullptr;
+  };
+
+  for (size_t i = 0; i < hits_by_channel.size(); ++i) {
+    auto &channel_hits = hits_by_channel[i];
+    if (channel_hits.empty()) {
+      continue;
+    }
+    std::vector<EdgeHit> edges;
+    edges.reserve(channel_hits.size());
+    for (const auto *hit : channel_hits) {
+      edges.push_back({hit});
+    }
+    std::sort(edges.begin(), edges.end(), [](const EdgeHit &a, const EdgeHit &b) {
+      if (a.hit->time_tick != b.hit->time_tick) {
+        return a.hit->time_tick < b.hit->time_tick;
+      }
+      return a.hit->fine < b.hit->fine;
+    });
+
+    std::array<bool, 2> have_leading = {false, false};
+    std::array<double, 2> leading_time_ns = {0.0, 0.0};
+    std::array<int, 2> leading_tdc = {-1, -1};
+    for (const auto &edge : edges) {
+      if (!IsLeadingTdc(edge.hit->tdc) && !IsTrailingTdc(edge.hit->tdc)) {
+        continue;
+      }
+      if (!IsValidTdcId(edge.hit->tdc)) {
+        continue;
+      }
+      int pair = TdcPairIndex(edge.hit->tdc);
+      if (pair < 0 || pair > 1) {
+        continue;
+      }
+      int tdc_index = analysis_time::TdcIndex(edge.hit->fifo, edge.hit->column, edge.hit->pixel, edge.hit->tdc);
+      double time_ns = analysis_time::TimeNsFromTick(
+          fine_calib, edge.hit->time_tick, edge.hit->fine, tdc_index, tick_ns, use_fine);
+      if (IsLeadingTdc(edge.hit->tdc)) {
+        leading_time_ns[pair] = time_ns;
+        leading_tdc[pair] = edge.hit->tdc;
+        have_leading[pair] = true;
+        continue;
+      }
+      if (!have_leading[pair]) {
+        continue;
+      }
+      if (leading_tdc[pair] < 0 || edge.hit->tdc != (leading_tdc[pair] ^ 0x1)) {
+        continue;
+      }
+      double dt_ns = time_ns - leading_time_ns[pair];
+      if (duration_max_ns > 0.0) {
+        if (dt_ns >= 0.0 && dt_ns <= duration_max_ns) {
+          durations[i].push_back(dt_ns);
+        }
+      }
+      have_leading[pair] = false;
+    }
+  }
+
+  if (duration_max_ns > 0.0) {
+    int bins = static_cast<int>(duration_max_ns * 4.0);
+    if (bins < 1) {
+      bins = 1;
+    }
+    if (bins > 400) {
+      bins = 400;
+    }
+    CoincPlotGroup duration_group;
+    duration_group.kind = "duration";
+    duration_group.name = "coinc_" + label + "_duration";
+    if (!title_prefix.empty()) {
+      std::ostringstream title;
+      title << title_prefix << " Time-over-Threshold (ToT) (<= " << duration_max_ns
+            << " ns); ToT [ns]; entries";
+      duration_group.title = title.str();
+    } else {
+      std::ostringstream title;
+      title << "coincident hit Time-over-Threshold (ToT) (<= " << duration_max_ns
+            << " ns); ToT [ns]; entries";
+      duration_group.title = title.str();
+    }
+    duration_group.hists.reserve(channel_list.size());
+
+    for (size_t i = 0; i < channel_list.size(); ++i) {
+      std::string name = "h_coinc_" + label + "_duration_ch" + std::to_string(channel_list[i]);
+      std::string ch_title;
+      if (!title_prefix.empty()) {
+        std::ostringstream title;
+        title << title_prefix << " Time-over-Threshold (ToT) (channel " << channel_list[i]
+              << ", <= " << duration_max_ns << " ns); ToT [ns]; entries";
+        ch_title = title.str();
+      } else {
+        std::ostringstream title;
+        title << "coincident hit Time-over-Threshold (ToT) (leading-trailing, <= " << duration_max_ns
+              << " ns) (channel " << channel_list[i] << "); ToT [ns]; entries";
+        ch_title = title.str();
+      }
+      auto hist = std::make_unique<TH1D>(name.c_str(), ch_title.c_str(), bins, 0.0, duration_max_ns);
+      hist->SetLineColor(colors[i % colors.size()]);
+      hist->SetLineWidth(2);
+      hist->SetDirectory(nullptr);
+      for (double dt : durations[i]) {
+        hist->Fill(dt);
+      }
+      duration_group.hists.push_back(std::move(hist));
+    }
+
+    set.groups.push_back(std::move(duration_group));
+  }
+
+  if (!set.groups.empty()) {
+    std::stable_partition(set.groups.begin(), set.groups.end(), [](const CoincPlotGroup &grp) {
+      return grp.kind == "duration";
+    });
+  }
+
+  if (set.groups.empty()) {
+    std::cout << "No coincidence histograms to draw." << std::endl;
+    return false;
+  }
+
+  out_set = std::move(set);
+  return true;
+}
+
+void DrawCoincidentStacksPerPair(const std::vector<CoincPlotSet> &sets, const char *out_pdf)
+{
+  if (sets.empty()) {
+    return;
+  }
+
+  for (const auto &set : sets) {
+    if (set.groups.empty()) {
+      continue;
+    }
+    int cols = 1;
+    int rows = 1;
+    GridForCount(set.groups.size(), cols, rows);
+    std::string name = "c_coinc_summary";
+    if (!set.label.empty()) {
+      name += "_" + set.label;
+    }
+    TCanvas c_summary(name.c_str(), name.c_str(), 1600, 900);
+    c_summary.Divide(cols, rows, 0.001, 0.001);
+
+    std::vector<std::unique_ptr<THStack>> stacks;
+    std::vector<std::unique_ptr<TLegend>> legends;
+    stacks.reserve(set.groups.size());
+    legends.reserve(set.groups.size());
+
+    for (size_t g = 0; g < set.groups.size(); ++g) {
+      const auto &group = set.groups[g];
+      if (group.hists.empty()) {
+        continue;
+      }
+      c_summary.cd(static_cast<int>(g + 1));
+      gPad->SetLogy(1);
+      std::string stack_name = "hs_" + group.name + "_summary";
+      auto stack = std::make_unique<THStack>(stack_name.c_str(), group.title.c_str());
+      for (const auto &hist : group.hists) {
+        stack->Add(hist.get(), "hist");
+      }
+      stack->Draw("nostack");
+
+      auto leg = std::make_unique<TLegend>(0.65, 0.75, 0.88, 0.88);
+      for (size_t i = 0; i < group.hists.size(); ++i) {
+        std::string label = "channel " + std::to_string(set.channels[i]);
+        leg->AddEntry(group.hists[i].get(), label.c_str(), "l");
+      }
+      leg->Draw();
+
+      stacks.push_back(std::move(stack));
+      legends.push_back(std::move(leg));
+    }
+
+    c_summary.Print(out_pdf);
+  }
+}
+
+void DrawCoincidentStacksPerVariable(const std::vector<CoincPlotSet> &sets, const char *out_pdf)
+{
+  if (sets.empty()) {
+    return;
+  }
+  const auto &ref_groups = sets.front().groups;
+  if (ref_groups.empty()) {
+    return;
+  }
+  std::vector<std::string> kinds;
+  kinds.reserve(ref_groups.size());
+  for (const auto &grp : ref_groups) {
+    kinds.push_back(grp.kind);
+  }
+
+  for (const auto &kind : kinds) {
+    int cols = 1;
+    int rows = 1;
+    GridForCount(sets.size(), cols, rows);
+    std::string canvas_name = "c_coinc_var_" + kind;
+    TCanvas c_var(canvas_name.c_str(), canvas_name.c_str(), 1600, 900);
+    c_var.Divide(cols, rows, 0.001, 0.001);
+
+    std::vector<std::unique_ptr<THStack>> stacks;
+    std::vector<std::unique_ptr<TLegend>> legends;
+    stacks.reserve(sets.size());
+    legends.reserve(sets.size());
+
+    size_t pad = 1;
+    for (const auto &set : sets) {
+      if (pad > sets.size()) {
+        break;
+      }
+      const CoincPlotGroup *group_ptr = nullptr;
+      for (const auto &grp : set.groups) {
+        if (grp.kind == kind) {
+          group_ptr = &grp;
+          break;
+        }
+      }
+      if (!group_ptr || group_ptr->hists.empty()) {
+        ++pad;
+        continue;
+      }
+      c_var.cd(static_cast<int>(pad));
+      gPad->SetLogy(1);
+      std::string stack_name = "hs_" + group_ptr->name + "_all";
+      auto stack = std::make_unique<THStack>(stack_name.c_str(), group_ptr->title.c_str());
+      for (const auto &hist : group_ptr->hists) {
+        stack->Add(hist.get(), "hist");
+      }
+      stack->Draw("nostack");
+
+      auto leg = std::make_unique<TLegend>(0.65, 0.75, 0.88, 0.88);
+      for (size_t i = 0; i < group_ptr->hists.size(); ++i) {
+        std::string label = "channel " + std::to_string(set.channels[i]);
+        leg->AddEntry(group_ptr->hists[i].get(), label.c_str(), "l");
+      }
+      leg->Draw();
+
+      stacks.push_back(std::move(stack));
+      legends.push_back(std::move(leg));
+      ++pad;
+    }
+
+    c_var.Print(out_pdf);
+  }
+}
+
+void WriteHistToTxt(std::ostream &out, const TH1D &hist)
+{
+  const int bins = hist.GetNbinsX();
+  for (int b = 1; b <= bins; ++b) {
+    double lo = hist.GetXaxis()->GetBinLowEdge(b);
+    double hi = hist.GetXaxis()->GetBinUpEdge(b);
+    double c = hist.GetBinContent(b);
+    out << lo << " " << hi << " " << c << "\n";
+  }
+}
+
+void WriteCoincidenceTxt(const char *out_txt,
+                         const std::vector<PairConfig> &pairs,
+                         const std::vector<PairStats> &pair_stats,
+                         double clock_mhz,
+                         bool use_fine,
+                         double max_duration_ns,
+                         int fine_cut,
+                         const char *pairs_file)
+{
+  if (!out_txt || out_txt[0] == '\0') {
+    return;
+  }
+  std::ofstream out(out_txt);
+  if (!out) {
+    std::cout << "Failed to open TXT output file: " << out_txt << std::endl;
+    return;
+  }
+  out << "# coincidence txt output\n";
+  out << "# pairs_file: " << (pairs_file ? pairs_file : "") << "\n";
+  out << "# clock_mhz: " << clock_mhz << "\n";
+  out << "# use_fine: " << (use_fine ? 1 : 0) << "\n";
+  out << "# max_duration_ns: " << max_duration_ns << "\n";
+  out << "# fine_cut: " << fine_cut << "\n";
+
+  for (size_t i = 0; i < pairs.size(); ++i) {
+    const auto &pair = pairs[i];
+    const auto &stats = (i < pair_stats.size()) ? pair_stats[i] : PairStats{};
+    out << "# pair " << i << " ch_a=" << pair.channel_a << " ch_b=" << pair.channel_b
+        << " window_ns=" << pair.window_ns << " search_window_ns=" << pair.search_window_ns << "\n";
+    out << "# fwhm_bkg_sub=" << stats.fwhm << " fwhm_err=" << stats.fwhm_err
+        << " bkg_sideband=" << stats.bkg << " bkg_err=" << stats.bkg_err
+        << " x_left=" << stats.x_left << " x_right=" << stats.x_right
+        << " entries=" << stats.entries << " boot_trials=" << stats.boot_trials << "\n";
+    if (pair.hist_search) {
+      out << "# hist_search: bin_low bin_high count\n";
+      WriteHistToTxt(out, *pair.hist_search);
+    }
+    if (pair.hist_coinc) {
+      out << "# hist_coinc: bin_low bin_high count\n";
+      WriteHistToTxt(out, *pair.hist_coinc);
+    }
+  }
+  std::cout << "Wrote coincidence TXT output to " << out_txt << std::endl;
+}
+
+void WriteCoincidenceRoot(const char *out_root,
+                          const std::vector<PairConfig> &pairs,
+                          const std::vector<GroupConfig> &groups,
+                          const TH1D *pair_mean_hist,
+                          const std::vector<CoincPlotSet> &pair_plot_sets,
+                          double clock_mhz,
+                          bool use_fine,
+                          double max_duration_ns,
+                          int fine_cut,
+                          const char *pairs_file)
+{
+  if (!out_root || out_root[0] == '\0') {
+    return;
+  }
+  std::unique_ptr<TFile> out(TFile::Open(out_root, "RECREATE"));
+  if (!out || out->IsZombie()) {
+    std::cout << "Failed to open ROOT output file: " << out_root << std::endl;
+    return;
+  }
+
+  if (pairs_file && pairs_file[0] != '\0') {
+    TNamed pairs_name("pairs_file", pairs_file);
+    pairs_name.Write();
+  }
+  TParameter<double> p_clock("clock_mhz", clock_mhz);
+  TParameter<int> p_use_fine("use_fine", use_fine ? 1 : 0);
+  TParameter<double> p_maxdur("max_duration_ns", max_duration_ns);
+  TParameter<int> p_fine_cut("fine_cut", fine_cut);
+  p_clock.Write();
+  p_use_fine.Write();
+  p_maxdur.Write();
+  p_fine_cut.Write();
+
+  for (const auto &pair : pairs) {
+    if (pair.hist_search) {
+      pair.hist_search->Write();
+    }
+    if (pair.hist_coinc) {
+      pair.hist_coinc->Write();
+    }
+    if (pair.hist_dt_fine_a) {
+      pair.hist_dt_fine_a->Write();
+    }
+    if (pair.hist_dt_fine_b) {
+      pair.hist_dt_fine_b->Write();
+    }
+    if (pair.hist_dt_fine_coinc_a) {
+      pair.hist_dt_fine_coinc_a->Write();
+    }
+    if (pair.hist_dt_fine_coinc_b) {
+      pair.hist_dt_fine_coinc_b->Write();
+    }
+    if (pair.prof_dt_fine_coinc_a) {
+      pair.prof_dt_fine_coinc_a->Write();
+    }
+    if (pair.prof_dt_fine_coinc_b) {
+      pair.prof_dt_fine_coinc_b->Write();
+    }
+  }
+  if (pair_mean_hist) {
+    pair_mean_hist->Write();
+  }
+  for (const auto &group : groups) {
+    for (const auto &hist : group.hists) {
+      if (hist) {
+        hist->Write();
+      }
+    }
+  }
+  for (const auto &set : pair_plot_sets) {
+    for (const auto &group : set.groups) {
+      for (const auto &hist : group.hists) {
+        if (hist) {
+          hist->Write();
+        }
+      }
+    }
+  }
+  out->Close();
+  std::cout << "Wrote coincidence ROOT output to " << out_root << std::endl;
+}
+
+}  // namespace
+
+void coincidence_rdf(const char *decoded_dir = "../raw_data/latest/kc705-196/decoded",
+                     const char *pairs_file = "../config/coincidence_pairs.txt",
+                     const char *out_pdf = "coincidences.pdf",
+                     double default_window_ns = 10.0,
+                     double clock_mhz = 320.0,
+                     bool use_fine = true,
+                     double max_duration_ns = 15.0,
+                     const char *fine_calib_path = "",
+                     bool force_window = false,
+                     const char *chan_calib_path = "",
+                     int fine_cut = analysis_time::kDefaultFineCut,
+                     const char *out_root = "",
+                     const char *out_txt = "",
+                     bool use_lut = true)
+{
+  ScopedTimer timer("coincidence_rdf");
+  ROOT::EnableImplicitMT();
+
+  if (WantsHelp(decoded_dir)) {
+    PrintCoincidenceHelp();
+    return;
+  }
+
+  gStyle->SetOptStat(0);
+  gStyle->SetOptFit(1111);
+  auto input_spec = analysis_io::ResolveInputSpec(decoded_dir);
+  if (input_spec.files.empty()) {
+    std::cout << "No decoded ROOT files found under " << decoded_dir << std::endl;
+    return;
+  }
+
+  std::unordered_set<int> channels;
+  std::vector<PairConfig> pairs;
+  std::vector<GroupConfig> groups;
+  if (!LoadCoincidenceConfig(pairs_file, default_window_ns, force_window, pairs, groups, channels)) {
+    return;
+  }
+  if (pairs.empty() && groups.empty()) {
+    std::cout << "No valid channel pairs/groups found in " << pairs_file << std::endl;
+    return;
+  }
+
+  std::cout << "Input: " << decoded_dir << std::endl;
+  std::cout << "Pairs: " << pairs_file << std::endl;
+  std::cout << "Output: " << out_pdf << std::endl;
+  std::cout << "Clock (MHz): " << clock_mhz << std::endl;
+  std::cout << "Use fine: " << (use_fine ? 1 : 0) << std::endl;
+  std::cout << "Max duration (ns): " << max_duration_ns << std::endl;
+  if (use_fine && fine_cut > 0) {
+    std::cout << "Fine cut (bins): " << fine_cut << std::endl;
+  } else {
+    std::cout << "Fine cut (bins): 0" << std::endl;
+  }
+  if (fine_calib_path && fine_calib_path[0] != '\0') {
+    std::cout << "Fine calib: " << fine_calib_path << std::endl;
+  }
+
+  const int fine_plot_bins = 128;
+  const double fine_plot_min = 0.0;
+  const double fine_plot_max = static_cast<double>(analysis_time::kFineBins);
+
+  for (auto &pair : pairs) {
+    const double hist_window_ns = pair.window_ns * 1.0;
+    const double search_window_ns = std::max(pair.window_ns * 15.0, 100.0 + 4.0 * pair.window_ns);
+
+    int bins = BinsForWindow(hist_window_ns);
+    const double bin_width = (bins > 0) ? (2.0 * hist_window_ns / static_cast<double>(bins)) : 1.0;
+    std::ostringstream title;
+    title << "ch " << pair.channel_a << " vs " << pair.channel_b
+          << " (coinc window " << pair.window_ns << " ns);"
+          << "#Deltat [ns];pairs";
+    std::string name = "h_dt_coinc_ch" + std::to_string(pair.channel_a) + "_ch" + std::to_string(pair.channel_b);
+    auto hist = std::make_unique<TH1D>(name.c_str(),
+                                       title.str().c_str(),
+                                       bins,
+                                       -hist_window_ns,
+                                       hist_window_ns);
+    hist->SetLineWidth(2);
+    hist->SetDirectory(nullptr);
+    pair.hist_coinc = std::move(hist);
+    pair.search_window_ns = search_window_ns;
+
+    int bins_search = static_cast<int>(std::ceil((2.0 * search_window_ns) / bin_width));
+    if (bins_search < 10) {
+      bins_search = 10;
+    }
+    std::ostringstream title_search;
+    title_search << "ch " << pair.channel_a << " vs " << pair.channel_b
+                 << " (search window " << (search_window_ns) << " ns);"
+                 << "#Deltat [ns];pairs";
+    std::string name_search =
+        "h_dt_search_ch" + std::to_string(pair.channel_a) + "_ch" + std::to_string(pair.channel_b);
+    auto hist_search = std::make_unique<TH1D>(name_search.c_str(),
+                                              title_search.str().c_str(),
+                                              bins_search,
+                                              -search_window_ns,
+                                              search_window_ns);
+    hist_search->SetLineWidth(2);
+    hist_search->SetDirectory(nullptr);
+    pair.hist_search = std::move(hist_search);
+    pair.search_window_ns = search_window_ns;
+
+    {
+      std::ostringstream title_a;
+      title_a << "ch " << pair.channel_a << " vs " << pair.channel_b
+              << " (#Deltat vs fine ch " << pair.channel_a << ", search window " << search_window_ns << " ns);"
+              << "#Deltat [ns]; fine (ch " << pair.channel_a << "); pairs";
+      std::string name_a =
+          "h_dt_fine_ch" + std::to_string(pair.channel_a) + "_ch" + std::to_string(pair.channel_b) + "_a";
+      auto hist_a = std::make_unique<TH2D>(name_a.c_str(),
+                                           title_a.str().c_str(),
+                                           bins_search,
+                                           -search_window_ns,
+                                           search_window_ns,
+                                           fine_plot_bins,
+                                           fine_plot_min,
+                                           fine_plot_max);
+      hist_a->SetDirectory(nullptr);
+      pair.hist_dt_fine_a = std::move(hist_a);
+    }
+    {
+      std::ostringstream title_b;
+      title_b << "ch " << pair.channel_a << " vs " << pair.channel_b
+              << " (#Deltat vs fine ch " << pair.channel_b << ", search window " << search_window_ns << " ns);"
+              << "#Deltat [ns]; fine (ch " << pair.channel_b << "); pairs";
+      std::string name_b =
+          "h_dt_fine_ch" + std::to_string(pair.channel_a) + "_ch" + std::to_string(pair.channel_b) + "_b";
+      auto hist_b = std::make_unique<TH2D>(name_b.c_str(),
+                                           title_b.str().c_str(),
+                                           bins_search,
+                                           -search_window_ns,
+                                           search_window_ns,
+                                           fine_plot_bins,
+                                           fine_plot_min,
+                                           fine_plot_max);
+      hist_b->SetDirectory(nullptr);
+      pair.hist_dt_fine_b = std::move(hist_b);
+    }
+    {
+      std::ostringstream title_a;
+      title_a << "ch " << pair.channel_a << " vs " << pair.channel_b
+              << " (#Deltat vs fine ch " << pair.channel_a << ", coinc window " << pair.window_ns << " ns);"
+              << "fine (ch " << pair.channel_a << "); #Deltat [ns]; pairs";
+      std::string name_a =
+          "h_dt_fine_coinc_ch" + std::to_string(pair.channel_a) + "_ch" + std::to_string(pair.channel_b) + "_a";
+      auto hist_a = std::make_unique<TH2D>(name_a.c_str(),
+                                           title_a.str().c_str(),
+                                           fine_plot_bins,
+                                           fine_plot_min,
+                                           fine_plot_max,
+                                           bins,
+                                           -hist_window_ns,
+                                           hist_window_ns);
+      hist_a->SetDirectory(nullptr);
+      pair.hist_dt_fine_coinc_a = std::move(hist_a);
+    }
+    {
+      std::ostringstream title_b;
+      title_b << "ch " << pair.channel_a << " vs " << pair.channel_b
+              << " (#Deltat vs fine ch " << pair.channel_b << ", coinc window " << pair.window_ns << " ns);"
+              << "fine (ch " << pair.channel_b << "); #Deltat [ns]; pairs";
+      std::string name_b =
+          "h_dt_fine_coinc_ch" + std::to_string(pair.channel_a) + "_ch" + std::to_string(pair.channel_b) + "_b";
+      auto hist_b = std::make_unique<TH2D>(name_b.c_str(),
+                                           title_b.str().c_str(),
+                                           fine_plot_bins,
+                                           fine_plot_min,
+                                           fine_plot_max,
+                                           bins,
+                                           -hist_window_ns,
+                                           hist_window_ns);
+      hist_b->SetDirectory(nullptr);
+      pair.hist_dt_fine_coinc_b = std::move(hist_b);
+    }
+  }
+
+  InitGroupHists(groups);
+
+  std::unique_ptr<TH1D> pair_mean_hist;
+  double pair_mean_window_a = default_window_ns;
+  double pair_mean_window_b = default_window_ns;
+  if (channels.count(17) && channels.count(19) && channels.count(22) && channels.count(23)) {
+    FindPairWindow(pairs, 17, 19, default_window_ns, pair_mean_window_a);
+    FindPairWindow(pairs, 22, 23, default_window_ns, pair_mean_window_b);
+    double hist_window_ns = std::max(pair_mean_window_a, pair_mean_window_b) * 2.2;
+    int bins = BinsForWindow(hist_window_ns);
+    std::ostringstream title;
+    title << "mean(t17,t19) - mean(t22,t23) (w17-19=" << pair_mean_window_a
+          << " ns, w22-23=" << pair_mean_window_b << " ns);"
+          << "#Deltat [ns]; entries";
+    std::string name = "h_pair_mean_17_19_22_23";
+    auto hist = std::make_unique<TH1D>(name.c_str(),
+                                       title.str().c_str(),
+                                       bins,
+                                       -hist_window_ns,
+                                       hist_window_ns);
+    hist->SetLineWidth(2);
+    hist->SetDirectory(nullptr);
+    pair_mean_hist = std::move(hist);
+  } else {
+    std::cout << "Pair-mean plot skipped (needs channels 17,19,22,23 in config)." << std::endl;
+  }
+
+  ROOT::RDataFrame df(input_spec.tree_name.c_str(), input_spec.files);
+  auto colnames = df.GetColumnNames();
+  if (colnames.empty()) {
+    std::cout << "Error: no branches found in tree '" << input_spec.tree_name
+              << "'. The decoded file may be empty. Re-run the decoder." << std::endl;
+    return;
+  }
+  auto has_branch = [&colnames](const std::string &name) {
+    return std::find(colnames.begin(), colnames.end(), name) != colnames.end();
+  };
+  std::vector<std::string> missing;
+  for (const auto &name : {"type", "fifo", "column", "pixel", "tdc", "rollover", "coarse", "fine"}) {
+    if (!has_branch(name)) {
+      missing.emplace_back(name);
+    }
+  }
+  if (!missing.empty()) {
+    std::cout << "Error: missing required branches in tree '" << input_spec.tree_name << "': ";
+    for (size_t i = 0; i < missing.size(); ++i) {
+      if (i) {
+        std::cout << ", ";
+      }
+      std::cout << missing[i];
+    }
+    std::cout << std::endl << "Available branches: ";
+    for (size_t i = 0; i < colnames.size(); ++i) {
+      if (i) {
+        std::cout << ", ";
+      }
+      std::cout << colnames[i];
+    }
+    std::cout << std::endl;
+    return;
+  }
+  bool has_channel = std::find(colnames.begin(), colnames.end(), "channel") != colnames.end();
+  bool has_time_tick = std::find(colnames.begin(), colnames.end(), "time_tick") != colnames.end();
+  bool has_spill = std::find(colnames.begin(), colnames.end(), "spill") != colnames.end();
+  bool has_run_id = std::find(colnames.begin(), colnames.end(), "run_id") != colnames.end();
+
+  ROOT::RDF::RNode df_time = df;
+  if (!has_channel) {
+    df_time = df_time.Define("channel", "column * 4 + pixel");
+  }
+  if (!has_time_tick) {
+    df_time = df_time.Define("time_tick", analysis_time::TimeTickLambda(), {"rollover", "coarse"});
+  }
+  if (!has_spill) {
+    df_time = df_time.Define("spill", "0");
+  }
+  if (!has_run_id) {
+    df_time = df_time.Define("run_id", "0");
+  }
+
+  auto types = df_time.Take<int>("type");
+  auto channels_v = df_time.Take<int>("channel");
+  auto ticks = df_time.Take<Long64_t>("time_tick");
+  auto fines = df_time.Take<int>("fine");
+  auto spills = df_time.Take<int>("spill");
+  auto run_ids = df_time.Take<int>("run_id");
+  auto devices = df_time.Take<int>("device");
+  auto fifos = df_time.Take<int>("fifo");
+  auto counters = df_time.Take<int>("counter");
+  auto columns = df_time.Take<int>("column");
+  auto pixels = df_time.Take<int>("pixel");
+  auto tdcs = df_time.Take<int>("tdc");
+  auto rollovers = df_time.Take<int>("rollover");
+  auto coarses = df_time.Take<int>("coarse");
+  ROOT::RDF::RunGraphs({types, channels_v, ticks, fines, spills, run_ids, devices, fifos, counters, columns, pixels,
+                        tdcs, rollovers, coarses});
+
+  const auto &types_val = types.GetValue();
+  const auto &channels_val = channels_v.GetValue();
+  const auto &ticks_val = ticks.GetValue();
+  const auto &fines_val = fines.GetValue();
+  const auto &spills_val = spills.GetValue();
+  const auto &run_ids_val = run_ids.GetValue();
+  const auto &devices_val = devices.GetValue();
+  const auto &fifos_val = fifos.GetValue();
+  const auto &counters_val = counters.GetValue();
+  const auto &columns_val = columns.GetValue();
+  const auto &pixels_val = pixels.GetValue();
+  const auto &tdcs_val = tdcs.GetValue();
+  const auto &rollovers_val = rollovers.GetValue();
+  const auto &coarses_val = coarses.GetValue();
+
+  std::vector<int> channel_list(channels.begin(), channels.end());
+  std::sort(channel_list.begin(), channel_list.end());
+
+  std::vector<Hit> hits;
+  hits.reserve(types_val.size());
+  std::vector<char> coincident_hits;
+  coincident_hits.reserve(types_val.size());
+  std::unordered_map<int, long long> hit_counts;
+  const double tick_ns = analysis_time::TickNs(clock_mhz);
+  analysis_time::FineCalib fine_calib;
+  if (fine_calib_path && fine_calib_path[0] != '\0') {
+    if (fine_calib.LoadFromFile(fine_calib_path)) {
+      std::cout << "Loaded fine calibration: " << fine_calib_path << std::endl;
+    } else {
+      std::cout << "Failed to load fine calibration: " << fine_calib_path << " (using default formula)" << std::endl;
+    }
+  }
+  fine_calib.use_lut = use_lut;
+  analysis_time::PrintFineCalibConstants(fine_calib);
+  analysis_time::ChannelCalib chan_calib;
+  if (chan_calib_path && chan_calib_path[0] != '\0') {
+    if (chan_calib.LoadFromFile(chan_calib_path)) {
+      std::cout << "Loaded channel calibration: " << chan_calib_path << std::endl;
+    } else {
+      std::cout << "Failed to load channel calibration: " << chan_calib_path << " (ignored)" << std::endl;
+    }
+  }
+  analysis_time::PrintChannelCalibSummary(chan_calib);
+  if (max_duration_ns < 0.0) {
+    max_duration_ns = 0.0;
+  }
+
+  int current_spill = 0;
+  for (size_t i = 0; i < types_val.size(); ++i) {
+    const int type = types_val[i];
+    int spill = 0;
+    int run_id = 0;
+    if (!has_spill) {
+      if (type == 15) {
+        ++current_spill;
+        continue;
+      }
+      if (type != 1) {
+        continue;
+      }
+      spill = current_spill;
+    } else {
+      if (type != 1) {
+        continue;
+      }
+      spill = spills_val[i];
+    }
+    if (has_run_id) {
+      run_id = run_ids_val[i];
+    }
+    const int ch = channels_val[i];
+    if (channels.find(ch) == channels.end()) {
+      continue;
+    }
+    Hit hit;
+    hit.run_id = run_id;
+    hit.device = devices_val[i];
+    hit.fifo = fifos_val[i];
+    hit.type = type;
+    hit.counter = counters_val[i];
+    hit.column = columns_val[i];
+    hit.pixel = pixels_val[i];
+    hit.tdc = tdcs_val[i];
+    hit.rollover = rollovers_val[i];
+    hit.coarse = coarses_val[i];
+    hit.fine = fines_val[i];
+    hit.channel = ch;
+    hit.time_tick = ticks_val[i];
+    hit.spill = spill;
+    int tdc_index = analysis_time::TdcIndex(hit.fifo, hit.column, hit.pixel, hit.tdc);
+    if (use_fine && !analysis_time::PassFineCut(fine_calib, fines_val[i], tdc_index, fine_cut)) {
+      continue;
+    }
+    double time_ns =
+        analysis_time::TimeNsFromTick(fine_calib, ticks_val[i], fines_val[i], tdc_index, tick_ns, use_fine);
+    hit.time_ns = time_ns;
+    hits.push_back(hit);
+    coincident_hits.push_back(0);
+  }
+
+  std::vector<char> leading_mask;
+  std::vector<int> leading_to_trailing;
+  if (max_duration_ns > 0.0) {
+    auto duration_info = ComputeDurationInfo(hits, fine_calib, tick_ns, max_duration_ns, use_fine);
+    leading_mask = std::move(duration_info.leading_mask);
+    leading_to_trailing = std::move(duration_info.leading_to_trailing);
+  } else {
+    leading_mask.assign(hits.size(), 0);
+    leading_to_trailing.assign(hits.size(), -1);
+    for (size_t i = 0; i < hits.size(); ++i) {
+      if (IsLeadingTdc(hits[i].tdc)) {
+        leading_mask[i] = 1;
+      }
+    }
+  }
+
+  if (chan_calib.loaded) {
+    if (max_duration_ns <= 0.0) {
+      std::cout << "Channel calibration loaded but max_duration_ns <= 0; skipping correction." << std::endl;
+    } else {
+      std::vector<double> leading_tot(hits.size(), -1.0);
+      for (size_t i = 0; i < hits.size(); ++i) {
+        if (i >= leading_mask.size() || !leading_mask[i]) {
+          continue;
+        }
+        int trailing = (i < leading_to_trailing.size()) ? leading_to_trailing[i] : -1;
+        if (trailing < 0 || trailing >= static_cast<int>(hits.size())) {
+          continue;
+        }
+        double dt = hits[trailing].time_ns - hits[i].time_ns;
+        if (dt <= 0.0 || dt > max_duration_ns) {
+          continue;
+        }
+        leading_tot[i] = dt;
+      }
+      for (size_t i = 0; i < hits.size(); ++i) {
+        if (i >= leading_mask.size() || !leading_mask[i]) {
+          continue;
+        }
+        double tot = leading_tot[i];
+        if (tot <= 0.0) {
+          continue;
+        }
+        hits[i].time_ns -= chan_calib.CorrectionNs(hits[i].channel, tot);
+      }
+    }
+  }
+
+  for (auto &pair : pairs) {
+    pair.coincident_hits.assign(hits.size(), 0);
+  }
+
+  std::unordered_map<uint64_t, std::unordered_map<int, std::vector<HitRef>>> spill_hits;
+  for (size_t i = 0; i < hits.size(); ++i) {
+    if (i >= leading_mask.size() || !leading_mask[i]) {
+      continue;
+    }
+    spill_hits[RunSpillKey(hits[i].run_id, hits[i].spill)][hits[i].channel].push_back({hits[i].time_ns, i});
+  }
+  for (auto &spill : spill_hits) {
+    ProcessSpill(spill.second, pairs, hits, hit_counts, leading_to_trailing, coincident_hits);
+    ProcessGroupSpill(spill.second, groups, hits, leading_to_trailing, coincident_hits);
+    if (pair_mean_hist) {
+      std::vector<double> means_a;
+      std::vector<double> means_b;
+      if (CollectPairMeanTimes(spill.second, 17, 19, pair_mean_window_a, means_a) &&
+          CollectPairMeanTimes(spill.second, 22, 23, pair_mean_window_b, means_b)) {
+        FillMeanTimeDiffs(means_a, means_b, pair_mean_hist.get());
+      }
+    }
+  }
+
+  std::cout << "Coincidence summary" << std::endl;
+  for (const auto &pair : pairs) {
+    std::cout << "  ch " << pair.channel_a << " vs " << pair.channel_b
+              << " window=" << pair.window_ns << " ns -> " << pair.count << std::endl;
+  }
+  for (const auto &group : groups) {
+    std::ostringstream label;
+    for (size_t i = 0; i < group.channels.size(); ++i) {
+      if (i > 0) {
+        label << ",";
+      }
+      label << group.channels[i];
+    }
+    std::cout << "  group ch " << label.str()
+              << " window=" << group.window_ns << " ns -> " << group.count << std::endl;
+  }
+
+  std::string out_open = std::string(out_pdf) + "[";
+  std::string out_close = std::string(out_pdf) + "]";
+  TCanvas c_open("c_open", "c_open", 1600, 900);
+  c_open.Print(out_open.c_str());
+
+  std::vector<PairStats> pair_stats;
+  pair_stats.reserve(pairs.size());
+  for (auto &pair : pairs) {
+    PairStats stats;
+    TCanvas c("c", "c", 1600, 900);
+    c.Divide(2, 1, 0.001, 0.001);
+    c.cd(1);
+    gPad->SetLogy(1);
+    pair.hist_search->Draw("hist");
+    c.cd(2);
+    gPad->SetLogy(1);
+    pair.hist_coinc->Draw("E1");
+    stats.entries = static_cast<long long>(pair.hist_coinc->GetEntries());
+    if (pair.hist_coinc->GetEntries() > 0) {
+      const double bkg_sideband = FitBackgroundFromSidebands(*pair.hist_search, pair.window_ns);
+      double x_left = 0.0;
+      double x_right = 0.0;
+      const double fwhm_hist = ComputeFwhmFromHist(*pair.hist_coinc, bkg_sideband, x_left, x_right);
+      stats.bkg = bkg_sideband;
+      stats.fwhm = fwhm_hist;
+      stats.x_left = x_left;
+      stats.x_right = x_right;
+      const int boot_trials = 200;
+      double fwhm_mean = std::numeric_limits<double>::quiet_NaN();
+      double fwhm_sigma = std::numeric_limits<double>::quiet_NaN();
+      double bkg_mean = std::numeric_limits<double>::quiet_NaN();
+      double bkg_sigma = std::numeric_limits<double>::quiet_NaN();
+      if (ComputeFwhmBootstrap(*pair.hist_coinc,
+                               *pair.hist_search,
+                               pair.window_ns,
+                               boot_trials,
+                               fwhm_mean,
+                               fwhm_sigma,
+                               bkg_mean,
+                               bkg_sigma)) {
+        stats.fwhm_err = fwhm_sigma;
+        stats.bkg_err = bkg_sigma;
+        stats.boot_trials = boot_trials;
+      }
+      std::cout << "FWHM ch " << pair.channel_a << " vs " << pair.channel_b
+                << " window=" << pair.window_ns << " ns:" << std::endl;
+      std::cout << "  bkg=" << bkg_sideband << " (sideband pol0)" << std::endl;
+      std::cout.setf(std::ios::fixed);
+      std::cout << std::setprecision(2);
+      if (std::isfinite(fwhm_hist)) {
+        std::cout << "  FWHM_(bkg-sub)=" << fwhm_hist;
+        if (std::isfinite(stats.fwhm_err)) {
+          std::cout << " ± " << stats.fwhm_err;
+        }
+        std::cout << " ns" << std::endl;
+      }
+
+      TLatex *latex = new TLatex();
+      latex->SetNDC(true);
+      latex->SetTextFont(42);
+      latex->SetTextSize(0.04);
+      if (std::isfinite(fwhm_hist)) {
+        std::ostringstream line;
+        line << std::fixed << std::setprecision(2) << "FWHM_{(bkg-sub)} = " << fwhm_hist << " ns";
+        latex->DrawLatex(0.12, 0.84, line.str().c_str());
+      } else {
+        latex->DrawLatex(0.12, 0.84, "FWHM_{(bkg-sub)} = n/a");
+      }
+      {
+        std::ostringstream line;
+        line << std::fixed << std::setprecision(2) << "bkg_{sideband} = " << bkg_sideband;
+        latex->DrawLatex(0.12, 0.78, line.str().c_str());
+      }
+    } else {
+      std::cout << "FWHM skipped (no entries) for ch " << pair.channel_a << " vs " << pair.channel_b << std::endl;
+    }
+    pair_stats.push_back(stats);
+    c.Print(out_pdf);
+
+    if (pair.hist_dt_fine_a || pair.hist_dt_fine_b) {
+      TCanvas c2("c_dt_fine", "c_dt_fine", 1600, 900);
+      c2.Divide(2, 1, 0.001, 0.001);
+      const double fine_draw_min = 20.0;
+      const double fine_draw_max = 160.0;
+      c2.cd(1);
+      gPad->SetLogz(1);
+      gPad->SetRightMargin(0.14);
+      if (pair.hist_dt_fine_a) {
+        pair.hist_dt_fine_a->GetYaxis()->SetRangeUser(fine_draw_min, fine_draw_max);
+        pair.hist_dt_fine_a->Draw("COLZ");
+      }
+      c2.cd(2);
+      gPad->SetLogz(1);
+      gPad->SetRightMargin(0.14);
+      if (pair.hist_dt_fine_b) {
+        pair.hist_dt_fine_b->GetYaxis()->SetRangeUser(fine_draw_min, fine_draw_max);
+        pair.hist_dt_fine_b->Draw("COLZ");
+      }
+      c2.Print(out_pdf);
+    }
+
+    if (pair.hist_dt_fine_coinc_a || pair.hist_dt_fine_coinc_b) {
+      if (pair.hist_dt_fine_coinc_a) {
+        auto prof = std::unique_ptr<TProfile>(pair.hist_dt_fine_coinc_a->ProfileX(
+            (std::string(pair.hist_dt_fine_coinc_a->GetName()) + "_prof").c_str()));
+        if (prof) {
+          prof->SetDirectory(nullptr);
+          prof->SetLineColor(kBlue + 1);
+          prof->SetLineWidth(2);
+          pair.prof_dt_fine_coinc_a = std::move(prof);
+        }
+      }
+      if (pair.hist_dt_fine_coinc_b) {
+        auto prof = std::unique_ptr<TProfile>(pair.hist_dt_fine_coinc_b->ProfileX(
+            (std::string(pair.hist_dt_fine_coinc_b->GetName()) + "_prof").c_str()));
+        if (prof) {
+          prof->SetDirectory(nullptr);
+          prof->SetLineColor(kRed + 1);
+          prof->SetLineWidth(2);
+          pair.prof_dt_fine_coinc_b = std::move(prof);
+        }
+      }
+
+      TCanvas c3("c_dt_fine_coinc", "c_dt_fine_coinc", 1600, 900);
+      c3.Divide(2, 2, 0.001, 0.001);
+      const double fine_draw_min = 20.0;
+      const double fine_draw_max = 160.0;
+
+      c3.cd(1);
+      gPad->SetLogz(1);
+      gPad->SetRightMargin(0.14);
+      if (pair.hist_dt_fine_coinc_a) {
+        pair.hist_dt_fine_coinc_a->GetXaxis()->SetRangeUser(fine_draw_min, fine_draw_max);
+        pair.hist_dt_fine_coinc_a->Draw("COLZ");
+      }
+
+      c3.cd(2);
+      gPad->SetLogz(1);
+      gPad->SetRightMargin(0.14);
+      if (pair.hist_dt_fine_coinc_b) {
+        pair.hist_dt_fine_coinc_b->GetXaxis()->SetRangeUser(fine_draw_min, fine_draw_max);
+        pair.hist_dt_fine_coinc_b->Draw("COLZ");
+      }
+
+      c3.cd(3);
+      if (pair.prof_dt_fine_coinc_a) {
+        pair.prof_dt_fine_coinc_a->Draw("hist");
+      }
+
+      c3.cd(4);
+      if (pair.prof_dt_fine_coinc_b) {
+        pair.prof_dt_fine_coinc_b->Draw("hist");
+      }
+
+      c3.Print(out_pdf);
+    }
+  }
+  if (pair_mean_hist) {
+    TCanvas c_mean("c_pair_mean", "c_pair_mean", 1600, 900);
+    gPad->SetLogy(1);
+    pair_mean_hist->Draw("hist");
+    c_mean.Print(out_pdf);
+  }
+
+  PlotGroupCoincidencePlots(groups, out_pdf);
+  std::vector<CoincPlotSet> pair_plot_sets;
+  for (size_t p = 0; p < pairs.size(); ++p) {
+    auto &pair = pairs[p];
+    std::vector<int> pair_channels = {pair.channel_a, pair.channel_b};
+    std::ostringstream label;
+    label << "pair" << p << "_ch" << pair.channel_a << "_" << pair.channel_b << "_w" << pair.window_ns;
+    std::string label_tag = SanitizeTag(label.str());
+    std::ostringstream title;
+    title << "coincident hits ch " << pair.channel_a << " vs " << pair.channel_b
+          << " (window " << pair.window_ns << " ns)";
+    const double duration_plot_max = std::max(pair.window_ns, max_duration_ns > 0.0 ? max_duration_ns : 0.0);
+    CoincPlotSet set;
+    if (BuildCoincidentHitDistributions(hits,
+                                        fine_calib,
+                                        pair.coincident_hits,
+                                        pair_channels,
+                                        tick_ns,
+                                        use_fine,
+                                        duration_plot_max,
+                                        label_tag,
+                                        title.str(),
+                                        set)) {
+      pair_plot_sets.push_back(std::move(set));
+    }
+  }
+  DrawCoincidentStacksPerPair(pair_plot_sets, out_pdf);
+  DrawCoincidentStacksPerVariable(pair_plot_sets, out_pdf);
+
+  WriteCoincidenceRoot(out_root,
+                       pairs,
+                       groups,
+                       pair_mean_hist.get(),
+                       pair_plot_sets,
+                       clock_mhz,
+                       use_fine,
+                       max_duration_ns,
+                       fine_cut,
+                       pairs_file);
+
+  WriteCoincidenceTxt(out_txt,
+                      pairs,
+                      pair_stats,
+                      clock_mhz,
+                      use_fine,
+                      max_duration_ns,
+                      fine_cut,
+                      pairs_file);
+
+  c_open.Print(out_close.c_str());
+}

@@ -1,0 +1,8 @@
+# channelA channelB [window_ns]
+17 19 40
+17 22 40
+17 23 40
+19 22 40
+19 23 40
+22 23 40
+group 17 19 22 23 window=40

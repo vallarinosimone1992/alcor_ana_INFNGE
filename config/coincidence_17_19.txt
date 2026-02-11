@@ -1,0 +1,2 @@
+# channelA channelB [window_ns]
+17 19 w=20

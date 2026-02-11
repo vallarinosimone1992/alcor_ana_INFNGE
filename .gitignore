@@ -1,0 +1,13 @@
+# macOS
+.DS_Store
+
+# Decoder build/install artifacts
+decoder/build/
+decoder/local/
+decoder/bin/
+decoder/src/bin/
+
+# Generated outputs
+output/
+calibration/*.root
+calibration/log_*.txt
