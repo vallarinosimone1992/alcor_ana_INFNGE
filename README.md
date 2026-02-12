@@ -74,6 +74,10 @@ Analisi per ALCOR basata su ROOT/RDataFrame. Lavora **direttamente sui decoded**
 - **Fine‑cut**
   - Se impostato, esclude hit con `|fine - cut| <= fine_cut` (cut = (min+max)/2 per TDC).
 - **LUT fine (CDF)**
+  - **TDC index**: indice globale per ogni TDC fisico, non solo 0–3.
+    - Definizione (in `analysis_time.h`): `tdc_index = tdc + 4*pixel + 16*(column%2) + 32*fifo`.
+    - Razionale: per ogni FIFO ci sono 32 TDC fisici (2 parità di colonna × 4 pixel × 4 TDC).
+    - Serve a costruire LUT/linearizzazione per **ogni TDC fisico**, senza mescolare risposte diverse.
   - `fine_calibration_rdf` costruisce `hFineLut` con la CDF per ogni TDC index.
   - Per ogni bin di fine `b` con conteggio `c_b` e totale `N`:
     ```text
