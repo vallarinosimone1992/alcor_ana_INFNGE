@@ -16,7 +16,10 @@
 namespace analysis_time {
 constexpr int kRolloverToCoarse = 32768;
 constexpr int kFineBins = 512;
-constexpr int kTdcPerFifo = 32;
+constexpr int kColumnsPerChip = 8;
+constexpr int kPixelsPerColumn = 4;
+constexpr int kTdcPerPixel = 4;
+constexpr int kTdcPerFifo = kColumnsPerChip * kPixelsPerColumn * kTdcPerPixel;
 constexpr int kFineCalibSize = 24 * kTdcPerFifo;
 constexpr double kDefaultFineMin = 37.0;
 constexpr double kDefaultFineMax = 101.0;
@@ -248,7 +251,10 @@ inline int TdcIndex(int fifo, int column, int pixel, int tdc)
   if (column < 0 || pixel < 0 || tdc < 0) {
     return -1;
   }
-  int idx = tdc + 4 * pixel + 16 * (column % 2) + kTdcPerFifo * fifo;
+  if (column >= kColumnsPerChip || pixel >= kPixelsPerColumn || tdc >= kTdcPerPixel) {
+    return -1;
+  }
+  int idx = tdc + kTdcPerPixel * pixel + (kTdcPerPixel * kPixelsPerColumn) * column + kTdcPerFifo * fifo;
   if (idx < 0 || idx >= kFineCalibSize) {
     return -1;
   }

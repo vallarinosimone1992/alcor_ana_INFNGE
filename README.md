@@ -60,6 +60,8 @@ Analisi per ALCOR basata su ROOT/RDataFrame. Lavora **direttamente sui decoded**
 - `run_channel_calibration.sh` — calibrazione ToT canale‑per‑canale
 - `run_coincidence.sh` — analisi coincidenze, PDF/ROOT/TXT
 - `run_plot.sh` — plot per canali (1D, spill)
+- `run_plot_lut.sh` — plot grafico della LUT fine (2D + slice 1D)
+- `run_test_calib_pipeline.sh` — pipeline test: decode→calibrazioni→coinc (calibration + golden, con/senza calib)
 
 ## Macro (macro/)
 - `analysis_io.h` — risoluzione input (decoded)
@@ -71,33 +73,40 @@ Analisi per ALCOR basata su ROOT/RDataFrame. Lavora **direttamente sui decoded**
 - `fine_validation_rdf.cxx` — validazione LUT fine (intrinseca + cross-validation)
 
 ## Note operative
-- **Fine‑cut**
-  - Se impostato, esclude hit con `|fine - cut| <= fine_cut` (cut = (min+max)/2 per TDC).
 - **LUT fine (CDF)**
   - **TDC index**: indice globale per ogni TDC fisico, non solo 0–3.
-    - Definizione (in `analysis_time.h`): `tdc_index = tdc + 4*pixel + 16*(column%2) + 32*fifo`.
-    - Razionale: per ogni FIFO ci sono 32 TDC fisici (2 parità di colonna × 4 pixel × 4 TDC).
-    - Serve a costruire LUT/linearizzazione per **ogni TDC fisico**, senza mescolare risposte diverse.
-  - `fine_calibration_rdf` costruisce `hFineLut` con la CDF per ogni TDC index.
-  - Per ogni bin di fine `b` con conteggio `c_b` e totale `N`:
-    ```text
-    cum_b = Σ_{k<=b} c_k
-    frac_b = clamp((cum_b - 0.5*c_b) / N, 0, 1)
-    fine_fraction = frac_b - 0.5
-    ```
-  - Il tempo è calcolato come: `time_ns = (time_tick - fine_fraction) * tick_ns`.
-  - Se `hFineLut` non è presente, si usa la mappatura lineare min/max con wrap al cut.
-  - Per forzare il **no‑LUT** (solo min/max) anche se `hFineLut` esiste: `--no-lut`
-  - **Time‑walk (ToT)**: corretto dalla calibrazione canale‑per‑canale (curve ToT→Δt).
-    - Rilevante quando la ToT varia; tende a restringere il picco di coincidenza.
+    - Definizione (in `analysis_time.h`): `tdc_index = tdc + 4*pixel + 16*column + 128*fifo`.
+    - Razionale: per ogni FIFO ci sono 128 TDC fisici (8 colonne × 4 pixel × 4 TDC).
+    - Serve a costruire LUT/linearizzazione per **ogni canale fisico**, senza collassare colonne diverse.
+    - Dopo un cambio di definizione del TDC index, **rigenera** le calibrazioni fine/chan.
+  - **Costruzione LUT** (`fine_calibration_rdf`)
+    - Per ogni TDC index si costruisce un istogramma di **fine_raw** (512 bin).
+    - I quantili `q_low/q_high` definiscono **min/max** (usati anche per il mapping lineare).
+    - Per ogni bin `b` con conteggio `c_b` e totale `N`:
+      ```text
+      cum_b = Σ_{k<=b} c_k
+      frac_b = clamp((cum_b - 0.5*c_b) / N, 0, 1)
+      fine_fraction = frac_b - 0.5
+      ```
+    - La LUT viene salvata in `hFineLut` (TH2D): **X=TDC index**, **Y=fine raw**, **Z=fraction**.
+    - Script per visualizzarla: `script/run_plot_lut.sh` (2D + slice 1D).
+  - **Correzione temporale (fine)**
+    - Tick grezzo: `time_tick = rollover * 32768 + coarse`.
+    - `tick_ns = 1000 / clock_mhz`.
+    - Se `use_fine=1`: `time_ns = (time_tick - fine_fraction) * tick_ns`.
+    - Se `use_fine=0`: `time_ns = time_tick * tick_ns`.
+  - **Fallback lineare** (quando LUT assente o disabilitata)
+    - `fine_fraction = (fine_raw - min) / (max - min)` e **wrap**: se `fine_raw > cut` allora `fine_fraction -= 1`.
+    - `min/max/cut` vengono da calibrazione; se file assente, usa i default (`kDefaultFineMin/Max`).
+    - Opzioni: `--no-lut` (forza lineare), `--no-calib` (ignora file calibrazione).
+  - **Time‑walk (ToT) e offset canale**
+    - La calibrazione canale (`channel_calibration.root`) fornisce una correzione **ToT→Δt** + offset per canale.
+    - Si applica **solo ai leading edge** con ToT valido (serve trailing associato).
+    - Applicazione: `t_lead -= CorrectionNs(channel, ToT)`.
+    - Se `--no-duration` oppure `max_duration<=0`, la correzione ToT viene **saltata**.
     - Disattivabile con `--no-chan-calib` in `run_coincidence.sh`.
-  - La calibrazione di canale è **simmetrica di default** (correzione divisa tra ref e canale).
-    - Disabilita con `run_channel_calibration.sh --no-symmetrize-ref`.
-    - In modalità simmetrica, il riferimento è la **media** delle correzioni dei canali coinvolti.
-  - Viene stimato anche un **offset assoluto per canale** dal run di calibrazione:
-    - per ogni canale si fa un fit gaussiano del residuo Δt dopo la correzione ToT
-    - l’offset è poi applicato in analisi (split 50/50 in modalità simmetrica)
-
+  - **Fine‑cut**
+    - Se impostato, esclude hit con `|fine_raw - cut| <= fine_cut` (cut = (min+max)/2 per TDC).
 ## Aggiornamenti recenti (calibrazione 2 canali)
 - **Calibrazione simmetrica** per il canale di riferimento:
   - `run_channel_calibration.sh --symmetrize-ref` riempie anche la correzione del ref (utile con soli 2 canali).

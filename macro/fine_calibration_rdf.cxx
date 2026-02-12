@@ -348,4 +348,50 @@ void fine_calibration_rdf(const char *input = "../data/calibration",
     std::cout << "  idx " << idx << " min=" << min_vals[idx] << " max=" << max_vals[idx]
               << " entries=" << entries[idx] << std::endl;
   }
+
+  int invalid = 0;
+  for (int idx = 0; idx < size; ++idx) {
+    if (valid_vals[idx]) {
+      continue;
+    }
+    ++invalid;
+  }
+  if (invalid > 0) {
+    std::cout << "TDC indices with insufficient statistics (min_entries=" << min_entries << "):" << std::endl;
+    const int n_fifo = analysis_time::kFineCalibSize / analysis_time::kTdcPerFifo;
+    std::vector<long long> fifo_entries(n_fifo, 0);
+    for (int idx = 0; idx < size; ++idx) {
+      const int fifo = idx / analysis_time::kTdcPerFifo;
+      if (fifo >= 0 && fifo < n_fifo) {
+        fifo_entries[fifo] += entries[idx];
+      }
+    }
+    std::vector<bool> fifo_empty(n_fifo, false);
+    for (int fifo = 0; fifo < n_fifo; ++fifo) {
+      if (fifo_entries[fifo] == 0) {
+        fifo_empty[fifo] = true;
+        std::cout << "  fifo " << fifo << " entries=0 (all TDC indices skipped)" << std::endl;
+      }
+    }
+    for (int idx = 0; idx < size; ++idx) {
+      if (valid_vals[idx]) {
+        continue;
+      }
+      const int fifo = idx / analysis_time::kTdcPerFifo;
+      if (fifo >= 0 && fifo < n_fifo && fifo_empty[fifo]) {
+        continue;
+      }
+      const int local = idx % analysis_time::kTdcPerFifo;
+      const int column = local / (analysis_time::kPixelsPerColumn * analysis_time::kTdcPerPixel);
+      const int rem = local % (analysis_time::kPixelsPerColumn * analysis_time::kTdcPerPixel);
+      const int pixel = rem / analysis_time::kTdcPerPixel;
+      const int tdc = rem % analysis_time::kTdcPerPixel;
+      std::cout << "  idx " << idx
+                << " fifo=" << fifo
+                << " column=" << column
+                << " pixel=" << pixel
+                << " tdc=" << tdc
+                << " entries=" << entries[idx] << std::endl;
+    }
+  }
 }
