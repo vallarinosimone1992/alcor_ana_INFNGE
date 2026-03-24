@@ -1,136 +1,187 @@
 # alcor_ana_INFNGE
 
-Analisi per ALCOR basata su ROOT/RDataFrame. Lavora **direttamente sui decoded** (alcdaq.fifo_*.root).
+ROOT/RDataFrame-based analysis for ALCOR timing studies. This package works on decoded ROOT files (`alcdaq.fifo_*.root`) and provides:
 
-## Variabile ambiente
-- Imposta `ALCOR_ANA_GE` al path di questa cartella per rendere i percorsi indipendenti dal nome:
-  - `export ALCOR_ANA_GE=/Users/simone/Work/BNL/EIC/ePIC/ALCOR/directory_apcx12/alcor_ana_INFNGE`
-- Gli script usano `ALCOR_ANA_GE` se definita.
+- fine-time calibration
+- channel-level ToT and offset calibration
+- coincidence analysis
+- validation scripts for fine calibration and time-walk calibration
 
-## Struttura
-- `script/` eseguibili principali
-- `macro/` macro ROOT C++
-- `config/` configurazioni (coppie di coincidenze)
-- `calibration/` file di calibrazione prodotti
-- `output/` PDF/ROOT/TXT/log prodotti
-- `decoder/` decoder self‑contained (sorgenti/build/binari)
-  - `decoder/src/` sorgenti
-  - `decoder/build/` build dir (generato)
-  - `decoder/local/` install dir (cmake install)
-  - `decoder/bin/` binari finali usati dagli script
+Algorithmic details and calibration notes are documented in `REPORT_CALIBRATION.md`. This README is intentionally limited to software structure and usage.
 
-## Pipeline consigliata (decoded → output)
-1) **Decode raw → decoded ROOT**
-   - `script/decode_raw.sh /path/to/raw_or_run [--force]`
-   - usa il decoder e scrive in `../data/<run>/kc705-196/decoded/alcdaq.fifo_*.root`
-   - default decoder: `decoder/bin/decoder` (risolto via `ALCOR_ANA_GE`) (override con `DECODER_BIN=...`)
+## Requirements
 
-2) **Fine calibration (laser)**
-   - `script/run_fine_calibration.sh -i ../data/calibration`
-   - output: `calibration/fine_calibration.root` + `output/fine_calibration.pdf`
-   - contiene: `hFineMin`, `hFineMax`, `hFineEntries`, `hFineTdc0..3`, **`hFineLut` (CDF)**
+- ROOT available in the environment
+- decoder built and available at `decoder/bin/decoder`, or provided via `DECODER_BIN`
 
-3) **Channel calibration (laser)**
-   - `script/run_channel_calibration.sh -i ../data/calibration -k calibration/fine_calibration.root`
-   - output: `calibration/channel_calibration.root`
-   - curve ToT→correzione per canale, riferite al canale di riferimento (default 19)
+Optional but recommended:
 
-4) **Coincidence (run di test)**
-   - `script/run_coincidence.sh -i ../data/<run_test> -p config/coincidence_17_19.txt -k calibration/fine_calibration.root -K calibration/channel_calibration.root`
-   - output: PDF + ROOT + TXT in `output/`
-   - include: search/coinc window, FWHM, 2D Δt vs fine (search e coinc-only), profili
+- set `ALCOR_ANA_GE` to this directory so the scripts resolve paths consistently
 
-5) **(Opz.) Validazione LUT fine**
-   - `script/run_fine_validation.sh -i ../data/calibration`
-   - output: PDF + ROOT + TXT in `output/`
+```bash
+export ALCOR_ANA_GE=/Users/simone/Work/BNL/EIC/ePIC/ALCOR/directory_apcx12/alcor_ana_INFNGE
+```
 
-## Decoder (self‑contained)
-- Sorgenti: `decoder/src/`
-- Binari: `decoder/bin/decoder`
-  - `decoder/bin/decoder` è un symlink al binario compilato in `decoder/build/src/decoder`.
-- Build: `script/build_decoder.sh`
-  - output principale: `decoder/bin/decoder`
-  - usa dipendenze di sistema (ROOT/Boost; uHAL solo per readout tools)
+If `ALCOR_ANA_GE` is not set, scripts fall back to paths relative to their own location.
 
-## Script (script/)
-- `decode_raw.sh` — raw `.dat` → decoded ROOT
-- `build_decoder.sh` — build del decoder da `decoder/src/`
-- `run_fine_calibration.sh` — calibrazione fine (min/max + LUT, PDF in `output/`)
-- `run_fine_validation.sh` — validazione LUT fine (intrinseca + cross-validation)
-- `run_channel_calibration.sh` — calibrazione ToT canale‑per‑canale
-- `run_coincidence.sh` — analisi coincidenze, PDF/ROOT/TXT
-- `run_plot.sh` — plot per canali (1D, spill)
-- `run_plot_lut.sh` — plot grafico della LUT fine (2D + slice 1D)
-- `run_test_calib_pipeline.sh` — pipeline test: decode→calibrazioni→coinc (calibration + golden, con/senza calib)
+## Directory Layout
 
-## Macro (macro/)
-- `analysis_io.h` — risoluzione input (decoded)
-- `analysis_time.h` — timing, fine‑calib (lineare + LUT CDF), fine‑cut, calibrazione canale
-- `fine_calibration_rdf.cxx` — costruisce `fine_calibration.root` (+ PDF opzionale)
-- `channel_calibration_rdf.cxx` — costruisce `channel_calibration.root`
-- `coincidence_rdf.cxx` — analisi coincidenze (PDF/ROOT/TXT, FWHM, 2D fine)
-- `plot_channels_rdf.cxx` — plot 1D per canali/ spill
-- `fine_validation_rdf.cxx` — validazione LUT fine (intrinseca + cross-validation)
+- `script/`: entry-point shell scripts
+- `macro/`: ROOT C++ macros
+- `config/`: coincidence pair and group configuration files
+- `calibration/`: generated calibration ROOT files
+- `output/`: generated PDF, ROOT, TXT, and log outputs
+- `decoder/`: decoder sources, build tree, and binary
 
-## Note operative
-- **LUT fine (CDF)**
-  - **TDC index**: indice globale per ogni TDC fisico, non solo 0–3.
-    - Definizione (in `analysis_time.h`): `tdc_index = tdc + 4*pixel + 16*column + 128*fifo`.
-    - Razionale: per ogni FIFO ci sono 128 TDC fisici (8 colonne × 4 pixel × 4 TDC).
-    - Serve a costruire LUT/linearizzazione per **ogni canale fisico**, senza collassare colonne diverse.
-    - Dopo un cambio di definizione del TDC index, **rigenera** le calibrazioni fine/chan.
-  - **Costruzione LUT** (`fine_calibration_rdf`)
-    - Per ogni TDC index si costruisce un istogramma di **fine_raw** (512 bin).
-    - I quantili `q_low/q_high` definiscono **min/max** (usati anche per il mapping lineare).
-    - Per ogni bin `b` con conteggio `c_b` e totale `N`:
-      ```text
-      cum_b = Σ_{k<=b} c_k
-      frac_b = clamp((cum_b - 0.5*c_b) / N, 0, 1)
-      fine_fraction = frac_b - 0.5
-      ```
-    - La LUT viene salvata in `hFineLut` (TH2D): **X=TDC index**, **Y=fine raw**, **Z=fraction**.
-    - Script per visualizzarla: `script/run_plot_lut.sh` (2D + slice 1D).
-  - **Correzione temporale (fine)**
-    - Tick grezzo: `time_tick = rollover * 32768 + coarse`.
-    - `tick_ns = 1000 / clock_mhz`.
-    - Se `use_fine=1`: `time_ns = (time_tick - fine_fraction) * tick_ns`.
-    - Se `use_fine=0`: `time_ns = time_tick * tick_ns`.
-  - **Fallback lineare** (quando LUT assente o disabilitata)
-    - `fine_fraction = (fine_raw - min) / (max - min)` e **wrap**: se `fine_raw > cut` allora `fine_fraction -= 1`.
-    - `min/max/cut` vengono da calibrazione; se file assente, usa i default (`kDefaultFineMin/Max`).
-    - Opzioni: `--no-lut` (forza lineare), `--no-calib` (ignora file calibrazione).
-  - **Time‑walk (ToT) e offset canale**
-    - La calibrazione canale (`channel_calibration.root`) fornisce una correzione **ToT→Δt** + offset per canale.
-    - Si applica **solo ai leading edge** con ToT valido (serve trailing associato).
-    - Applicazione: `t_lead -= CorrectionNs(channel, ToT)`.
-    - Se `--no-duration` oppure `max_duration<=0`, la correzione ToT viene **saltata**.
-    - Disattivabile con `--no-chan-calib` in `run_coincidence.sh`.
-  - **Fine‑cut**
-    - Se impostato, esclude hit con `|fine_raw - cut| <= fine_cut` (cut = (min+max)/2 per TDC).
-## Aggiornamenti recenti (calibrazione 2 canali)
-- **Calibrazione simmetrica** per il canale di riferimento:
-  - `run_channel_calibration.sh --symmetrize-ref` riempie anche la correzione del ref (utile con soli 2 canali).
-  - Con più canali, la correzione del ref può “mischiare” contributi (warning in macro).
-  - I plot 2D Δt vs fine (search/coinc‑only) sono **zoomati** sull’asse fine in [20, 160] per chiarezza.
-  - Nei confronti ROOT, sui 2D sono riportati anche:
-    - **corr(Δt, fine)** (correlazione lineare)
-    - **slope** e **span** del profilo ⟨Δt⟩(fine)
+## Data Layout
 
-- **Metriche di valutazione LUT (fine_validation)**
-  - **KS D**: distanza di Kolmogorov‑Smirnov tra CDF empirica di `fine_fraction` e uniforme in \([-0.5, 0.5]\).
-    - **Più piccolo è meglio** (0 = uniformità perfetta).
-  - **p‑value KS**: probabilità di osservare una D almeno così grande se la distribuzione è uniforme.
-    - **Più alto è meglio** (p ≪ 0.05 indica non uniformità significativa).
-  - **mean**: media di `fine_fraction` (idealmente ~0).
-  - **std**: deviazione standard di `fine_fraction` (idealmente ~0.288675 per uniforme in \([-0.5,0.5]\)).
-  - Le metriche sono riportate per **tdc0..tdc3** e **all**, sia per **intrinsic** che **cross**.
-- **Config coincidences** (`config/*.txt`)
-  - Riga coppia: `chA chB [window_ns]`
-  - Riga gruppo: `group ch1 ch2 ch3 [window=ns]`
+The analysis distinguishes raw data and decoded data:
 
-## run_coincidence defaults
-- `window_ns=10`, `clock_mhz=320`, `use_fine=1`, `use_lut=1`
-- `duration_ns=15` (<=0 disabilita filtro durata), `fine_cut=0` (disabilitato)
-- `calib`: `calibration/fine_calibration.root`
-- `chan-calib`: `calibration/channel_calibration.root`
-- output: PDF + ROOT + TXT (nomi derivati dall’input)
+- `../raw_data/<run>/...`: raw `.dat` files and DAQ-side run content
+- `../data/<run>/kc705-196/decoded/*.root`: decoded ROOT files used by the analysis
+
+Common symlinks:
+
+- `../raw_data/calibration`
+- `../raw_data/golden_run`
+- `../data/calibration`
+- `../data/golden_run`
+
+Important:
+
+- pipeline scripts can depend on both `raw_data/*` and `data/*`
+- if you retarget the calibration or golden dataset, either update both symlink pairs or pass explicit input paths
+- calibration files should be built from the calibration run and then validated on an independent golden run
+
+## Build the Decoder
+
+The analysis scripts expect a decoder binary at `decoder/bin/decoder` unless `DECODER_BIN` is set explicitly.
+
+Standard build:
+
+```bash
+script/build_decoder.sh
+```
+
+Useful options:
+
+- `script/build_decoder.sh --clean`: remove the build directory before configuring
+- `script/build_decoder.sh -j 8`: build with a fixed number of parallel jobs
+- `script/build_decoder.sh -h`: show all supported options
+
+The build script configures CMake in `decoder/build`, installs into `decoder/local`, and creates or refreshes the `decoder/bin/decoder` symlink automatically.
+
+After the build, you should have:
+
+```text
+decoder/bin/decoder
+```
+
+## Quick Start
+
+### 1. Decode raw data
+
+```bash
+script/decode_raw.sh /path/to/raw_or_run [--force]
+```
+
+Decoded files are written to:
+
+```text
+../data/<run>/kc705-196/decoded/alcdaq.fifo_*.root
+```
+
+By default the decoder is taken from `decoder/bin/decoder`. Override with `DECODER_BIN=...` if needed.
+
+### 2. Build the fine calibration
+
+```bash
+script/run_fine_calibration.sh -i ../data/calibration
+```
+
+Outputs:
+
+- `calibration/fine_calibration.root`
+- `output/fine_calibration.pdf`
+
+### 3. Build the channel calibration
+
+```bash
+script/run_channel_calibration.sh -i ../data/calibration -k calibration/fine_calibration.root
+```
+
+Output:
+
+- `calibration/channel_calibration.root`
+
+### 4. Run coincidence analysis
+
+```bash
+script/run_coincidence.sh \
+  -i ../data/<run> \
+  -p config/coincidence_17_19.txt \
+  -k calibration/fine_calibration.root \
+  -K calibration/channel_calibration.root
+```
+
+Outputs are written to `output/` as PDF, ROOT, and TXT files.
+
+### 5. Optional validation
+
+Fine-calibration validation:
+
+```bash
+script/run_fine_validation.sh -i ../data/calibration
+```
+
+Time-walk validation:
+
+```bash
+script/run_tw_validation.sh \
+  --calib-input ../data/calibration \
+  --golden-input ../data/golden_run
+```
+
+## Main Scripts
+
+- `decode_raw.sh`: decode raw `.dat` files into ROOT files
+- `build_decoder.sh`: build the decoder from `decoder/src/`
+- `run_fine_calibration.sh`: build the fine calibration ROOT file
+- `run_fine_validation.sh`: validate the fine calibration
+- `run_channel_calibration.sh`: build per-channel ToT and offset calibration
+- `run_coincidence.sh`: run coincidence analysis and write PDF/ROOT/TXT outputs
+- `run_plot.sh`: channel and spill plots
+- `run_plot_lut.sh`: visualize the fine LUT
+- `run_tw_validation.sh`: validate time-walk corrections
+- `run_golden_pipeline.sh`: compact decode -> calibrate -> coincidence workflow
+- `run_test_calib_pipeline.sh`: extended calibration/golden comparison workflow
+
+## Typical Outputs
+
+Calibration products:
+
+- `calibration/fine_calibration.root`
+- `calibration/channel_calibration.root`
+
+Run outputs:
+
+- `output/<label>.pdf`
+- `output/<label>.root`
+- `output/<label>.txt`
+- `output/log_<label>_macro.txt`
+
+## Practical Notes
+
+- `run_golden_pipeline.sh` and `run_test_calib_pipeline.sh` expect the standard calibration and golden symlinks unless you edit the script or invoke lower-level commands directly.
+- `run_coincidence.sh` can be pointed to explicit decoded paths if you do not want to rely on symlinks.
+- If you change the calibration dataset, regenerate both fine and channel calibration files before comparing runs.
+
+## Further Documentation
+
+See `REPORT_CALIBRATION.md` for:
+
+- timing model details
+- fine LUT construction
+- ToT and offset calibration method
+- validation metrics
+- important caveats when interpreting the outputs

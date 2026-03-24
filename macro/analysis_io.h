@@ -77,7 +77,7 @@ inline std::vector<std::string> CollectDecodedFiles(const std::string &dir)
 inline std::vector<std::string> FindDecodedDirs(const std::string &input, int maxdepth = 3)
 {
   std::vector<std::string> decoded_dirs;
-  std::string cmd = "find '" + input + "' -maxdepth " + std::to_string(maxdepth) +
+  std::string cmd = "find -L '" + input + "' -maxdepth " + std::to_string(maxdepth) +
                     " -type d -name decoded 2>/dev/null";
   TString output = gSystem->GetFromPipe(cmd.c_str());
   std::istringstream iss(output.Data());

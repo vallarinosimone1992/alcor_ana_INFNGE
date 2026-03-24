@@ -23,6 +23,13 @@
 #include <vector>
 
 namespace {
+template <typename... Ts>
+void RunGraphsCompat(Ts &...results)
+{
+  int dummy[] = {(results.GetValue(), 0)...};
+  (void)dummy;
+}
+
 bool WantsHelp(const char *arg)
 {
   if (!arg) {
@@ -37,7 +44,7 @@ void PrintPlotHelp()
   std::cout << "plot_channels_rdf usage:" << std::endl;
   std::cout
       << "  plot_channels_rdf(\"/path/to/decoded.root\", \"out.pdf\", \"17,19\", \"fine_calibration.root\","
-         " 1, 0, true)"
+         " 1, 0, true, 320, 1, 15, \"channel_calibration.root\")"
             << std::endl;
   std::cout << "Inputs:" << std::endl;
   std::cout << "  decoded dir must contain alcdaq.fifo_*.root with TTree 'alcor'" << std::endl;
@@ -46,6 +53,7 @@ void PrintPlotHelp()
   std::cout << "  channels list can be comma- or space-separated" << std::endl;
   std::cout << "  fine calibration file uses hFineMin/hFineMax; default formula used when missing" << std::endl;
   std::cout << "  use_lut=false disables LUT even if hFineLut is present" << std::endl;
+  std::cout << "  channel calibration uses hChanCalib_chXX vs ToT; applied to leading-edge times" << std::endl;
   std::cout << "  spill index is 0-based; default 1 (second spill)" << std::endl;
   std::cout << "  includes extra plot: leading-edge time distribution in selected spill" << std::endl;
   std::cout << "  fine_cut excludes hits with |fine - cut| <= fine_cut (fine units)" << std::endl;
@@ -157,15 +165,18 @@ void plot_channels_rdf(const char *decoded_dir = "../raw_data/latest/kc705-196/d
                        const char *fine_calib_path = "",
                        int spill_index = 1,
                        int fine_cut = analysis_time::kDefaultFineCut,
-                       bool use_lut = true)
+                       bool use_lut = true,
+                       double clock_mhz = 320.0,
+                       int use_fine = 1,
+                       double max_duration_ns = 15.0,
+                       const char *chan_calib_path = "")
 {
-  ScopedTimer timer("plot_channels_rdf");
-  ROOT::EnableImplicitMT();
-
   if (WantsHelp(decoded_dir)) {
     PrintPlotHelp();
     return;
   }
+
+  ScopedTimer timer("plot_channels_rdf");
 
   auto input_spec = analysis_io::ResolveInputSpec(decoded_dir);
   if (input_spec.files.empty()) {
@@ -179,11 +190,19 @@ void plot_channels_rdf(const char *decoded_dir = "../raw_data/latest/kc705-196/d
     return;
   }
 
+  const bool use_fine_flag = (use_fine != 0);
+  if (max_duration_ns < 0.0) {
+    max_duration_ns = 0.0;
+  }
+
   std::cout << "Input: " << decoded_dir << std::endl;
   std::cout << "Output: " << out_pdf << std::endl;
   std::cout << "Channels: " << channels << std::endl;
   std::cout << "Spill index: " << spill_index << std::endl;
+  std::cout << "Clock (MHz): " << clock_mhz << std::endl;
+  std::cout << "Use fine: " << (use_fine_flag ? 1 : 0) << std::endl;
   std::cout << "Use LUT: " << (use_lut ? 1 : 0) << std::endl;
+  std::cout << "Max duration (ns): " << max_duration_ns << std::endl;
   if (fine_cut > 0) {
     std::cout << "Fine cut (bins): " << fine_cut << std::endl;
   } else {
@@ -192,8 +211,12 @@ void plot_channels_rdf(const char *decoded_dir = "../raw_data/latest/kc705-196/d
   if (fine_calib_path && fine_calib_path[0] != '\0') {
     std::cout << "Fine calib: " << fine_calib_path << std::endl;
   }
+  if (chan_calib_path && chan_calib_path[0] != '\0') {
+    std::cout << "Channel calib: " << chan_calib_path << std::endl;
+  }
 
-  analysis_time::FineCalib fine_calib;
+  auto fine_calib_ptr = std::make_unique<analysis_time::FineCalib>();
+  auto &fine_calib = *fine_calib_ptr;
   if (fine_calib_path && fine_calib_path[0] != '\0') {
     if (fine_calib.LoadFromFile(fine_calib_path)) {
       std::cout << "Loaded fine calibration: " << fine_calib_path << std::endl;
@@ -203,7 +226,18 @@ void plot_channels_rdf(const char *decoded_dir = "../raw_data/latest/kc705-196/d
   }
   fine_calib.use_lut = use_lut;
   analysis_time::PrintFineCalibConstants(fine_calib);
+  auto chan_calib_ptr = std::make_unique<analysis_time::ChannelCalib>();
+  auto &chan_calib = *chan_calib_ptr;
+  if (chan_calib_path && chan_calib_path[0] != '\0') {
+    if (chan_calib.LoadFromFile(chan_calib_path)) {
+      std::cout << "Loaded channel calibration: " << chan_calib_path << std::endl;
+    } else {
+      std::cout << "Failed to load channel calibration: " << chan_calib_path << " (ignored)" << std::endl;
+    }
+  }
+  analysis_time::PrintChannelCalibSummary(chan_calib);
 
+  ROOT::EnableImplicitMT();
   ROOT::RDataFrame df(input_spec.tree_name.c_str(), input_spec.files);
   auto colnames = df.GetColumnNames();
   bool has_channel = std::find(colnames.begin(), colnames.end(), "channel") != colnames.end();
@@ -217,9 +251,9 @@ void plot_channels_rdf(const char *decoded_dir = "../raw_data/latest/kc705-196/d
     df_hits_ch = df_hits.Define("channel", "column * 4 + pixel");
   }
 
-  auto df_hits_cut = df_hits_ch;
-  if (fine_cut > 0) {
-    auto fine_cut_lambda = [fine_calib, fine_cut](int fine, int fifo, int column, int pixel, int tdc) -> bool {
+  ROOT::RDF::RNode df_hits_cut = df_hits_ch;
+  if (use_fine_flag && fine_cut > 0) {
+    auto fine_cut_lambda = [&fine_calib, fine_cut](int fine, int fifo, int column, int pixel, int tdc) -> bool {
       const int tdc_index = analysis_time::TdcIndex(fifo, column, pixel, tdc);
       return analysis_time::PassFineCut(fine_calib, fine, tdc_index, fine_cut);
     };
@@ -313,8 +347,8 @@ void plot_channels_rdf(const char *decoded_dir = "../raw_data/latest/kc705-196/d
     rdf_hists_store.push_back(std::move(hists));
   }
 
-  const double tick_ns = analysis_time::TickNs(320.0);
-  const double duration_max_ns = 20.0;
+  const double tick_ns = analysis_time::TickNs(clock_mhz);
+  const double duration_max_ns = max_duration_ns;
   auto df_time = df_sel;
   if (!has_time_tick) {
     df_time = df_time.Define("time_tick", analysis_time::TimeTickLambda(), {"rollover", "coarse"});
@@ -326,7 +360,7 @@ void plot_channels_rdf(const char *decoded_dir = "../raw_data/latest/kc705-196/d
   auto pixel_vals = df_time.Take<int>("pixel");
   auto tdc_vals = df_time.Take<int>("tdc");
   auto fine_vals = df_time.Take<int>("fine");
-  ROOT::RDF::RunGraphs({ch_vals, time_vals, fifo_vals, column_vals, pixel_vals, tdc_vals, fine_vals});
+  RunGraphsCompat(ch_vals, time_vals, fifo_vals, column_vals, pixel_vals, tdc_vals, fine_vals);
 
   std::unordered_map<int, size_t> channel_index;
   channel_index.reserve(views.size());
@@ -334,16 +368,20 @@ void plot_channels_rdf(const char *decoded_dir = "../raw_data/latest/kc705-196/d
     channel_index[views[i].channel] = i;
   }
 
-  struct EdgeHit {
+  struct Hit {
     long long time_tick;
     int fine;
     int tdc;
     int fifo;
     int column;
     int pixel;
+    int spill;
+    double time_ns_raw;
+    double time_ns;
+    bool leading;
   };
 
-  std::vector<std::vector<EdgeHit>> hits_by_channel(views.size());
+  std::vector<std::vector<Hit>> hits_by_channel(views.size());
   const auto &channels_vec = ch_vals.GetValue();
   const auto &times_vec = time_vals.GetValue();
   const auto &fifos_vec = fifo_vals.GetValue();
@@ -351,68 +389,133 @@ void plot_channels_rdf(const char *decoded_dir = "../raw_data/latest/kc705-196/d
   const auto &pixels_vec = pixel_vals.GetValue();
   const auto &tdc_vec = tdc_vals.GetValue();
   const auto &fine_vec = fine_vals.GetValue();
+  std::vector<int> spills_vec;
+  if (has_spill) {
+    auto spills_take = df_time.Take<int>("spill");
+    RunGraphsCompat(spills_take);
+    spills_vec = spills_take.GetValue();
+  }
+
   for (size_t i = 0; i < channels_vec.size(); ++i) {
     int ch = channels_vec[i];
     auto idx_it = channel_index.find(ch);
     if (idx_it == channel_index.end()) {
       continue;
     }
-    hits_by_channel[idx_it->second].push_back(
-        {times_vec[i], fine_vec[i], tdc_vec[i], fifos_vec[i], columns_vec[i], pixels_vec[i]});
+    int spill_val = -1;
+    if (has_spill && i < spills_vec.size()) {
+      spill_val = spills_vec[i];
+    }
+    int tdc_index = analysis_time::TdcIndex(fifos_vec[i], columns_vec[i], pixels_vec[i], tdc_vec[i]);
+    double time_ns_raw =
+        analysis_time::TimeNsFromTick(fine_calib, times_vec[i], fine_vec[i], tdc_index, tick_ns, use_fine_flag);
+    hits_by_channel[idx_it->second].push_back({times_vec[i],
+                                               fine_vec[i],
+                                               tdc_vec[i],
+                                               fifos_vec[i],
+                                               columns_vec[i],
+                                               pixels_vec[i],
+                                               spill_val,
+                                               time_ns_raw,
+                                               time_ns_raw,
+                                               false});
   }
 
   std::vector<std::vector<double>> durations(views.size());
   bool has_duration = false;
+  bool skip_chan_calib = false;
+  if (chan_calib.loaded && duration_max_ns <= 0.0) {
+    skip_chan_calib = true;
+    std::cout << "Channel calibration loaded but max_duration_ns <= 0; skipping correction." << std::endl;
+  }
 
   for (size_t i = 0; i < hits_by_channel.size(); ++i) {
     auto &hits = hits_by_channel[i];
     if (hits.empty()) {
       continue;
     }
-    std::sort(hits.begin(), hits.end(), [](const EdgeHit &a, const EdgeHit &b) {
+    std::sort(hits.begin(), hits.end(), [](const Hit &a, const Hit &b) {
       if (a.time_tick != b.time_tick) {
         return a.time_tick < b.time_tick;
       }
       return a.fine < b.fine;
     });
 
-    std::array<bool, 2> have_leading = {false, false};
-    std::array<double, 2> leading_time_ns = {0.0, 0.0};
-    std::array<int, 2> leading_tdc = {-1, -1};
-    for (const auto &hit : hits) {
-      if (!IsLeadingTdc(hit.tdc) && !IsTrailingTdc(hit.tdc)) {
-        continue;
-      }
-      if (!IsValidTdcId(hit.tdc)) {
-        continue;
-      }
-      int pair = TdcPairIndex(hit.tdc);
-      if (pair < 0 || pair > 1) {
-        continue;
-      }
-      int tdc_index = analysis_time::TdcIndex(hit.fifo, hit.column, hit.pixel, hit.tdc);
-      double time_ns =
-          analysis_time::TimeNsFromTick(fine_calib, hit.time_tick, hit.fine, tdc_index, tick_ns, true);
+    std::vector<char> leading_mask(hits.size(), 0);
+    std::vector<int> leading_to_trailing(hits.size(), -1);
 
-      if (IsLeadingTdc(hit.tdc)) {
-        leading_time_ns[pair] = time_ns;
-        leading_tdc[pair] = hit.tdc;
-        have_leading[pair] = true;
-        continue;
-      }
+    if (duration_max_ns > 0.0) {
+      std::array<bool, 2> have_leading = {false, false};
+      std::array<double, 2> leading_time_ns = {0.0, 0.0};
+      std::array<int, 2> leading_tdc = {-1, -1};
+      std::array<int, 2> leading_idx = {-1, -1};
+      for (size_t j = 0; j < hits.size(); ++j) {
+        const auto &hit = hits[j];
+        if (!IsLeadingTdc(hit.tdc) && !IsTrailingTdc(hit.tdc)) {
+          continue;
+        }
+        if (!IsValidTdcId(hit.tdc)) {
+          continue;
+        }
+        int pair = TdcPairIndex(hit.tdc);
+        if (pair < 0 || pair > 1) {
+          continue;
+        }
 
-      if (!have_leading[pair]) {
-        continue;
+        if (IsLeadingTdc(hit.tdc)) {
+          leading_time_ns[pair] = hit.time_ns_raw;
+          leading_tdc[pair] = hit.tdc;
+          leading_idx[pair] = static_cast<int>(j);
+          have_leading[pair] = true;
+          continue;
+        }
+
+        if (!have_leading[pair]) {
+          continue;
+        }
+        if (leading_tdc[pair] < 0 || hit.tdc != (leading_tdc[pair] ^ 0x1)) {
+          continue;
+        }
+        double dt_ns = hit.time_ns_raw - leading_time_ns[pair];
+        if (dt_ns >= 0.0 && dt_ns <= duration_max_ns) {
+          durations[i].push_back(dt_ns);
+          has_duration = true;
+          int lead_idx = leading_idx[pair];
+          if (lead_idx >= 0 && lead_idx < static_cast<int>(hits.size())) {
+            leading_mask[lead_idx] = 1;
+            leading_to_trailing[lead_idx] = static_cast<int>(j);
+          }
+        }
+        have_leading[pair] = false;
       }
-      if (leading_tdc[pair] < 0 || hit.tdc != (leading_tdc[pair] ^ 0x1)) {
-        continue;
+    } else {
+      for (size_t j = 0; j < hits.size(); ++j) {
+        if (IsLeadingTdc(hits[j].tdc)) {
+          leading_mask[j] = 1;
+        }
       }
-      double dt_ns = time_ns - leading_time_ns[pair];
-      if (dt_ns >= 0.0 && dt_ns <= duration_max_ns) {
-        durations[i].push_back(dt_ns);
-        has_duration = true;
+    }
+
+    for (size_t j = 0; j < hits.size(); ++j) {
+      hits[j].leading = leading_mask[j] != 0;
+    }
+
+    if (chan_calib.loaded && !skip_chan_calib && duration_max_ns > 0.0) {
+      const int channel = views[i].channel;
+      for (size_t j = 0; j < hits.size(); ++j) {
+        if (!leading_mask[j]) {
+          continue;
+        }
+        int trailing = leading_to_trailing[j];
+        if (trailing < 0 || trailing >= static_cast<int>(hits.size())) {
+          continue;
+        }
+        double tot = hits[trailing].time_ns_raw - hits[j].time_ns_raw;
+        if (tot <= 0.0 || tot > duration_max_ns) {
+          continue;
+        }
+        hits[j].time_ns = hits[j].time_ns_raw - chan_calib.CorrectionNs(channel, tot);
       }
-      have_leading[pair] = false;
     }
   }
 
@@ -424,15 +527,19 @@ void plot_channels_rdf(const char *decoded_dir = "../raw_data/latest/kc705-196/d
     }
     PlotGroup duration_group;
     duration_group.name = "duration";
-    duration_group.title = "hit duration (leading-trailing, <= 20 ns); Delta t [ns]; entries";
+    std::ostringstream duration_title;
+    duration_title << "hit duration (leading-trailing, <= " << duration_max_ns << " ns); Delta t [ns]; entries";
+    duration_group.title = duration_title.str();
     duration_group.hists.reserve(views.size());
     duration_hists.reserve(views.size());
 
     for (size_t i = 0; i < views.size(); ++i) {
       std::string name = "h_duration_ch" + std::to_string(views[i].channel);
-      std::string ch_title = "hit duration (leading-trailing, <= 20 ns) (channel " +
-                             std::to_string(views[i].channel) + "); Delta t [ns]; entries";
-      auto hist = std::make_unique<TH1D>(name.c_str(), ch_title.c_str(), bins, 0.0, duration_max_ns);
+      std::ostringstream ch_title;
+      ch_title << "hit duration (leading-trailing, <= " << duration_max_ns << " ns) (channel "
+               << views[i].channel << "); Delta t [ns]; entries";
+      const std::string ch_title_str = ch_title.str();
+      auto hist = std::make_unique<TH1D>(name.c_str(), ch_title_str.c_str(), bins, 0.0, duration_max_ns);
       hist->SetLineColor(colors[i % colors.size()]);
       hist->SetLineWidth(2);
       hist->SetDirectory(nullptr);
@@ -444,6 +551,39 @@ void plot_channels_rdf(const char *decoded_dir = "../raw_data/latest/kc705-196/d
     }
 
     groups.push_back(duration_group);
+  }
+
+  struct FineTdcGroup {
+    int channel = -1;
+    std::array<TH1D *, 4> hists{};
+  };
+  std::vector<FineTdcGroup> fine_tdc_groups;
+  std::vector<std::array<ROOT::RDF::RResultPtr<TH1D>, 4>> fine_tdc_store;
+
+  {
+    const int fine_bins = analysis_time::kFineBins;
+    const double fine_lo = -0.5;
+    const double fine_hi = static_cast<double>(analysis_time::kFineBins) - 0.5;
+    fine_tdc_groups.reserve(views.size());
+    fine_tdc_store.reserve(views.size());
+    for (auto &view : views) {
+      FineTdcGroup group;
+      group.channel = view.channel;
+      std::array<ROOT::RDF::RResultPtr<TH1D>, 4> hists;
+      for (int tdc = 0; tdc < 4; ++tdc) {
+        std::string name = "h_fine_ch" + std::to_string(view.channel) + "_tdc" + std::to_string(tdc);
+        std::string title = "fine (channel " + std::to_string(view.channel) + ", tdc " + std::to_string(tdc) +
+                            "); fine; entries";
+        auto hist = view.df.Filter("tdc == " + std::to_string(tdc))
+                        .Histo1D({name.c_str(), title.c_str(), fine_bins, fine_lo, fine_hi}, "fine");
+        hist->SetLineColor(kBlue + 1);
+        hist->SetLineWidth(2);
+        hists[tdc] = hist;
+        group.hists[tdc] = hist.GetPtr();
+      }
+      fine_tdc_store.push_back(std::move(hists));
+      fine_tdc_groups.push_back(group);
+    }
   }
 
   std::vector<std::vector<double>> spill_times(views.size());
@@ -466,12 +606,12 @@ void plot_channels_rdf(const char *decoded_dir = "../raw_data/latest/kc705-196/d
     auto pixels_all = df_all.Take<int>("pixel");
     auto tdcs_all = df_all.Take<int>("tdc");
     auto fines_all = df_all.Take<int>("fine");
-    ROOT::RDF::RunGraphs({types_all, channels_all, ticks_all, fifos_all, columns_all, pixels_all, tdcs_all, fines_all});
+    RunGraphsCompat(types_all, channels_all, ticks_all, fifos_all, columns_all, pixels_all, tdcs_all, fines_all);
 
     std::vector<int> spills_all;
     if (has_spill) {
       auto spills_take = df_all.Take<int>("spill");
-      ROOT::RDF::RunGraphs({spills_take});
+      RunGraphsCompat(spills_take);
       spills_all = spills_take.GetValue();
     }
 
@@ -499,30 +639,18 @@ void plot_channels_rdf(const char *decoded_dir = "../raw_data/latest/kc705-196/d
         spill_start_tick = std::min(spill_start_tick, ticks_vals[i]);
       }
       if (spill_start_tick != std::numeric_limits<Long64_t>::max()) {
-        for (size_t i = 0; i < types_vals.size(); ++i) {
-          if (types_vals[i] != 1) {
-            continue;
+        double start_ns = static_cast<double>(spill_start_tick) * tick_ns;
+        for (size_t ch_idx = 0; ch_idx < hits_by_channel.size(); ++ch_idx) {
+          for (const auto &hit : hits_by_channel[ch_idx]) {
+            if (hit.spill != spill_index) {
+              continue;
+            }
+            if (!hit.leading) {
+              continue;
+            }
+            spill_times[ch_idx].push_back(hit.time_ns - start_ns);
+            has_spill_times = true;
           }
-          if (static_cast<size_t>(i) >= spills_all.size()) {
-            continue;
-          }
-          if (spills_all[i] != spill_index) {
-            continue;
-          }
-          int ch = channels_vals[i];
-          auto idx_it = channel_index.find(ch);
-          if (idx_it == channel_index.end()) {
-            continue;
-          }
-          if (!IsLeadingTdc(tdcs_vals[i])) {
-            continue;
-          }
-          int tdc_index = analysis_time::TdcIndex(fifos_vals[i], columns_vals[i], pixels_vals[i], tdcs_vals[i]);
-          double time_ns =
-              analysis_time::TimeNsFromTick(fine_calib, ticks_vals[i], fines_vals[i], tdc_index, tick_ns, true);
-          double start_ns = static_cast<double>(spill_start_tick) * tick_ns;
-          spill_times[idx_it->second].push_back(time_ns - start_ns);
-          has_spill_times = true;
         }
       }
     } else {
@@ -574,7 +702,7 @@ void plot_channels_rdf(const char *decoded_dir = "../raw_data/latest/kc705-196/d
         }
         int tdc_index = analysis_time::TdcIndex(fifo, columns_vals[i], pixels_vals[i], tdcs_vals[i]);
         double time_ns =
-            analysis_time::TimeNsFromTick(fine_calib, ticks_vals[i], fines_vals[i], tdc_index, tick_ns, true);
+            analysis_time::TimeNsFromTick(fine_calib, ticks_vals[i], fines_vals[i], tdc_index, tick_ns, use_fine_flag);
         if (!has_start_by_fifo[fifo]) {
           continue;
         }
@@ -660,6 +788,19 @@ void plot_channels_rdf(const char *decoded_dir = "../raw_data/latest/kc705-196/d
       group.hists[i]->Draw("hist");
     }
 
+    c.Print(out_pdf);
+  }
+
+  for (const auto &group : fine_tdc_groups) {
+    std::string cname = "c_fine_tdc_ch" + std::to_string(group.channel);
+    TCanvas c(cname.c_str(), cname.c_str(), 1600, 900);
+    c.Divide(2, 2, 0.001, 0.001);
+    for (int tdc = 0; tdc < 4; ++tdc) {
+      c.cd(tdc + 1);
+      if (group.hists[tdc]) {
+        group.hists[tdc]->Draw("hist");
+      }
+    }
     c.Print(out_pdf);
   }
 

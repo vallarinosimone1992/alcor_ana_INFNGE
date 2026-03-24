@@ -16,6 +16,10 @@ Optional options:
       --q-low VALUE        low quantile for min (default 0.01)
       --q-high VALUE       high quantile for max (default 0.99)
       --min-entries N      minimum hits per TDC (default 200)
+  -d, --duration NS        max ToT (ns) to match coincidence selection (default 0 = disabled)
+      --match-coincidence  use leading edges with valid ToT for LUT (default off)
+      --no-match-coincidence disable leading/ToT filter
+  -m, --clock MHz          clock frequency for ToT matching (default 320)
   -h, --help               show this help
 USAGE
 }
@@ -26,6 +30,9 @@ input_dir=""
 q_low=0.01
 q_high=0.99
 min_entries=200
+max_duration_ns=0
+match_coincidence=0
+clock_mhz=320
 
 need_arg() {
   if [ "$#" -lt 2 ] || [ -z "${2-}" ]; then
@@ -95,6 +102,32 @@ while [ "$#" -gt 0 ]; do
       min_entries=${1#*=}
       shift
       ;;
+    -d|--duration)
+      need_arg "$@"
+      max_duration_ns=${2:-}
+      shift 2
+      ;;
+    --duration=*)
+      max_duration_ns=${1#*=}
+      shift
+      ;;
+    --match-coincidence)
+      match_coincidence=1
+      shift
+      ;;
+    --no-match-coincidence)
+      match_coincidence=0
+      shift
+      ;;
+    -m|--clock)
+      need_arg "$@"
+      clock_mhz=${2:-}
+      shift 2
+      ;;
+    --clock=*)
+      clock_mhz=${1#*=}
+      shift
+      ;;
     *)
       echo "Unknown option: $1" >&2
       usage >&2
@@ -152,7 +185,7 @@ elif ! has_root_files "${resolved_dir}"; then
       if has_root_files "${cand}"; then
         filtered+=("${cand}")
       fi
-    done < <(find "${resolved_dir}" -maxdepth 3 -type d -name decoded 2>/dev/null)
+    done < <(find -L "${resolved_dir}" -maxdepth 3 -type d -name decoded 2>/dev/null)
     if [[ "${#filtered[@]}" -eq 1 ]]; then
       resolved_dir="${filtered[0]}"
     else
@@ -189,4 +222,4 @@ fi
 
 exec > >(tee "${log_path}") 2>&1
 
-root -l -b -q "${macro_path}(\"${resolved_dir}\",\"${out_path}\",${q_low},${q_high},${min_entries},\"${pdf_path}\")"
+root -l -b -q "${macro_path}(\"${resolved_dir}\",\"${out_path}\",${q_low},${q_high},${min_entries},\"${pdf_path}\",${max_duration_ns},${match_coincidence},${clock_mhz})"

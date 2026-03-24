@@ -1,8 +1,12 @@
 #include <ROOT/RDataFrame.hxx>
+#include <TCanvas.h>
 #include <TFile.h>
-#include <TProfile.h>
+#include <TH1D.h>
+#include <THStack.h>
+#include <TLegend.h>
 #include <TParameter.h>
 #include <TF1.h>
+#include <TStyle.h>
 #include <TSystem.h>
 
 #include "analysis_io.h"
@@ -43,6 +47,31 @@ struct ScopedTimer {
     std::cout << "Elapsed time (" << label << "): " << elapsed.count() << " s" << std::endl;
   }
 };
+
+bool HasNonZeroBin(const TH1D *hist)
+{
+  if (!hist) {
+    return false;
+  }
+  const int bins = hist->GetNbinsX();
+  for (int b = 1; b <= bins; ++b) {
+    if (hist->GetBinContent(b) != 0.0) {
+      return true;
+    }
+  }
+  return false;
+}
+
+void GridForCount(size_t count, int &cols, int &rows)
+{
+  if (count == 0) {
+    cols = 1;
+    rows = 1;
+    return;
+  }
+  cols = static_cast<int>(std::ceil(std::sqrt(static_cast<double>(count))));
+  rows = static_cast<int>(std::ceil(static_cast<double>(count) / cols));
+}
 
 bool HasBranch(const std::vector<std::string> &cols, const std::string &name)
 {
@@ -199,28 +228,56 @@ struct CalibHit {
   double tot_ns = 0.0;
 };
 
-double ProfileValue(const TProfile *prof, double x)
+double HistValue(const TH1 *hist, double x)
 {
-  if (!prof) {
+  if (!hist) {
     return 0.0;
   }
-  const int bins = prof->GetNbinsX();
+  const int bins = hist->GetNbinsX();
   if (bins <= 0) {
     return 0.0;
   }
-  if (x <= prof->GetXaxis()->GetXmin()) {
-    return prof->GetBinContent(1);
+  if (x <= hist->GetXaxis()->GetXmin()) {
+    return hist->GetBinContent(1);
   }
-  if (x >= prof->GetXaxis()->GetXmax()) {
-    return prof->GetBinContent(bins);
+  if (x >= hist->GetXaxis()->GetXmax()) {
+    return hist->GetBinContent(bins);
   }
-  int bin = prof->GetXaxis()->FindBin(x);
+  int bin = hist->GetXaxis()->FindBin(x);
   if (bin < 1) {
     bin = 1;
   } else if (bin > bins) {
     bin = bins;
   }
-  return prof->GetBinContent(bin);
+  return hist->GetBinContent(bin);
+}
+
+int TotBinIndex(double tot_ns, double max_duration_ns, int tot_bins)
+{
+  if (tot_ns <= 0.0 || tot_ns > max_duration_ns || tot_bins <= 0) {
+    return -1;
+  }
+  const double frac = tot_ns / max_duration_ns;
+  int bin = static_cast<int>(frac * static_cast<double>(tot_bins));
+  if (bin < 0) {
+    bin = 0;
+  } else if (bin >= tot_bins) {
+    bin = tot_bins - 1;
+  }
+  return bin;
+}
+
+double MedianValue(std::vector<double> &vals)
+{
+  if (vals.empty()) {
+    return 0.0;
+  }
+  std::sort(vals.begin(), vals.end());
+  const size_t n = vals.size();
+  if (n % 2 == 1) {
+    return vals[n / 2];
+  }
+  return 0.5 * (vals[n / 2 - 1] + vals[n / 2]);
 }
 
 double FitGaussianMean(TH1D *hist, double range)
@@ -295,12 +352,13 @@ void channel_calibration_rdf(const char *input = "../data/calibration",
                              bool use_fine = true,
                              const char *fine_calib_path = "",
                              bool use_lut = true,
-                             bool symmetrize_ref = true)
+                             bool symmetrize_ref = true,
+                             const char *out_pdf = "")
 {
   if (WantsHelp(input) || WantsHelp(out_root)) {
     std::cout << "channel_calibration_rdf usage:\n";
     std::cout << "  channel_calibration_rdf(\"/path/to/decoded_or_parent\", \"channel_calibration.root\", 19,"
-              << " 40.0, 20.0, 60, 320.0, true, \"fine_calibration.root\", true, true)\n";
+              << " 40.0, 20.0, 60, 320.0, true, \"fine_calibration.root\", true, true, \"channel_calibration.pdf\")\n";
     std::cout << "  required branches: type,fifo,column,pixel,tdc,rollover,coarse,fine\n";
     std::cout << "  use_lut=false disables LUT even if hFineLut is present\n";
     std::cout << "  symmetrize_ref=true splits correction between ref and channel (mean reference)\n";
@@ -480,77 +538,137 @@ void channel_calibration_rdf(const char *input = "../data/calibration",
     leading_tot[i] = dt;
   }
 
-  std::unordered_map<uint64_t, std::vector<RefHit>> ref_hits;
-  std::array<std::unordered_map<uint64_t, std::vector<CalibHit>>, 32> hits_by_channel;
-
-  for (size_t i = 0; i < hits.size(); ++i) {
-    if (i >= leading_mask.size() || !leading_mask[i]) {
-      continue;
+  auto build_maps = [&](const std::vector<double> &times_ns,
+                        std::unordered_map<uint64_t, std::vector<RefHit>> &ref_hits_out,
+                        std::array<std::unordered_map<uint64_t, std::vector<CalibHit>>, 32> &hits_by_channel_out) {
+    ref_hits_out.clear();
+    for (auto &entry : hits_by_channel_out) {
+      entry.clear();
     }
-    double tot = leading_tot[i];
-    if (tot <= 0.0 || tot > max_duration_ns) {
-      continue;
-    }
-    const Hit &hit = hits[i];
-    const uint64_t key = RunSpillKey(hit.run_id, hit.spill);
-    if (hit.channel == ref_channel) {
-      double ref_tot = tot;
-      if (ref_tot <= 0.0 || ref_tot > max_duration_ns) {
-        ref_tot = -1.0;
-      }
-      ref_hits[key].push_back({hit.time_ns, ref_tot});
-    } else if (hit.channel >= 0 && hit.channel < 32) {
-      hits_by_channel[hit.channel][key].push_back({hit.time_ns, tot});
-    }
-  }
-
-  for (auto &kv : ref_hits) {
-    auto &vec = kv.second;
-    std::sort(vec.begin(), vec.end(), [](const RefHit &a, const RefHit &b) { return a.time_ns < b.time_ns; });
-  }
-
-  std::vector<std::unique_ptr<TProfile>> profiles;
-  profiles.reserve(32);
-  for (int ch = 0; ch < 32; ++ch) {
-    std::string name = "hChanCalib_ch" + std::to_string(ch);
-    std::string title = "Channel calibration ch" + std::to_string(ch) + ";ToT [ns];#Delta t [ns]";
-    auto prof = std::make_unique<TProfile>(name.c_str(), title.c_str(), tot_bins, 0.0, max_duration_ns);
-    prof->SetDirectory(nullptr);
-    profiles.push_back(std::move(prof));
-  }
-
-  const double symm_scale = symmetrize_ref ? 0.5 : 1.0;
-  for (int ch = 0; ch < 32; ++ch) {
-    if (ch == ref_channel) {
-      continue;
-    }
-    for (auto &kv : hits_by_channel[ch]) {
-      auto it_ref = ref_hits.find(kv.first);
-      if (it_ref == ref_hits.end()) {
+    for (size_t i = 0; i < hits.size(); ++i) {
+      if (i >= leading_mask.size() || !leading_mask[i]) {
         continue;
       }
-      const auto &refs = it_ref->second;
-      for (const auto &hit : kv.second) {
-        double dt = 0.0;
-        double ref_tot = -1.0;
-        bool ok = NearestDelta(refs, hit.time_ns, window_ns, dt, ref_tot);
-        if (!ok) {
+      double tot = leading_tot[i];
+      if (tot <= 0.0 || tot > max_duration_ns) {
+        continue;
+      }
+      const Hit &hit = hits[i];
+      const uint64_t key = RunSpillKey(hit.run_id, hit.spill);
+      if (hit.channel == ref_channel) {
+        double ref_tot = tot;
+        if (ref_tot <= 0.0 || ref_tot > max_duration_ns) {
+          ref_tot = -1.0;
+        }
+        ref_hits_out[key].push_back({times_ns[i], ref_tot});
+      } else if (hit.channel >= 0 && hit.channel < 32) {
+        hits_by_channel_out[hit.channel][key].push_back({times_ns[i], tot});
+      }
+    }
+    for (auto &kv : ref_hits_out) {
+      auto &vec = kv.second;
+      std::sort(vec.begin(), vec.end(), [](const RefHit &a, const RefHit &b) { return a.time_ns < b.time_ns; });
+    }
+  };
+
+  const int iterations = 2;
+  const double symm_scale = symmetrize_ref ? 0.5 : 1.0;
+  std::vector<double> base_time(hits.size(), 0.0);
+  std::vector<double> corrected_time(hits.size(), 0.0);
+  for (size_t i = 0; i < hits.size(); ++i) {
+    base_time[i] = hits[i].time_ns;
+    corrected_time[i] = hits[i].time_ns;
+  }
+
+  std::vector<std::unique_ptr<TH1D>> calib_hists;
+  calib_hists.reserve(32);
+
+  for (int iter = 0; iter < iterations; ++iter) {
+    std::unordered_map<uint64_t, std::vector<RefHit>> ref_hits_iter;
+    std::array<std::unordered_map<uint64_t, std::vector<CalibHit>>, 32> hits_by_channel_iter;
+    build_maps(corrected_time, ref_hits_iter, hits_by_channel_iter);
+
+    std::vector<std::vector<std::vector<double>>> dt_bins(
+        32, std::vector<std::vector<double>>(tot_bins));
+
+    for (int ch = 0; ch < 32; ++ch) {
+      if (ch == ref_channel) {
+        continue;
+      }
+      for (auto &kv : hits_by_channel_iter[ch]) {
+        auto it_ref = ref_hits_iter.find(kv.first);
+        if (it_ref == ref_hits_iter.end()) {
           continue;
         }
-        if (hit.tot_ns <= 0.0 || hit.tot_ns > max_duration_ns) {
-          continue;
-        }
-        profiles[ch]->Fill(hit.tot_ns, dt * symm_scale);
-        if (symmetrize_ref && ref_tot > 0.0 && ref_tot <= max_duration_ns) {
-          profiles[ref_channel]->Fill(ref_tot, -dt * symm_scale);
+        const auto &refs = it_ref->second;
+        for (const auto &hit : kv.second) {
+          double dt = 0.0;
+          double ref_tot = -1.0;
+          bool ok = NearestDelta(refs, hit.time_ns, window_ns, dt, ref_tot);
+          if (!ok) {
+            continue;
+          }
+          const int bin = TotBinIndex(hit.tot_ns, max_duration_ns, tot_bins);
+          if (bin < 0) {
+            continue;
+          }
+          dt_bins[ch][bin].push_back(dt * symm_scale);
+          if (symmetrize_ref) {
+            const int ref_bin = TotBinIndex(ref_tot, max_duration_ns, tot_bins);
+            if (ref_bin >= 0) {
+              dt_bins[ref_channel][ref_bin].push_back(-dt * symm_scale);
+            }
+          }
         }
       }
     }
+
+    std::vector<std::unique_ptr<TH1D>> new_hists;
+    new_hists.reserve(32);
+    for (int ch = 0; ch < 32; ++ch) {
+      std::string name = "hChanCalib_ch" + std::to_string(ch);
+      std::string title = "Channel calibration ch" + std::to_string(ch) + ";ToT [ns];#Delta t [ns]";
+      auto hist = std::make_unique<TH1D>(name.c_str(), title.c_str(), tot_bins, 0.0, max_duration_ns);
+      hist->SetDirectory(nullptr);
+      for (int b = 0; b < tot_bins; ++b) {
+        if (dt_bins[ch][b].empty()) {
+          continue;
+        }
+        double median = MedianValue(dt_bins[ch][b]);
+        hist->SetBinContent(b + 1, median);
+      }
+      new_hists.push_back(std::move(hist));
+    }
+
+    calib_hists = std::move(new_hists);
+
+    if (iter + 1 < iterations) {
+      for (size_t i = 0; i < hits.size(); ++i) {
+        if (i >= leading_mask.size() || !leading_mask[i]) {
+          continue;
+        }
+        double tot = leading_tot[i];
+        if (tot <= 0.0 || tot > max_duration_ns) {
+          continue;
+        }
+        const int ch = hits[i].channel;
+        if (ch < 0 || ch >= 32) {
+          continue;
+        }
+        const double corr = HistValue(calib_hists[ch].get(), tot);
+        corrected_time[i] -= corr;
+      }
+    }
   }
+
+  std::unordered_map<uint64_t, std::vector<RefHit>> ref_hits;
+  std::array<std::unordered_map<uint64_t, std::vector<CalibHit>>, 32> hits_by_channel;
+  build_maps(base_time, ref_hits, hits_by_channel);
 
   std::array<double, 32> offset_mu{};
   std::array<double, 32> offset_w{};
   std::array<std::unique_ptr<TH1D>, 32> h_offset{};
+  std::array<std::unique_ptr<TH1D>, 32> h_offset_raw{};
   const int offset_bins = 200;
   const double offset_range = window_ns;
   for (int ch = 0; ch < 32; ++ch) {
@@ -559,6 +677,12 @@ void channel_calibration_rdf(const char *input = "../data/calibration",
     auto hist = std::make_unique<TH1D>(name.c_str(), title.c_str(), offset_bins, -offset_range, offset_range);
     hist->SetDirectory(nullptr);
     h_offset[ch] = std::move(hist);
+
+    std::string raw_name = "hChanOffsetRaw_ch" + std::to_string(ch);
+    std::string raw_title = "Channel offset raw ch" + std::to_string(ch) + ";#Delta t [ns];entries";
+    auto hist_raw = std::make_unique<TH1D>(raw_name.c_str(), raw_title.c_str(), offset_bins, -offset_range, offset_range);
+    hist_raw->SetDirectory(nullptr);
+    h_offset_raw[ch] = std::move(hist_raw);
   }
 
   for (int ch = 0; ch < 32; ++ch) {
@@ -584,10 +708,61 @@ void channel_calibration_rdf(const char *input = "../data/calibration",
         if (symmetrize_ref && !(ref_tot > 0.0 && ref_tot <= max_duration_ns)) {
           continue;
         }
-        const double corr_ch = ProfileValue(profiles[ch].get(), hit.tot_ns);
-        const double corr_ref = symmetrize_ref ? ProfileValue(profiles[ref_channel].get(), ref_tot) : 0.0;
+        const double corr_ch = HistValue(calib_hists[ch].get(), hit.tot_ns);
+        const double corr_ref = symmetrize_ref ? HistValue(calib_hists[ref_channel].get(), ref_tot) : 0.0;
         const double dt_resid = dt - (corr_ch - corr_ref);
+        h_offset_raw[ch]->Fill(dt);
         h_offset[ch]->Fill(dt_resid);
+      }
+    }
+  }
+
+  std::vector<std::unique_ptr<TH1D>> h_dt_raw;
+  std::vector<std::unique_ptr<TH1D>> h_dt_corr;
+  h_dt_raw.reserve(32);
+  h_dt_corr.reserve(32);
+  for (int ch = 0; ch < 32; ++ch) {
+    std::string name_raw = "hDtRaw_ch" + std::to_string(ch);
+    std::string title_raw = "Raw #Delta t distribution ch" + std::to_string(ch) + ";#Delta t [ns];entries";
+    auto hist_raw = std::make_unique<TH1D>(name_raw.c_str(), title_raw.c_str(), offset_bins, -offset_range, offset_range);
+    hist_raw->SetDirectory(nullptr);
+    h_dt_raw.push_back(std::move(hist_raw));
+
+    std::string name_corr = "hDtCorr_ch" + std::to_string(ch);
+    std::string title_corr = "Corrected #Delta t distribution ch" + std::to_string(ch) + ";#Delta t [ns];entries";
+    auto hist_corr = std::make_unique<TH1D>(name_corr.c_str(), title_corr.c_str(), offset_bins, -offset_range, offset_range);
+    hist_corr->SetDirectory(nullptr);
+    h_dt_corr.push_back(std::move(hist_corr));
+  }
+
+  for (int ch = 0; ch < 32; ++ch) {
+    if (ch == ref_channel) {
+      continue;
+    }
+    for (auto &kv : hits_by_channel[ch]) {
+      auto it_ref = ref_hits.find(kv.first);
+      if (it_ref == ref_hits.end()) {
+        continue;
+      }
+      const auto &refs = it_ref->second;
+      for (const auto &hit : kv.second) {
+        double dt = 0.0;
+        double ref_tot = -1.0;
+        bool ok = NearestDelta(refs, hit.time_ns, window_ns, dt, ref_tot);
+        if (!ok) {
+          continue;
+        }
+        if (hit.tot_ns <= 0.0 || hit.tot_ns > max_duration_ns) {
+          continue;
+        }
+        if (symmetrize_ref && !(ref_tot > 0.0 && ref_tot <= max_duration_ns)) {
+          continue;
+        }
+        const double corr_ch = HistValue(calib_hists[ch].get(), hit.tot_ns);
+        const double corr_ref = symmetrize_ref ? HistValue(calib_hists[ref_channel].get(), ref_tot) : 0.0;
+        const double dt_corr = dt - (corr_ch - corr_ref);
+        h_dt_raw[ch]->Fill(dt);
+        h_dt_corr[ch]->Fill(dt_corr);
       }
     }
   }
@@ -656,8 +831,10 @@ void channel_calibration_rdf(const char *input = "../data/calibration",
     h_offset_summary->SetBinContent(ch + 1, offsets[ch]);
   }
   h_offset_summary->Write();
-  for (auto &prof : profiles) {
-    prof->Write();
+  for (auto &hist : calib_hists) {
+    if (hist) {
+      hist->Write();
+    }
   }
   for (int ch = 0; ch < 32; ++ch) {
     if (h_offset[ch]) {
@@ -679,4 +856,76 @@ void channel_calibration_rdf(const char *input = "../data/calibration",
   out->Close();
 
   std::cout << "Wrote channel calibration to " << out_root << std::endl;
+
+  if (out_pdf && out_pdf[0] != '\0') {
+    gStyle->SetOptStat(0);
+    std::vector<int> active_channels;
+    active_channels.reserve(32);
+    for (int ch = 0; ch < 32; ++ch) {
+      if (HasNonZeroBin(calib_hists[ch].get())) {
+        active_channels.push_back(ch);
+      }
+    }
+
+    std::string open_pdf = std::string(out_pdf) + "[";
+    std::string close_pdf = std::string(out_pdf) + "]";
+    TCanvas c_open("c_open", "c_open", 1600, 900);
+    c_open.Print(open_pdf.c_str());
+
+    if (!active_channels.empty()) {
+      int cols = 1;
+      int rows = 1;
+      GridForCount(active_channels.size(), cols, rows);
+
+      TCanvas c_calib("c_calib", "c_calib", 1600, 900);
+      c_calib.Divide(cols, rows, 0.001, 0.001);
+      for (size_t i = 0; i < active_channels.size(); ++i) {
+        int ch = active_channels[i];
+        c_calib.cd(static_cast<int>(i + 1));
+        auto *hist = calib_hists[ch].get();
+        if (!hist) {
+          continue;
+        }
+        hist->SetLineColor(kBlue + 1);
+        hist->SetLineWidth(2);
+        hist->Draw("hist");
+      }
+      c_calib.Print(out_pdf);
+
+      TCanvas c_delta("c_delta", "c_delta", 1600, 900);
+      c_delta.Divide(cols, rows, 0.001, 0.001);
+      std::vector<std::unique_ptr<THStack>> delta_stacks;
+      std::vector<std::unique_ptr<TLegend>> delta_legends;
+      delta_stacks.reserve(active_channels.size());
+      delta_legends.reserve(active_channels.size());
+      for (size_t i = 0; i < active_channels.size(); ++i) {
+        int ch = active_channels[i];
+        c_delta.cd(static_cast<int>(i + 1));
+        auto *h_raw = h_dt_raw[ch].get();
+        auto *h_corr = h_dt_corr[ch].get();
+        if (!h_raw || !h_corr) {
+          continue;
+        }
+        h_raw->SetLineColor(kRed + 1);
+        h_corr->SetLineColor(kBlue + 1);
+        h_raw->SetLineWidth(2);
+        h_corr->SetLineWidth(2);
+        std::string stack_name = "hs_dt_ch" + std::to_string(ch);
+        auto stack = std::make_unique<THStack>(stack_name.c_str(), h_raw->GetTitle());
+        stack->Add(h_raw, "hist");
+        stack->Add(h_corr, "hist");
+        stack->Draw("nostack");
+        auto leg = std::make_unique<TLegend>(0.6, 0.75, 0.88, 0.88);
+        leg->AddEntry(h_raw, "raw #Delta t", "l");
+        leg->AddEntry(h_corr, "corrected #Delta t", "l");
+        leg->Draw();
+        delta_stacks.push_back(std::move(stack));
+        delta_legends.push_back(std::move(leg));
+      }
+      c_delta.Print(out_pdf);
+    }
+
+    c_open.Print(close_pdf.c_str());
+    std::cout << "Wrote channel calibration PDF to " << out_pdf << std::endl;
+  }
 }

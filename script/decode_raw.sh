@@ -70,6 +70,14 @@ while IFS= read -r -d '' raw_dir; do
   run_dir="$(dirname "${device_dir}")"
   run_name="$(basename "${run_dir}")"
 
+  link_path="${data_root}/${run_name}"
+  if [ -L "${link_path}" ]; then
+    target_path="$(python3 -c "import os,sys; print(os.path.realpath(sys.argv[1]))" "${link_path}")"
+    if [ -n "${target_path}" ] && [ ! -d "${target_path}" ]; then
+      mkdir -p "${target_path}"
+    fi
+  fi
+
   out_dir="${data_root}/${run_name}/${device}/decoded"
   mkdir -p "${out_dir}"
 
@@ -84,7 +92,7 @@ while IFS= read -r -d '' raw_dir; do
     echo "decoding ${dat} -> ${out}"
     "${decoder_bin}" --input "${dat}" --output "${out}"
   done
-done < <(find "${input_dir}" -type d -name raw -print0 2>/dev/null)
+done < <(find -L "${input_dir}" -type d -name raw -print0 2>/dev/null)
 
 if [ "${found}" = false ]; then
   echo "no raw directories found under ${input_dir}" >&2

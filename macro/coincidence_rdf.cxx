@@ -3,7 +3,6 @@
 #include <TFile.h>
 #include <TH1D.h>
 #include <TH2D.h>
-#include <TProfile.h>
 #include <TF1.h>
 #include <TFitResultPtr.h>
 #include <THStack.h>
@@ -213,9 +212,11 @@ double FitBackgroundFromSidebandsCore(TH1D &hist_search, double window_ns)
   if (left_hi > left_lo) {
     TF1 f_left("f_sideband_left", "pol0", left_lo, left_hi);
     TFitResultPtr res_left = hist_search.Fit(&f_left, "RQN");
-    bkg_left = f_left.GetParameter(0);
-    err_left = f_left.GetParError(0);
-    ok_left = std::isfinite(bkg_left);
+    if (res_left.Get() && res_left->IsValid()) {
+      bkg_left = f_left.GetParameter(0);
+      err_left = f_left.GetParError(0);
+      ok_left = std::isfinite(bkg_left);
+    }
   }
 
   double bkg_right = 0.0;
@@ -224,9 +225,11 @@ double FitBackgroundFromSidebandsCore(TH1D &hist_search, double window_ns)
   if (right_hi > right_lo) {
     TF1 f_right("f_sideband_right", "pol0", right_lo, right_hi);
     TFitResultPtr res_right = hist_search.Fit(&f_right, "RQN");
-    bkg_right = f_right.GetParameter(0);
-    err_right = f_right.GetParError(0);
-    ok_right = std::isfinite(bkg_right);
+    if (res_right.Get() && res_right->IsValid()) {
+      bkg_right = f_right.GetParameter(0);
+      err_right = f_right.GetParError(0);
+      ok_right = std::isfinite(bkg_right);
+    }
   }
 
   double weight_left = 0.0;
@@ -577,8 +580,12 @@ struct PairConfig {
   std::unique_ptr<TH2D> hist_dt_fine_b;
   std::unique_ptr<TH2D> hist_dt_fine_coinc_a;
   std::unique_ptr<TH2D> hist_dt_fine_coinc_b;
-  std::unique_ptr<TProfile> prof_dt_fine_coinc_a;
-  std::unique_ptr<TProfile> prof_dt_fine_coinc_b;
+  std::unique_ptr<TH2D> hist_dt_fine_coinc_a_tdc0;
+  std::unique_ptr<TH2D> hist_dt_fine_coinc_b_tdc0;
+  std::unique_ptr<TH2D> hist_dt_fine_coinc_a_tdc2;
+  std::unique_ptr<TH2D> hist_dt_fine_coinc_b_tdc2;
+  std::array<std::unique_ptr<TH2D>, 4> hist_tot_fine_a{};
+  std::array<std::unique_ptr<TH2D>, 4> hist_tot_fine_b{};
   std::vector<char> coincident_hits;
 };
 
@@ -608,6 +615,8 @@ struct PairStats {
   double fwhm_err = std::numeric_limits<double>::quiet_NaN();
   double bkg = std::numeric_limits<double>::quiet_NaN();
   double bkg_err = std::numeric_limits<double>::quiet_NaN();
+  double gaus_sigma = std::numeric_limits<double>::quiet_NaN();
+  double gaus_sigma_err = std::numeric_limits<double>::quiet_NaN();
   double x_left = std::numeric_limits<double>::quiet_NaN();
   double x_right = std::numeric_limits<double>::quiet_NaN();
   long long entries = 0;
@@ -650,12 +659,12 @@ std::string ChannelListLabel(const std::vector<int> &channels)
 
 int BinsForWindow(double window_ns)
 {
-  int bins = static_cast<int>(std::ceil(window_ns * 4.0));
-  if (bins < 50) {
-    bins = 50;
+  if (window_ns <= 0.0) {
+    return 60;
   }
-  if (bins > 400) {
-    bins = 400;
+  int bins = static_cast<int>(std::lround(window_ns * 20.0));
+  if (bins < 6) {
+    bins = 6;
   }
   return bins;
 }
@@ -836,6 +845,7 @@ void MarkCoincident(size_t index,
 void ProcessSpill(std::unordered_map<int, std::vector<HitRef>> &hits_by_channel,
                   std::vector<PairConfig> &pairs,
                   const std::vector<Hit> &hits,
+                  const std::vector<double> &tot_per_hit,
                   std::unordered_map<int, long long> &hit_counts,
                   const std::vector<int> &leading_to_trailing,
                   std::vector<char> &coincident_hits)
@@ -901,17 +911,52 @@ void ProcessSpill(std::unordered_map<int, std::vector<HitRef>> &hits_by_channel,
       size_t k = j;
       while (k < times_b.size() && times_b[k].time_ns <= t + window) {
         const double dt = times_b[k].time_ns - t;
+        const size_t idx_a = times_a[i].index;
+        const size_t idx_b = times_b[k].index;
+        const bool idx_valid = (idx_a < hits.size() && idx_b < hits.size());
         pair.hist_coinc->Fill(dt);
         ++pair.count;
-        if (pair.hist_dt_fine_coinc_a || pair.hist_dt_fine_coinc_b) {
-          const size_t idx_a = times_a[i].index;
-          const size_t idx_b = times_b[k].index;
-          if (idx_a < hits.size() && idx_b < hits.size()) {
+        if (pair.hist_dt_fine_coinc_a || pair.hist_dt_fine_coinc_b ||
+            pair.hist_dt_fine_coinc_a_tdc0 || pair.hist_dt_fine_coinc_b_tdc0 ||
+            pair.hist_dt_fine_coinc_a_tdc2 || pair.hist_dt_fine_coinc_b_tdc2) {
+          if (idx_valid) {
             if (pair.hist_dt_fine_coinc_a) {
               pair.hist_dt_fine_coinc_a->Fill(hits[idx_a].fine, dt);
             }
             if (pair.hist_dt_fine_coinc_b) {
               pair.hist_dt_fine_coinc_b->Fill(hits[idx_b].fine, dt);
+            }
+            if (hits[idx_a].tdc == 0 && pair.hist_dt_fine_coinc_a_tdc0) {
+              pair.hist_dt_fine_coinc_a_tdc0->Fill(hits[idx_a].fine, dt);
+            } else if (hits[idx_a].tdc == 2 && pair.hist_dt_fine_coinc_a_tdc2) {
+              pair.hist_dt_fine_coinc_a_tdc2->Fill(hits[idx_a].fine, dt);
+            }
+            if (hits[idx_b].tdc == 0 && pair.hist_dt_fine_coinc_b_tdc0) {
+              pair.hist_dt_fine_coinc_b_tdc0->Fill(hits[idx_b].fine, dt);
+            } else if (hits[idx_b].tdc == 2 && pair.hist_dt_fine_coinc_b_tdc2) {
+              pair.hist_dt_fine_coinc_b_tdc2->Fill(hits[idx_b].fine, dt);
+            }
+          }
+        }
+        if (!pair.hist_tot_fine_a.empty() || !pair.hist_tot_fine_b.empty()) {
+          if (idx_valid && idx_a < tot_per_hit.size()) {
+            const double tot_a = tot_per_hit[idx_a];
+            const int tdc_a = hits[idx_a].tdc;
+            if (tot_a > 0.0 && tdc_a >= 0 && tdc_a < 4) {
+              auto &hist_a = pair.hist_tot_fine_a[tdc_a];
+              if (hist_a) {
+                hist_a->Fill(hits[idx_a].fine, tot_a);
+              }
+            }
+          }
+          if (idx_valid && idx_b < tot_per_hit.size()) {
+            const double tot_b = tot_per_hit[idx_b];
+            const int tdc_b = hits[idx_b].tdc;
+            if (tot_b > 0.0 && tdc_b >= 0 && tdc_b < 4) {
+              auto &hist_b = pair.hist_tot_fine_b[tdc_b];
+              if (hist_b) {
+                hist_b->Fill(hits[idx_b].fine, tot_b);
+              }
             }
           }
         }
@@ -1515,6 +1560,7 @@ void WriteCoincidenceTxt(const char *out_txt,
         << " window_ns=" << pair.window_ns << " search_window_ns=" << pair.search_window_ns << "\n";
     out << "# fwhm_bkg_sub=" << stats.fwhm << " fwhm_err=" << stats.fwhm_err
         << " bkg_sideband=" << stats.bkg << " bkg_err=" << stats.bkg_err
+        << " gaus_sigma=" << stats.gaus_sigma << " gaus_sigma_err=" << stats.gaus_sigma_err
         << " x_left=" << stats.x_left << " x_right=" << stats.x_right
         << " entries=" << stats.entries << " boot_trials=" << stats.boot_trials << "\n";
     if (pair.hist_search) {
@@ -1581,11 +1627,27 @@ void WriteCoincidenceRoot(const char *out_root,
     if (pair.hist_dt_fine_coinc_b) {
       pair.hist_dt_fine_coinc_b->Write();
     }
-    if (pair.prof_dt_fine_coinc_a) {
-      pair.prof_dt_fine_coinc_a->Write();
+    if (pair.hist_dt_fine_coinc_a_tdc0) {
+      pair.hist_dt_fine_coinc_a_tdc0->Write();
     }
-    if (pair.prof_dt_fine_coinc_b) {
-      pair.prof_dt_fine_coinc_b->Write();
+    if (pair.hist_dt_fine_coinc_b_tdc0) {
+      pair.hist_dt_fine_coinc_b_tdc0->Write();
+    }
+    if (pair.hist_dt_fine_coinc_a_tdc2) {
+      pair.hist_dt_fine_coinc_a_tdc2->Write();
+    }
+    if (pair.hist_dt_fine_coinc_b_tdc2) {
+      pair.hist_dt_fine_coinc_b_tdc2->Write();
+    }
+    for (auto &hist : pair.hist_tot_fine_a) {
+      if (hist) {
+        hist->Write();
+      }
+    }
+    for (auto &hist : pair.hist_tot_fine_b) {
+      if (hist) {
+        hist->Write();
+      }
     }
   }
   if (pair_mean_hist) {
@@ -1653,6 +1715,28 @@ void coincidence_rdf(const char *decoded_dir = "../raw_data/latest/kc705-196/dec
   if (pairs.empty() && groups.empty()) {
     std::cout << "No valid channel pairs/groups found in " << pairs_file << std::endl;
     return;
+  }
+
+  analysis_time::ChannelCalib chan_calib;
+  bool chan_calib_loaded = false;
+  if (chan_calib_path && chan_calib_path[0] != '\0') {
+    if (chan_calib.LoadFromFile(chan_calib_path)) {
+      chan_calib_loaded = true;
+    }
+    if (chan_calib.meta_loaded && chan_calib.meta_maxdur > 0.0) {
+      if (max_duration_ns <= 0.0 || std::abs(max_duration_ns - chan_calib.meta_maxdur) > 1e-6) {
+        std::cout << "Warning: max_duration_ns=" << max_duration_ns
+                  << " does not match channel calibration (" << chan_calib.meta_maxdur
+                  << " ns). Using calibration value." << std::endl;
+        max_duration_ns = chan_calib.meta_maxdur;
+      }
+      if (chan_calib.meta_bins > 0) {
+        std::cout << "Channel calibration ToT bins: " << chan_calib.meta_bins << std::endl;
+      }
+      if (chan_calib.meta_sym >= 0) {
+        std::cout << "Channel calibration symmetrize_ref: " << chan_calib.meta_sym << std::endl;
+      }
+    }
   }
 
   std::cout << "Input: " << decoded_dir << std::endl;
@@ -1770,6 +1854,42 @@ void coincidence_rdf(const char *decoded_dir = "../raw_data/latest/kc705-196/dec
       pair.hist_dt_fine_coinc_a = std::move(hist_a);
     }
     {
+      std::ostringstream title_a;
+      title_a << "ch " << pair.channel_a << " vs " << pair.channel_b
+              << " (#Deltat vs fine ch " << pair.channel_a << ", TDC0, coinc window " << pair.window_ns << " ns);"
+              << "fine (ch " << pair.channel_a << "); #Deltat [ns]; pairs";
+      std::string name_a =
+          "h_dt_fine_coinc_ch" + std::to_string(pair.channel_a) + "_ch" + std::to_string(pair.channel_b) + "_a_tdc0";
+      auto hist_a = std::make_unique<TH2D>(name_a.c_str(),
+                                           title_a.str().c_str(),
+                                           fine_plot_bins,
+                                           fine_plot_min,
+                                           fine_plot_max,
+                                           bins,
+                                           -hist_window_ns,
+                                           hist_window_ns);
+      hist_a->SetDirectory(nullptr);
+      pair.hist_dt_fine_coinc_a_tdc0 = std::move(hist_a);
+    }
+    {
+      std::ostringstream title_a;
+      title_a << "ch " << pair.channel_a << " vs " << pair.channel_b
+              << " (#Deltat vs fine ch " << pair.channel_a << ", TDC2, coinc window " << pair.window_ns << " ns);"
+              << "fine (ch " << pair.channel_a << "); #Deltat [ns]; pairs";
+      std::string name_a =
+          "h_dt_fine_coinc_ch" + std::to_string(pair.channel_a) + "_ch" + std::to_string(pair.channel_b) + "_a_tdc2";
+      auto hist_a = std::make_unique<TH2D>(name_a.c_str(),
+                                           title_a.str().c_str(),
+                                           fine_plot_bins,
+                                           fine_plot_min,
+                                           fine_plot_max,
+                                           bins,
+                                           -hist_window_ns,
+                                           hist_window_ns);
+      hist_a->SetDirectory(nullptr);
+      pair.hist_dt_fine_coinc_a_tdc2 = std::move(hist_a);
+    }
+    {
       std::ostringstream title_b;
       title_b << "ch " << pair.channel_a << " vs " << pair.channel_b
               << " (#Deltat vs fine ch " << pair.channel_b << ", coinc window " << pair.window_ns << " ns);"
@@ -1786,6 +1906,92 @@ void coincidence_rdf(const char *decoded_dir = "../raw_data/latest/kc705-196/dec
                                            hist_window_ns);
       hist_b->SetDirectory(nullptr);
       pair.hist_dt_fine_coinc_b = std::move(hist_b);
+    }
+    {
+      std::ostringstream title_b;
+      title_b << "ch " << pair.channel_a << " vs " << pair.channel_b
+              << " (#Deltat vs fine ch " << pair.channel_b << ", TDC0, coinc window " << pair.window_ns << " ns);"
+              << "fine (ch " << pair.channel_b << "); #Deltat [ns]; pairs";
+      std::string name_b =
+          "h_dt_fine_coinc_ch" + std::to_string(pair.channel_a) + "_ch" + std::to_string(pair.channel_b) + "_b_tdc0";
+      auto hist_b = std::make_unique<TH2D>(name_b.c_str(),
+                                           title_b.str().c_str(),
+                                           fine_plot_bins,
+                                           fine_plot_min,
+                                           fine_plot_max,
+                                           bins,
+                                           -hist_window_ns,
+                                           hist_window_ns);
+      hist_b->SetDirectory(nullptr);
+      pair.hist_dt_fine_coinc_b_tdc0 = std::move(hist_b);
+    }
+    {
+      std::ostringstream title_b;
+      title_b << "ch " << pair.channel_a << " vs " << pair.channel_b
+              << " (#Deltat vs fine ch " << pair.channel_b << ", TDC2, coinc window " << pair.window_ns << " ns);"
+              << "fine (ch " << pair.channel_b << "); #Deltat [ns]; pairs";
+      std::string name_b =
+          "h_dt_fine_coinc_ch" + std::to_string(pair.channel_a) + "_ch" + std::to_string(pair.channel_b) + "_b_tdc2";
+      auto hist_b = std::make_unique<TH2D>(name_b.c_str(),
+                                           title_b.str().c_str(),
+                                           fine_plot_bins,
+                                           fine_plot_min,
+                                           fine_plot_max,
+                                           bins,
+                                           -hist_window_ns,
+                                           hist_window_ns);
+      hist_b->SetDirectory(nullptr);
+      pair.hist_dt_fine_coinc_b_tdc2 = std::move(hist_b);
+    }
+
+    if (max_duration_ns > 0.0) {
+      int tot_bins = static_cast<int>(std::ceil(max_duration_ns * 4.0));
+      if (tot_bins < 20) {
+        tot_bins = 20;
+      }
+      if (tot_bins > 400) {
+        tot_bins = 400;
+      }
+      for (int tdc = 0; tdc < 4; ++tdc) {
+        {
+          std::ostringstream title_a;
+          title_a << "ch " << pair.channel_a << " vs " << pair.channel_b
+                  << " (ToT vs fine ch " << pair.channel_a << ", TDC" << tdc
+                  << ", coinc window " << pair.window_ns << " ns);"
+                  << "fine (ch " << pair.channel_a << "); ToT [ns]; pairs";
+          std::string name_a = "h_tot_fine_ch" + std::to_string(pair.channel_a) + "_ch" +
+                               std::to_string(pair.channel_b) + "_a_tdc" + std::to_string(tdc);
+          auto hist_a = std::make_unique<TH2D>(name_a.c_str(),
+                                               title_a.str().c_str(),
+                                               fine_plot_bins,
+                                               fine_plot_min,
+                                               fine_plot_max,
+                                               tot_bins,
+                                               0.0,
+                                               max_duration_ns);
+          hist_a->SetDirectory(nullptr);
+          pair.hist_tot_fine_a[tdc] = std::move(hist_a);
+        }
+        {
+          std::ostringstream title_b;
+          title_b << "ch " << pair.channel_a << " vs " << pair.channel_b
+                  << " (ToT vs fine ch " << pair.channel_b << ", TDC" << tdc
+                  << ", coinc window " << pair.window_ns << " ns);"
+                  << "fine (ch " << pair.channel_b << "); ToT [ns]; pairs";
+          std::string name_b = "h_tot_fine_ch" + std::to_string(pair.channel_a) + "_ch" +
+                               std::to_string(pair.channel_b) + "_b_tdc" + std::to_string(tdc);
+          auto hist_b = std::make_unique<TH2D>(name_b.c_str(),
+                                               title_b.str().c_str(),
+                                               fine_plot_bins,
+                                               fine_plot_min,
+                                               fine_plot_max,
+                                               tot_bins,
+                                               0.0,
+                                               max_duration_ns);
+          hist_b->SetDirectory(nullptr);
+          pair.hist_tot_fine_b[tdc] = std::move(hist_b);
+        }
+      }
     }
   }
 
@@ -1920,9 +2126,8 @@ void coincidence_rdf(const char *decoded_dir = "../raw_data/latest/kc705-196/dec
   }
   fine_calib.use_lut = use_lut;
   analysis_time::PrintFineCalibConstants(fine_calib);
-  analysis_time::ChannelCalib chan_calib;
   if (chan_calib_path && chan_calib_path[0] != '\0') {
-    if (chan_calib.LoadFromFile(chan_calib_path)) {
+    if (chan_calib_loaded) {
       std::cout << "Loaded channel calibration: " << chan_calib_path << std::endl;
     } else {
       std::cout << "Failed to load channel calibration: " << chan_calib_path << " (ignored)" << std::endl;
@@ -2002,30 +2207,34 @@ void coincidence_rdf(const char *decoded_dir = "../raw_data/latest/kc705-196/dec
     }
   }
 
+  std::vector<double> tot_per_hit(hits.size(), -1.0);
+  if (max_duration_ns > 0.0) {
+    for (size_t i = 0; i < hits.size(); ++i) {
+      if (i >= leading_mask.size() || !leading_mask[i]) {
+        continue;
+      }
+      int trailing = (i < leading_to_trailing.size()) ? leading_to_trailing[i] : -1;
+      if (trailing < 0 || trailing >= static_cast<int>(hits.size())) {
+        continue;
+      }
+      double dt = hits[trailing].time_ns - hits[i].time_ns;
+      if (dt <= 0.0 || dt > max_duration_ns) {
+        continue;
+      }
+      tot_per_hit[i] = dt;
+      tot_per_hit[static_cast<size_t>(trailing)] = dt;
+    }
+  }
+
   if (chan_calib.loaded) {
     if (max_duration_ns <= 0.0) {
       std::cout << "Channel calibration loaded but max_duration_ns <= 0; skipping correction." << std::endl;
     } else {
-      std::vector<double> leading_tot(hits.size(), -1.0);
       for (size_t i = 0; i < hits.size(); ++i) {
         if (i >= leading_mask.size() || !leading_mask[i]) {
           continue;
         }
-        int trailing = (i < leading_to_trailing.size()) ? leading_to_trailing[i] : -1;
-        if (trailing < 0 || trailing >= static_cast<int>(hits.size())) {
-          continue;
-        }
-        double dt = hits[trailing].time_ns - hits[i].time_ns;
-        if (dt <= 0.0 || dt > max_duration_ns) {
-          continue;
-        }
-        leading_tot[i] = dt;
-      }
-      for (size_t i = 0; i < hits.size(); ++i) {
-        if (i >= leading_mask.size() || !leading_mask[i]) {
-          continue;
-        }
-        double tot = leading_tot[i];
+        double tot = tot_per_hit[i];
         if (tot <= 0.0) {
           continue;
         }
@@ -2046,7 +2255,7 @@ void coincidence_rdf(const char *decoded_dir = "../raw_data/latest/kc705-196/dec
     spill_hits[RunSpillKey(hits[i].run_id, hits[i].spill)][hits[i].channel].push_back({hits[i].time_ns, i});
   }
   for (auto &spill : spill_hits) {
-    ProcessSpill(spill.second, pairs, hits, hit_counts, leading_to_trailing, coincident_hits);
+    ProcessSpill(spill.second, pairs, hits, tot_per_hit, hit_counts, leading_to_trailing, coincident_hits);
     ProcessGroupSpill(spill.second, groups, hits, leading_to_trailing, coincident_hits);
     if (pair_mean_hist) {
       std::vector<double> means_a;
@@ -2102,6 +2311,21 @@ void coincidence_rdf(const char *decoded_dir = "../raw_data/latest/kc705-196/dec
       stats.fwhm = fwhm_hist;
       stats.x_left = x_left;
       stats.x_right = x_right;
+      {
+        TF1 fit_fn("fit_gaus_bkg", "gaus(0)+pol0(3)", -pair.window_ns, pair.window_ns);
+        fit_fn.SetParNames("K", "#mu", "#sigma", "bkg");
+        const double max_bin = pair.hist_coinc->GetMaximum();
+        const double amp_guess = std::max(1.0, max_bin - bkg_sideband);
+        const double sigma_guess = std::max(0.05, pair.hist_coinc->GetRMS());
+        fit_fn.SetParameters(amp_guess, 0.0, sigma_guess, bkg_sideband);
+        fit_fn.SetParLimits(0, 0.0, amp_guess * 10.0);
+        fit_fn.SetParLimits(2, 0.05, std::max(0.05, pair.window_ns));
+        auto fit_res = pair.hist_coinc->Fit(&fit_fn, "RQ");
+        if (fit_res.Get() && fit_res->IsValid()) {
+          stats.gaus_sigma = fit_fn.GetParameter(2);
+          stats.gaus_sigma_err = fit_fn.GetParError(2);
+        }
+      }
       const int boot_trials = 200;
       double fwhm_mean = std::numeric_limits<double>::quiet_NaN();
       double fwhm_sigma = std::numeric_limits<double>::quiet_NaN();
@@ -2131,6 +2355,15 @@ void coincidence_rdf(const char *decoded_dir = "../raw_data/latest/kc705-196/dec
         }
         std::cout << " ns" << std::endl;
       }
+      if (std::isfinite(stats.gaus_sigma)) {
+        std::cout << "  sigma_(gaus)=" << stats.gaus_sigma;
+        if (std::isfinite(stats.gaus_sigma_err)) {
+          std::cout << " ± " << stats.gaus_sigma_err;
+        }
+        std::cout << " ns" << std::endl;
+      } else {
+        std::cout << "  sigma_(gaus)=n/a" << std::endl;
+      }
 
       TLatex *latex = new TLatex();
       latex->SetNDC(true);
@@ -2145,7 +2378,11 @@ void coincidence_rdf(const char *decoded_dir = "../raw_data/latest/kc705-196/dec
       }
       {
         std::ostringstream line;
-        line << std::fixed << std::setprecision(2) << "bkg_{sideband} = " << bkg_sideband;
+        if (std::isfinite(stats.gaus_sigma)) {
+          line << std::fixed << std::setprecision(2) << "#sigma_{gaus} = " << stats.gaus_sigma << " ns";
+        } else {
+          line << "#sigma_{gaus} = n/a";
+        }
         latex->DrawLatex(0.12, 0.78, line.str().c_str());
       }
     } else {
@@ -2154,11 +2391,11 @@ void coincidence_rdf(const char *decoded_dir = "../raw_data/latest/kc705-196/dec
     pair_stats.push_back(stats);
     c.Print(out_pdf);
 
+    const double fine_draw_min = 20.0;
+    const double fine_draw_max = 160.0;
     if (pair.hist_dt_fine_a || pair.hist_dt_fine_b) {
       TCanvas c2("c_dt_fine", "c_dt_fine", 1600, 900);
       c2.Divide(2, 1, 0.001, 0.001);
-      const double fine_draw_min = 20.0;
-      const double fine_draw_max = 160.0;
       c2.cd(1);
       gPad->SetLogz(1);
       gPad->SetRightMargin(0.14);
@@ -2176,60 +2413,89 @@ void coincidence_rdf(const char *decoded_dir = "../raw_data/latest/kc705-196/dec
       c2.Print(out_pdf);
     }
 
-    if (pair.hist_dt_fine_coinc_a || pair.hist_dt_fine_coinc_b) {
-      if (pair.hist_dt_fine_coinc_a) {
-        auto prof = std::unique_ptr<TProfile>(pair.hist_dt_fine_coinc_a->ProfileX(
-            (std::string(pair.hist_dt_fine_coinc_a->GetName()) + "_prof").c_str()));
-        if (prof) {
-          prof->SetDirectory(nullptr);
-          prof->SetLineColor(kBlue + 1);
-          prof->SetLineWidth(2);
-          pair.prof_dt_fine_coinc_a = std::move(prof);
-        }
-      }
-      if (pair.hist_dt_fine_coinc_b) {
-        auto prof = std::unique_ptr<TProfile>(pair.hist_dt_fine_coinc_b->ProfileX(
-            (std::string(pair.hist_dt_fine_coinc_b->GetName()) + "_prof").c_str()));
-        if (prof) {
-          prof->SetDirectory(nullptr);
-          prof->SetLineColor(kRed + 1);
-          prof->SetLineWidth(2);
-          pair.prof_dt_fine_coinc_b = std::move(prof);
-        }
-      }
-
-      TCanvas c3("c_dt_fine_coinc", "c_dt_fine_coinc", 1600, 900);
+    if (pair.hist_dt_fine_coinc_a_tdc0 || pair.hist_dt_fine_coinc_b_tdc0 ||
+        pair.hist_dt_fine_coinc_a_tdc2 || pair.hist_dt_fine_coinc_b_tdc2) {
+      TCanvas c3("c_dt_fine_coinc_tdc", "c_dt_fine_coinc_tdc", 1600, 900);
       c3.Divide(2, 2, 0.001, 0.001);
-      const double fine_draw_min = 20.0;
-      const double fine_draw_max = 160.0;
 
       c3.cd(1);
       gPad->SetLogz(1);
       gPad->SetRightMargin(0.14);
-      if (pair.hist_dt_fine_coinc_a) {
-        pair.hist_dt_fine_coinc_a->GetXaxis()->SetRangeUser(fine_draw_min, fine_draw_max);
-        pair.hist_dt_fine_coinc_a->Draw("COLZ");
+      if (pair.hist_dt_fine_coinc_a_tdc0) {
+        pair.hist_dt_fine_coinc_a_tdc0->GetXaxis()->SetRangeUser(fine_draw_min, fine_draw_max);
+        pair.hist_dt_fine_coinc_a_tdc0->Draw("COLZ");
       }
 
       c3.cd(2);
       gPad->SetLogz(1);
       gPad->SetRightMargin(0.14);
-      if (pair.hist_dt_fine_coinc_b) {
-        pair.hist_dt_fine_coinc_b->GetXaxis()->SetRangeUser(fine_draw_min, fine_draw_max);
-        pair.hist_dt_fine_coinc_b->Draw("COLZ");
+      if (pair.hist_dt_fine_coinc_b_tdc0) {
+        pair.hist_dt_fine_coinc_b_tdc0->GetXaxis()->SetRangeUser(fine_draw_min, fine_draw_max);
+        pair.hist_dt_fine_coinc_b_tdc0->Draw("COLZ");
       }
 
       c3.cd(3);
-      if (pair.prof_dt_fine_coinc_a) {
-        pair.prof_dt_fine_coinc_a->Draw("hist");
+      gPad->SetLogz(1);
+      gPad->SetRightMargin(0.14);
+      if (pair.hist_dt_fine_coinc_a_tdc2) {
+        pair.hist_dt_fine_coinc_a_tdc2->GetXaxis()->SetRangeUser(fine_draw_min, fine_draw_max);
+        pair.hist_dt_fine_coinc_a_tdc2->Draw("COLZ");
       }
 
       c3.cd(4);
-      if (pair.prof_dt_fine_coinc_b) {
-        pair.prof_dt_fine_coinc_b->Draw("hist");
+      gPad->SetLogz(1);
+      gPad->SetRightMargin(0.14);
+      if (pair.hist_dt_fine_coinc_b_tdc2) {
+        pair.hist_dt_fine_coinc_b_tdc2->GetXaxis()->SetRangeUser(fine_draw_min, fine_draw_max);
+        pair.hist_dt_fine_coinc_b_tdc2->Draw("COLZ");
       }
 
       c3.Print(out_pdf);
+    }
+
+    bool has_tot_fine_a = false;
+    bool has_tot_fine_b = false;
+    for (const auto &h : pair.hist_tot_fine_a) {
+      if (h) {
+        has_tot_fine_a = true;
+        break;
+      }
+    }
+    for (const auto &h : pair.hist_tot_fine_b) {
+      if (h) {
+        has_tot_fine_b = true;
+        break;
+      }
+    }
+    if (has_tot_fine_a) {
+      TCanvas c_tot_a("c_tot_fine_a", "c_tot_fine_a", 1600, 900);
+      c_tot_a.Divide(2, 2, 0.001, 0.001);
+      for (int tdc = 0; tdc < 4; ++tdc) {
+        c_tot_a.cd(tdc + 1);
+        gPad->SetLogz(1);
+        gPad->SetRightMargin(0.14);
+        auto &hist = pair.hist_tot_fine_a[tdc];
+        if (hist) {
+          hist->GetXaxis()->SetRangeUser(fine_draw_min, fine_draw_max);
+          hist->Draw("COLZ");
+        }
+      }
+      c_tot_a.Print(out_pdf);
+    }
+    if (has_tot_fine_b) {
+      TCanvas c_tot_b("c_tot_fine_b", "c_tot_fine_b", 1600, 900);
+      c_tot_b.Divide(2, 2, 0.001, 0.001);
+      for (int tdc = 0; tdc < 4; ++tdc) {
+        c_tot_b.cd(tdc + 1);
+        gPad->SetLogz(1);
+        gPad->SetRightMargin(0.14);
+        auto &hist = pair.hist_tot_fine_b[tdc];
+        if (hist) {
+          hist->GetXaxis()->SetRangeUser(fine_draw_min, fine_draw_max);
+          hist->Draw("COLZ");
+        }
+      }
+      c_tot_b.Print(out_pdf);
     }
   }
   if (pair_mean_hist) {

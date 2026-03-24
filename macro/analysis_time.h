@@ -5,6 +5,7 @@
 #include <TFile.h>
 #include <TH1.h>
 #include <TH2.h>
+#include <TParameter.h>
 
 #include <array>
 #include <cmath>
@@ -116,6 +117,10 @@ struct ChannelCalib {
   };
 
   bool loaded = false;
+  bool meta_loaded = false;
+  double meta_maxdur = 0.0;
+  int meta_bins = 0;
+  int meta_sym = -1;
   std::array<ChannelHist, 32> channels{};
   std::array<double, 32> offsets{};
 
@@ -125,6 +130,10 @@ struct ChannelCalib {
       return false;
     }
     loaded = false;
+    meta_loaded = false;
+    meta_maxdur = 0.0;
+    meta_bins = 0;
+    meta_sym = -1;
     for (auto &ch : channels) {
       ch = ChannelHist{};
     }
@@ -134,6 +143,18 @@ struct ChannelCalib {
     std::unique_ptr<TFile> file(TFile::Open(path.c_str(), "READ"));
     if (!file || file->IsZombie()) {
       return false;
+    }
+    if (auto *p_max = dynamic_cast<TParameter<double> *>(file->Get("max_duration_ns"))) {
+      meta_maxdur = p_max->GetVal();
+      meta_loaded = true;
+    }
+    if (auto *p_bins = dynamic_cast<TParameter<int> *>(file->Get("tot_bins"))) {
+      meta_bins = p_bins->GetVal();
+      meta_loaded = true;
+    }
+    if (auto *p_sym = dynamic_cast<TParameter<int> *>(file->Get("symmetrize_ref"))) {
+      meta_sym = p_sym->GetVal();
+      meta_loaded = true;
     }
     auto *hoff = dynamic_cast<TH1 *>(file->Get("hChanOffset"));
     if (hoff) {

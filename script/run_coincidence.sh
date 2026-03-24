@@ -452,7 +452,7 @@ elif ! has_root_files "${resolved_dir}"; then
       if has_root_files "${cand}"; then
         filtered+=("${cand}")
       fi
-    done < <(find "${resolved_dir}" -maxdepth 3 -type d -name decoded 2>/dev/null)
+    done < <(find -L "${resolved_dir}" -maxdepth 3 -type d -name decoded 2>/dev/null)
     if [[ "${#filtered[@]}" -eq 1 ]]; then
       resolved_dir="${filtered[0]}"
     else

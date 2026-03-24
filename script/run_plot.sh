@@ -15,8 +15,16 @@ Required options:
 Optional options:
   -o, --output NAME        output PDF name (default: derived from input dir)
   -s, --spill INDEX        spill index to plot (0-based), default 1 (second spill)
+  -m, --clock MHz          clock frequency (default 320)
+  -f, --use-fine [0|1]     enable fine timing (default 1)
+      --no-fine            disable fine timing
+  -d, --duration NS        max leading-trailing duration (ns), default 15 (<=0 disables duration filter)
+      --no-duration        disable duration filter (use leading edges only)
   -F, --fine-cut N         exclude hits with |fine - cut| <= N (default 0; 0 disables)
   -k, --calib FILE         fine calibration ROOT file (default: calibration/fine_calibration.root)
+      --no-calib           disable fine calibration file (use default linear mapping)
+  -K, --chan-calib FILE    channel calibration ROOT file (default: calibration/channel_calibration.root)
+      --no-chan-calib      disable channel calibration file
       --use-lut [0|1]      enable LUT correction (default 1)
       --no-lut             disable LUT correction (use original mapping)
       --config FILE        load defaults from config file (CLI overrides)
@@ -33,7 +41,11 @@ out_name=""
 input_dir=""
 channels=()
 fine_calib_path=""
+chan_calib_path=""
 spill_index=1
+clock_mhz=320
+use_fine=1
+max_duration_ns=15
 fine_cut=0
 use_lut=1
 config_file=""
@@ -41,7 +53,11 @@ cli_out_set=0
 cli_input_set=0
 cli_channels_set=0
 cli_calib_set=0
+cli_chan_calib_set=0
 cli_spill_set=0
+cli_clock_set=0
+cli_use_fine_set=0
+cli_duration_set=0
 cli_fine_cut_set=0
 cli_use_lut_set=0
 
@@ -121,6 +137,54 @@ while [ "$#" -gt 0 ]; do
       cli_spill_set=1
       shift
       ;;
+    -m|--clock)
+      need_arg "$@"
+      clock_mhz=${2:-}
+      cli_clock_set=1
+      shift 2
+      ;;
+    --clock=*)
+      clock_mhz=${1#*=}
+      cli_clock_set=1
+      shift
+      ;;
+    -f|--use-fine)
+      if [ "${2:-}" = "0" ] || [ "${2:-}" = "1" ]; then
+        use_fine=$2
+        cli_use_fine_set=1
+        shift 2
+      else
+        use_fine=1
+        cli_use_fine_set=1
+        shift
+      fi
+      ;;
+    --use-fine=*)
+      use_fine=${1#*=}
+      cli_use_fine_set=1
+      shift
+      ;;
+    --no-fine)
+      use_fine=0
+      cli_use_fine_set=1
+      shift
+      ;;
+    -d|--duration)
+      need_arg "$@"
+      max_duration_ns=${2:-}
+      cli_duration_set=1
+      shift 2
+      ;;
+    --duration=*)
+      max_duration_ns=${1#*=}
+      cli_duration_set=1
+      shift
+      ;;
+    --no-duration)
+      max_duration_ns=0
+      cli_duration_set=1
+      shift
+      ;;
     -F|--fine-cut)
       need_arg "$@"
       fine_cut=${2:-}
@@ -141,6 +205,27 @@ while [ "$#" -gt 0 ]; do
     --calib=*)
       fine_calib_path=${1#*=}
       cli_calib_set=1
+      shift
+      ;;
+    --no-calib)
+      fine_calib_path=""
+      cli_calib_set=1
+      shift
+      ;;
+    -K|--chan-calib)
+      need_arg "$@"
+      chan_calib_path=${2:-}
+      cli_chan_calib_set=1
+      shift 2
+      ;;
+    --chan-calib=*)
+      chan_calib_path=${1#*=}
+      cli_chan_calib_set=1
+      shift
+      ;;
+    --no-chan-calib)
+      chan_calib_path=""
+      cli_chan_calib_set=1
       shift
       ;;
     --use-lut)
@@ -239,8 +324,20 @@ apply_config() {
       spill|spill_index)
         if [ "${cli_spill_set}" -eq 0 ]; then spill_index="${value}"; fi
         ;;
+      clock|clock_mhz)
+        if [ "${cli_clock_set}" -eq 0 ]; then clock_mhz="${value}"; fi
+        ;;
+      use_fine)
+        if [ "${cli_use_fine_set}" -eq 0 ]; then use_fine="$(parse_bool "${value}")"; fi
+        ;;
+      duration|max_duration|max_duration_ns)
+        if [ "${cli_duration_set}" -eq 0 ]; then max_duration_ns="${value}"; fi
+        ;;
       calib|calib_file|fine_calib)
         if [ "${cli_calib_set}" -eq 0 ]; then fine_calib_path="${value}"; fi
+        ;;
+      chan_calib|channel_calib)
+        if [ "${cli_chan_calib_set}" -eq 0 ]; then chan_calib_path="${value}"; fi
         ;;
       use_lut|lut)
         if [ "${cli_use_lut_set}" -eq 0 ]; then use_lut="$(parse_bool "${value}")"; fi
@@ -271,6 +368,9 @@ out_dir="${qa_dir}/output"
 
 if [ -z "${fine_calib_path}" ] && [ "${cli_calib_set}" -eq 0 ]; then
   fine_calib_path="${qa_dir}/calibration/fine_calibration.root"
+fi
+if [ -z "${chan_calib_path}" ] && [ "${cli_chan_calib_set}" -eq 0 ]; then
+  chan_calib_path="${qa_dir}/calibration/channel_calibration.root"
 fi
 
 mkdir -p "${out_dir}"
@@ -311,7 +411,7 @@ elif ! has_root_files "${resolved_dir}"; then
       if has_root_files "${cand}"; then
         filtered+=("${cand}")
       fi
-    done < <(find "${resolved_dir}" -maxdepth 3 -type d -name decoded 2>/dev/null)
+    done < <(find -L "${resolved_dir}" -maxdepth 3 -type d -name decoded 2>/dev/null)
     if [[ "${#filtered[@]}" -eq 1 ]]; then
       resolved_dir="${filtered[0]}"
     else
@@ -338,4 +438,4 @@ log_path="${out_dir}/log_${out_base}_macro.txt"
 
 exec > >(tee "${log_path}") 2>&1
 
-root -l -b -q "${macro_path}(\"${resolved_dir}\",\"${out_path}\",\"${channels_csv}\",\"${fine_calib_path}\",${spill_index},${fine_cut},${use_lut})"
+root -l -b -q "${macro_path}(\"${resolved_dir}\",\"${out_path}\",\"${channels_csv}\",\"${fine_calib_path}\",${spill_index},${fine_cut},${use_lut},${clock_mhz},${use_fine},${max_duration_ns},\"${chan_calib_path}\")"

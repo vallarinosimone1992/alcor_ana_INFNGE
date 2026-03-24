@@ -209,7 +209,7 @@ elif ! has_root_files "${resolved_dir}"; then
       if has_root_files "${cand}"; then
         filtered+=("${cand}")
       fi
-    done < <(find "${resolved_dir}" -maxdepth 3 -type d -name decoded 2>/dev/null)
+    done < <(find -L "${resolved_dir}" -maxdepth 3 -type d -name decoded 2>/dev/null)
     if [[ "${#filtered[@]}" -eq 1 ]]; then
       resolved_dir="${filtered[0]}"
     else
@@ -231,7 +231,8 @@ fi
 out_path="${out_dir}/${out_name}"
 out_base="${out_name%.*}"
 log_path="${qa_dir}/output/log_${out_base}_macro.txt"
+out_pdf="${qa_dir}/output/${out_base}.pdf"
 
 exec > >(tee "${log_path}") 2>&1
 
-root -l -b -q "${macro_path}(\"${resolved_dir}\",\"${out_path}\",${ref_channel},${window_ns},${max_duration_ns},${tot_bins},${clock_mhz},${use_fine},\"${fine_calib_path}\",${use_lut},${symmetrize_ref})"
+root -l -b -q "${macro_path}(\"${resolved_dir}\",\"${out_path}\",${ref_channel},${window_ns},${max_duration_ns},${tot_bins},${clock_mhz},${use_fine},\"${fine_calib_path}\",${use_lut},${symmetrize_ref},\"${out_pdf}\")"
