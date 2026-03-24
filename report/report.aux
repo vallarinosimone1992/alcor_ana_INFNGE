@@ -2,29 +2,41 @@
 \providecommand\hyper@newdestlabel[2]{}
 \providecommand\HyField@AuxAddToFields[1]{}
 \providecommand\HyField@AuxAddToCoFields[2]{}
-\@writefile{toc}{\contentsline {section}{\numberline {1}Executive Summary}{1}{section.1}\protected@file@percent }
+\@writefile{toc}{\contentsline {section}{\numberline {1}Scope and Objective}{1}{section.1}\protected@file@percent }
 \@writefile{toc}{\contentsline {section}{\numberline {2}Experimental Setup}{1}{section.2}\protected@file@percent }
 \@writefile{toc}{\contentsline {subsection}{\numberline {2.1}Calibration setup}{1}{subsection.2.1}\protected@file@percent }
 \@writefile{lof}{\contentsline {figure}{\numberline {1}{\ignorespaces Calibration setup photographs.}}{1}{figure.1}\protected@file@percent }
 \newlabel{fig:setup_photos}{{1}{1}{Calibration setup photographs}{figure.1}{}}
-\@writefile{toc}{\contentsline {subsection}{\numberline {2.2}Scintillating fiber setup}{1}{subsection.2.2}\protected@file@percent }
-\@writefile{toc}{\contentsline {section}{\numberline {3}Corrections Developed}{2}{section.3}\protected@file@percent }
-\@writefile{toc}{\contentsline {subsection}{\numberline {3.1}Fine-time look-up table (LUT) (cumulative distribution function, CDF, linearization)}{2}{subsection.3.1}\protected@file@percent }
-\@writefile{toc}{\contentsline {subsection}{\numberline {3.2}Time-walk (Time-over-Threshold, ToT, dependent correction)}{2}{subsection.3.2}\protected@file@percent }
-\@writefile{lof}{\contentsline {figure}{\numberline {2}{\ignorespaces DNL example (one channel). The plot compares raw, linear, and LUT‑corrected fine fractions; the LUT curve is closest to the ideal uniform response.}}{3}{figure.2}\protected@file@percent }
-\newlabel{fig:fine_validation_dnl}{{2}{3}{DNL example (one channel). The plot compares raw, linear, and LUT‑corrected fine fractions; the LUT curve is closest to the ideal uniform response}{figure.2}{}}
-\@writefile{toc}{\contentsline {subsection}{\numberline {3.3}Channel-dependent offsets}{3}{subsection.3.3}\protected@file@percent }
-\@writefile{lof}{\contentsline {figure}{\numberline {3}{\ignorespaces INL example (one channel). The LUT strongly reduces the cumulative non‑linearity compared to the linear correction.}}{4}{figure.3}\protected@file@percent }
-\newlabel{fig:fine_validation_inl}{{3}{4}{INL example (one channel). The LUT strongly reduces the cumulative non‑linearity compared to the linear correction}{figure.3}{}}
-\@writefile{toc}{\contentsline {section}{\numberline {4}Calibration Procedure}{4}{section.4}\protected@file@percent }
-\@writefile{toc}{\contentsline {subsection}{\numberline {4.1}Input data}{4}{subsection.4.1}\protected@file@percent }
-\@writefile{toc}{\contentsline {subsection}{\numberline {4.2}Steps}{4}{subsection.4.2}\protected@file@percent }
-\@writefile{toc}{\contentsline {section}{\numberline {5}Results Obtained (Current)}{5}{section.5}\protected@file@percent }
-\@writefile{toc}{\contentsline {subsection}{\numberline {5.1}Fine LUT}{5}{subsection.5.1}\protected@file@percent }
-\@writefile{toc}{\contentsline {subsection}{\numberline {5.2}Time-walk correction magnitude}{5}{subsection.5.2}\protected@file@percent }
-\@writefile{toc}{\contentsline {subsection}{\numberline {5.3}Symmetric correction}{5}{subsection.5.3}\protected@file@percent }
-\@writefile{toc}{\contentsline {subsection}{\numberline {5.4}Laser calibration comparison (page 3)}{5}{subsection.5.4}\protected@file@percent }
-\@writefile{lof}{\contentsline {figure}{\numberline {4}{\ignorespaces Calibration run (laser) comparison using page 3.}}{5}{figure.4}\protected@file@percent }
-\newlabel{fig:laser_calib_page3}{{4}{5}{Calibration run (laser) comparison using page 3}{figure.4}{}}
-\@writefile{toc}{\contentsline {section}{\numberline {6}Notes and Assumptions}{5}{section.6}\protected@file@percent }
-\gdef \@abspage@last{6}
+\@writefile{toc}{\contentsline {subsection}{\numberline {2.2}Scintillating fiber setup}{2}{subsection.2.2}\protected@file@percent }
+\@writefile{toc}{\contentsline {section}{\numberline {3}Dataset Roles and Analysis Flow}{2}{section.3}\protected@file@percent }
+\@writefile{toc}{\contentsline {section}{\numberline {4}Timing Representation}{2}{section.4}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {4.1}Global TDC index}{3}{subsection.4.1}\protected@file@percent }
+\@writefile{toc}{\contentsline {section}{\numberline {5}Fine-Time Calibration}{3}{section.5}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {5.1}Motivation}{3}{subsection.5.1}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {5.2}CDF LUT method}{3}{subsection.5.2}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {5.3}Min/max and linear fallback}{4}{subsection.5.3}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {5.4}When the LUT assumption is valid}{4}{subsection.5.4}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {5.5}Uniformity diagnostics}{4}{subsection.5.5}\protected@file@percent }
+\@writefile{toc}{\contentsline {section}{\numberline {6}Channel Calibration}{4}{section.6}\protected@file@percent }
+\@writefile{lof}{\contentsline {figure}{\numberline {2}{\ignorespaces DNL example for one channel. The LUT-corrected curve is closer to the ideal uniform response than the raw and simple linear cases.}}{5}{figure.2}\protected@file@percent }
+\newlabel{fig:fine_validation_dnl}{{2}{5}{DNL example for one channel. The LUT-corrected curve is closer to the ideal uniform response than the raw and simple linear cases}{figure.2}{}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {6.1}Time-walk correction}{5}{subsection.6.1}\protected@file@percent }
+\@writefile{lof}{\contentsline {figure}{\numberline {3}{\ignorespaces INL example for one channel. The LUT reduces the cumulative non-linearity compared to the raw and simple linear cases.}}{6}{figure.3}\protected@file@percent }
+\newlabel{fig:fine_validation_inl}{{3}{6}{INL example for one channel. The LUT reduces the cumulative non-linearity compared to the raw and simple linear cases}{figure.3}{}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {6.2}Channel offsets}{6}{subsection.6.2}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {6.3}Symmetric reference mode}{6}{subsection.6.3}\protected@file@percent }
+\@writefile{toc}{\contentsline {section}{\numberline {7}Coincidence Analysis}{6}{section.7}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {7.1}Configuration and outputs}{6}{subsection.7.1}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {7.2}Important implementation caveat}{7}{subsection.7.2}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {7.3}Fine cut}{7}{subsection.7.3}\protected@file@percent }
+\@writefile{toc}{\contentsline {section}{\numberline {8}Validation Metrics for Fine Calibration}{7}{section.8}\protected@file@percent }
+\@writefile{toc}{\contentsline {section}{\numberline {9}Reading the Output Files}{8}{section.9}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {9.1}Fine calibration output}{8}{subsection.9.1}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {9.2}Channel calibration output}{8}{subsection.9.2}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {9.3}Coincidence output}{9}{subsection.9.3}\protected@file@percent }
+\@writefile{toc}{\contentsline {section}{\numberline {10}Practical Validation Strategy}{9}{section.10}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {10.1}Example comparison plot}{9}{subsection.10.1}\protected@file@percent }
+\@writefile{lof}{\contentsline {figure}{\numberline {4}{\ignorespaces Example calibration-run comparison using the coincidence summary page.}}{10}{figure.4}\protected@file@percent }
+\newlabel{fig:laser_calib_page3}{{4}{10}{Example calibration-run comparison using the coincidence summary page}{figure.4}{}}
+\@writefile{toc}{\contentsline {section}{\numberline {11}Documentation Policy}{10}{section.11}\protected@file@percent }
+\gdef \@abspage@last{10}

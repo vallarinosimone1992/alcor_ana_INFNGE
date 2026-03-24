@@ -7,7 +7,7 @@ ROOT/RDataFrame-based analysis for ALCOR timing studies. This package works on d
 - coincidence analysis
 - validation scripts for fine calibration and time-walk calibration
 
-Algorithmic details and calibration notes are documented in `REPORT_CALIBRATION.md`. This README is intentionally limited to software structure and usage.
+Algorithmic details and calibration notes are documented in `report/report.tex` and in the compiled `report/report.pdf`. This README is intentionally limited to software structure and usage.
 
 ## Requirements
 
@@ -178,7 +178,7 @@ Run outputs:
 
 ## Further Documentation
 
-See `REPORT_CALIBRATION.md` for:
+See `report/report.tex` or `report/report.pdf` for:
 
 - timing model details
 - fine LUT construction

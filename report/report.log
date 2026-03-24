@@ -1,4 +1,4 @@
-This is pdfTeX, Version 3.141592653-2.6-1.40.28 (TeX Live 2025) (preloaded format=pdflatex 2025.12.18)  17 FEB 2026 12:05
+This is pdfTeX, Version 3.141592653-2.6-1.40.28 (TeX Live 2025) (preloaded format=pdflatex 2025.12.18)  24 MAR 2026 12:46
 entering extended mode
  restricted \write18 enabled.
  %&-line parsing enabled.
@@ -369,77 +369,82 @@ G,.JBIG2,.JB2,.eps]
 File: epstopdf-sys.cfg 2010/07/13 v1.3 Configuration of (r)epstopdf for TeX Liv
 e
 ))
-Underfull \hbox (badness 6927) in paragraph at lines 25--25
+Underfull \hbox (badness 6927) in paragraph at lines 30--30
 [][][]\T1/cmr/m/n/9 Hamamatsu PLP-10 datasheet, []$\T1/cmtt/m/n/9 https : / / w
 ww . hamamatsu . com / content / dam / hamamatsu-[]photonics / sites /
  []
 
-<images/Laser_source.jpg, id=76, 1284.8pt x 592.2125pt>
+<images/Laser_source.jpg, id=124, 1284.8pt x 592.2125pt>
 File: images/Laser_source.jpg Graphic file (type jpg)
 <use images/Laser_source.jpg>
-Package pdftex.def Info: images/Laser_source.jpg  used on input line 33.
+Package pdftex.def Info: images/Laser_source.jpg  used on input line 38.
 (pdftex.def)             Requested size: 150.32504pt x 69.28226pt.
-<images/Laser_emitter.jpg, id=77, 1284.8pt x 592.2125pt>
+<images/Laser_emitter.jpg, id=125, 1284.8pt x 592.2125pt>
 File: images/Laser_emitter.jpg Graphic file (type jpg)
 <use images/Laser_emitter.jpg>
-Package pdftex.def Info: images/Laser_emitter.jpg  used on input line 40.
+Package pdftex.def Info: images/Laser_emitter.jpg  used on input line 45.
 (pdftex.def)             Requested size: 150.32504pt x 69.28226pt.
-<images/Sensori.jpg, id=78, 1284.8pt x 592.2125pt>
+<images/Sensori.jpg, id=126, 1284.8pt x 592.2125pt>
 File: images/Sensori.jpg Graphic file (type jpg)
 <use images/Sensori.jpg>
-Package pdftex.def Info: images/Sensori.jpg  used on input line 47.
+Package pdftex.def Info: images/Sensori.jpg  used on input line 52.
 (pdftex.def)             Requested size: 150.32504pt x 69.28226pt.
 [1
 
 {/usr/local/texlive/2025/texmf-var/fonts/map/pdftex/updmap/pdftex.map}{/usr/loc
-al/texlive/2025/texmf-dist/fonts/enc/dvips/cm-super/cm-super-t1.enc} <./images/
-Laser_source.jpg> <./images/Laser_emitter.jpg> <./images/Sensori.jpg>]
-<figs/calibration_fine_validation_p15.png, id=101, 1233.60875pt x 746.79pt>
+al/texlive/2025/texmf-dist/fonts/enc/dvips/cm-super/cm-super-t1.enc}{/usr/local
+/texlive/2025/texmf-dist/fonts/enc/dvips/cm-super/cm-super-ts1.enc} <./images/L
+aser_source.jpg> <./images/Laser_emitter.jpg> <./images/Sensori.jpg>]
+Overfull \hbox (46.7799pt too wide) in paragraph at lines 87--88
+[]\T1/cmr/m/n/10.95 The anal-y-sis works on de-coded ROOT files un-der \T1/cmtt
+/m/n/10.95 data/<run>/kc705-196/decoded/alcdaq.fifo_*.root\T1/cmr/m/n/10.95 . 
+ []
+
+[2] [3]
+<figs/calibration_fine_validation_p15.png, id=169, 1233.60875pt x 746.79pt>
 File: figs/calibration_fine_validation_p15.png Graphic file (type png)
 <use figs/calibration_fine_validation_p15.png>
 Package pdftex.def Info: figs/calibration_fine_validation_p15.png  used on inpu
-t line 88.
+t line 181.
 (pdftex.def)             Requested size: 446.26582pt x 270.15462pt.
-<figs/calibration_fine_validation_p16.png, id=102, 1233.60875pt x 746.79pt>
+<figs/calibration_fine_validation_p16.png, id=170, 1233.60875pt x 746.79pt>
 File: figs/calibration_fine_validation_p16.png Graphic file (type png)
 <use figs/calibration_fine_validation_p16.png>
 Package pdftex.def Info: figs/calibration_fine_validation_p16.png  used on inpu
-t line 95.
+t line 188.
 (pdftex.def)             Requested size: 446.26582pt x 270.15462pt.
-
-[2{/usr/local/texlive/2025/texmf-dist/fonts/enc/dvips/cm-super/cm-super-ts1.enc
-}] [3 <./figs/calibration_fine_validation_p15.png (PNG copy)>] [4 <./figs/calib
-ration_fine_validation_p16.png (PNG copy)>]
-<figs/calibration_no_calib_page3-03.png, id=132, 845.19765pt x 597.31155pt>
+ [4] [5 <./figs/calibration_fine_validation_p15.png (PNG copy)>]
+[6 <./figs/calibration_fine_validation_p16.png (PNG copy)>] [7] [8]
+<figs/calibration_no_calib_page3-03.png, id=201, 845.19765pt x 597.31155pt>
 File: figs/calibration_no_calib_page3-03.png Graphic file (type png)
 <use figs/calibration_no_calib_page3-03.png>
 Package pdftex.def Info: figs/calibration_no_calib_page3-03.png  used on input 
-line 179.
+line 367.
 (pdftex.def)             Requested size: 230.18253pt x 162.67075pt.
-<figs/calibration_with_calib_page3-03.png, id=133, 845.19765pt x 597.31155pt>
+<figs/calibration_with_calib_page3-03.png, id=202, 845.19765pt x 597.31155pt>
 File: figs/calibration_with_calib_page3-03.png Graphic file (type png)
 <use figs/calibration_with_calib_page3-03.png>
 Package pdftex.def Info: figs/calibration_with_calib_page3-03.png  used on inpu
-t line 186.
+t line 374.
 (pdftex.def)             Requested size: 230.18253pt x 162.67075pt.
- [5 <./figs/calibration_no_calib_page3-03.png (PNG copy)> <./figs/calibration_w
-ith_calib_page3-03.png (PNG copy)>]
-[6] (./report.aux)
+ [9]
+[10 <./figs/calibration_no_calib_page3-03.png (PNG copy)> <./figs/calibration_w
+ith_calib_page3-03.png (PNG copy)>] (./report.aux)
  ***********
 LaTeX2e <2025-11-01>
 L3 programming layer <2025-11-14>
  ***********
 Package rerunfilecheck Info: File `report.out' has not changed.
-(rerunfilecheck)             Checksum: 07114471F0EB2E033374E40D207C2A13;3237.
+(rerunfilecheck)             Checksum: 8753AF7AB080917B0620D4334EEAFDCB;4867.
  ) 
 Here is how much of TeX's memory you used:
- 10298 strings out of 467538
- 158096 string characters out of 5419545
- 580728 words of memory out of 5000000
- 39052 multiletter control sequences out of 15000+600000
+ 10334 strings out of 467538
+ 158491 string characters out of 5419545
+ 580745 words of memory out of 5000000
+ 39064 multiletter control sequences out of 15000+600000
  642301 words of font info for 74 fonts, out of 8000000 for 9000
  1141 hyphenation exceptions out of 8191
- 75i,10n,79p,565b,701s stack positions out of 10000i,1000n,20000p,200000b,200000s
+ 75i,12n,79p,565b,589s stack positions out of 10000i,1000n,20000p,200000b,200000s
 </usr/local/texlive/2025/texmf-dist/fonts/type1/public/amsfonts/cm/cmex10.pfb
 ></usr/local/texlive/2025/texmf-dist/fonts/type1/public/amsfonts/cm/cmmi10.pfb>
 </usr/local/texlive/2025/texmf-dist/fonts/type1/public/amsfonts/cm/cmmi8.pfb></
@@ -457,10 +462,10 @@ e/2025/texmf-dist/fonts/type1/public/cm-super/sfrm0800.pfb></usr/local/texlive/
 /texmf-dist/fonts/type1/public/cm-super/sfrm1728.pfb></usr/local/texlive/2025/t
 exmf-dist/fonts/type1/public/cm-super/sftt0900.pfb></usr/local/texlive/2025/tex
 mf-dist/fonts/type1/public/cm-super/sftt1095.pfb>
-Output written on report.pdf (6 pages, 846175 bytes).
+Output written on report.pdf (10 pages, 870697 bytes).
 PDF statistics:
- 230 PDF objects out of 1000 (max. 8388607)
- 178 compressed objects within 2 object streams
- 37 named destinations out of 1000 (max. 500000)
- 172 words of extra memory for PDF output out of 10000 (max. 10000000)
+ 309 PDF objects out of 1000 (max. 8388607)
+ 252 compressed objects within 3 object streams
+ 61 named destinations out of 1000 (max. 500000)
+ 268 words of extra memory for PDF output out of 10000 (max. 10000000)
 
