@@ -56,6 +56,7 @@ void PrintPlotHelp()
   std::cout << "  channel calibration uses hChanCalib_chXX vs ToT; applied to leading-edge times" << std::endl;
   std::cout << "  spill index is 0-based; default 1 (second spill)" << std::endl;
   std::cout << "  includes extra plot: leading-edge time distribution in selected spill" << std::endl;
+  std::cout << "  with exactly two channels, adds Delta t histogram for same-index leading hits" << std::endl;
   std::cout << "  fine_cut excludes hits with |fine - cut| <= fine_cut (fine units)" << std::endl;
 }
 
@@ -302,10 +303,11 @@ void plot_channels_rdf(const char *decoded_dir = "../raw_data/latest/kc705-196/d
   std::string out_open = std::string(out_pdf) + "[";
   std::string out_close = std::string(out_pdf) + "]";
 
-  struct PlotGroup {
+struct PlotGroup {
     std::string name;
     std::string title;
     std::vector<TH1D *> hists;
+    std::vector<std::string> labels;
   };
 
   std::vector<PlotGroup> groups;
@@ -329,6 +331,7 @@ void plot_channels_rdf(const char *decoded_dir = "../raw_data/latest/kc705-196/d
     group.name = var;
     group.title = var + "; " + var + "; entries";
     group.hists.reserve(views.size());
+    group.labels.reserve(views.size());
 
     std::vector<ROOT::RDF::RResultPtr<TH1D>> hists;
     hists.reserve(views.size());
@@ -341,6 +344,7 @@ void plot_channels_rdf(const char *decoded_dir = "../raw_data/latest/kc705-196/d
       hist->SetLineWidth(2);
       hists.push_back(hist);
       group.hists.push_back(hist.GetPtr());
+      group.labels.push_back("channel " + std::to_string(views[i].channel));
     }
 
     groups.push_back(group);
@@ -519,9 +523,68 @@ void plot_channels_rdf(const char *decoded_dir = "../raw_data/latest/kc705-196/d
     }
   }
 
+  std::unique_ptr<TH1D> indexed_dt_hist;
+  if (views.size() == 2) {
+    std::vector<double> leading_times_a;
+    std::vector<double> leading_times_b;
+    leading_times_a.reserve(hits_by_channel[0].size());
+    leading_times_b.reserve(hits_by_channel[1].size());
+
+    for (const auto &hit : hits_by_channel[0]) {
+      if (hit.leading) {
+        leading_times_a.push_back(hit.time_ns);
+      }
+    }
+    for (const auto &hit : hits_by_channel[1]) {
+      if (hit.leading) {
+        leading_times_b.push_back(hit.time_ns);
+      }
+    }
+
+    const size_t pair_count = std::min(leading_times_a.size(), leading_times_b.size());
+    if (pair_count > 0) {
+      std::vector<double> indexed_dt;
+      indexed_dt.reserve(pair_count);
+      for (size_t i = 0; i < pair_count; ++i) {
+        indexed_dt.push_back(leading_times_b[i] - leading_times_a[i]);
+      }
+
+      const auto minmax = std::minmax_element(indexed_dt.begin(), indexed_dt.end());
+      double lo = std::floor(*minmax.first) - 0.5;
+      double hi = std::ceil(*minmax.second) + 0.5;
+      if (lo == hi) {
+        lo -= 0.5;
+        hi += 0.5;
+      }
+      const int bins = BinsForRange(lo, hi);
+
+      const int channel_a = views[0].channel;
+      const int channel_b = views[1].channel;
+      std::ostringstream title;
+      title << "leading-edge time difference by hit index (channel " << channel_b << " - channel " << channel_a
+            << "); t_{ch" << channel_b << "}[i] - t_{ch" << channel_a << "}[i] [ns]; entries";
+
+      indexed_dt_hist = std::make_unique<TH1D>("h_indexed_dt", title.str().c_str(), bins, lo, hi);
+      indexed_dt_hist->SetLineColor(kBlue + 1);
+      indexed_dt_hist->SetLineWidth(2);
+      indexed_dt_hist->SetDirectory(nullptr);
+      for (double dt : indexed_dt) {
+        indexed_dt_hist->Fill(dt);
+      }
+
+      PlotGroup dt_group;
+      dt_group.name = "indexed_leading_dt";
+      dt_group.title = title.str();
+      dt_group.hists.push_back(indexed_dt_hist.get());
+      dt_group.labels.push_back("same index");
+      groups.push_back(std::move(dt_group));
+    }
+  }
+
   std::vector<std::unique_ptr<TH1D>> duration_hists;
   if (has_duration) {
-    int bins = static_cast<int>(duration_max_ns * 4.0);
+    const double duration_hist_max_ns = std::max(duration_max_ns, 30.0);
+    int bins = static_cast<int>(duration_hist_max_ns * 4.0);
     if (bins < 1) {
       bins = 1;
     }
@@ -531,6 +594,7 @@ void plot_channels_rdf(const char *decoded_dir = "../raw_data/latest/kc705-196/d
     duration_title << "hit duration (leading-trailing, <= " << duration_max_ns << " ns); Delta t [ns]; entries";
     duration_group.title = duration_title.str();
     duration_group.hists.reserve(views.size());
+    duration_group.labels.reserve(views.size());
     duration_hists.reserve(views.size());
 
     for (size_t i = 0; i < views.size(); ++i) {
@@ -539,7 +603,7 @@ void plot_channels_rdf(const char *decoded_dir = "../raw_data/latest/kc705-196/d
       ch_title << "hit duration (leading-trailing, <= " << duration_max_ns << " ns) (channel "
                << views[i].channel << "); Delta t [ns]; entries";
       const std::string ch_title_str = ch_title.str();
-      auto hist = std::make_unique<TH1D>(name.c_str(), ch_title_str.c_str(), bins, 0.0, duration_max_ns);
+      auto hist = std::make_unique<TH1D>(name.c_str(), ch_title_str.c_str(), bins, 0.0, duration_hist_max_ns);
       hist->SetLineColor(colors[i % colors.size()]);
       hist->SetLineWidth(2);
       hist->SetDirectory(nullptr);
@@ -547,6 +611,7 @@ void plot_channels_rdf(const char *decoded_dir = "../raw_data/latest/kc705-196/d
         hist->Fill(dt);
       }
       duration_group.hists.push_back(hist.get());
+      duration_group.labels.push_back("channel " + std::to_string(views[i].channel));
       duration_hists.push_back(std::move(hist));
     }
 
@@ -738,6 +803,7 @@ void plot_channels_rdf(const char *decoded_dir = "../raw_data/latest/kc705-196/d
       spill_group.title =
           "spill " + std::to_string(spill_index) + " leading-edge time; t - t_{spill} [ns]; entries";
       spill_group.hists.reserve(views.size());
+      spill_group.labels.reserve(views.size());
       spill_hists.reserve(views.size());
 
       for (size_t i = 0; i < views.size(); ++i) {
@@ -752,6 +818,7 @@ void plot_channels_rdf(const char *decoded_dir = "../raw_data/latest/kc705-196/d
           hist->Fill(v);
         }
         spill_group.hists.push_back(hist.get());
+        spill_group.labels.push_back("channel " + std::to_string(views[i].channel));
         spill_hists.push_back(std::move(hist));
       }
 
@@ -831,7 +898,14 @@ void plot_channels_rdf(const char *decoded_dir = "../raw_data/latest/kc705-196/d
 
       auto leg = std::make_unique<TLegend>(0.65, 0.75, 0.88, 0.88);
       for (size_t i = 0; i < group.hists.size(); ++i) {
-        std::string label = "channel " + std::to_string(views[i].channel);
+        std::string label;
+        if (i < group.labels.size() && !group.labels[i].empty()) {
+          label = group.labels[i];
+        } else if (i < views.size()) {
+          label = "channel " + std::to_string(views[i].channel);
+        } else {
+          label = "hist " + std::to_string(i);
+        }
         leg->AddEntry(group.hists[i], label.c_str(), "l");
       }
       leg->Draw();

@@ -4,6 +4,7 @@
 #include <TH1D.h>
 #include <TH2D.h>
 #include <TF1.h>
+#include <TFitResult.h>
 #include <TFitResultPtr.h>
 #include <THStack.h>
 #include <TLegend.h>
@@ -11,6 +12,7 @@
 #include <TPad.h>
 #include <TParameter.h>
 #include <TRandom3.h>
+#include <TError.h>
 #include <TStyle.h>
 #include <TSystem.h>
 
@@ -49,7 +51,7 @@ void PrintCoincidenceHelp()
 {
   std::cout << "coincidence_rdf usage:" << std::endl;
   std::cout << "  coincidence_rdf(\"/path/to/decoded.root\", \"pairs.txt\", \"out.pdf\", 10.0, 320.0, true,"
-               " 15.0, \"fine_calibration.root\", false, \"channel_calibration.root\", 0, \"out.root\", \"out.txt\", true)"
+               " 15.0, 0.0, \"fine_calibration.root\", false, \"channel_calibration.root\", 0, \"out.root\", \"out.txt\", true, 100)"
             << std::endl;
   std::cout << "Inputs:" << std::endl;
   std::cout << "  decoded dir must contain alcdaq.fifo_*.root with TTree 'alcor'" << std::endl;
@@ -57,6 +59,7 @@ void PrintCoincidenceHelp()
   std::cout << "  channels are 0..31, computed as column*4 + pixel when missing" << std::endl;
   std::cout << "Pairs file format: chA chB [window_ns], '#' for comments" << std::endl;
   std::cout << "  group lines: group ch1 ch2 ch3 [window=ns] (3+ channels)" << std::endl;
+  std::cout << "  duration-min lines: dmin CH NS (per-channel minimum ToT)" << std::endl;
   std::cout << "  use window=10 or 10.0 for integer windows to avoid ambiguity" << std::endl;
   std::cout << "  use the 'group' prefix for 3+ channel coincidences" << std::endl;
   std::cout << "Notes: type==1 hits, type==15 spill boundary, clock_mhz sets tick size" << std::endl;
@@ -67,7 +70,7 @@ void PrintCoincidenceHelp()
   std::cout << "  group plots show t_i - mean for the matched timestamps" << std::endl;
   std::cout << "  pair-mean plot: mean(t17,t19) - mean(t22,t23) using leading edges" << std::endl;
   std::cout << "  coincidence-hit distributions are appended to the same PDF" << std::endl;
-  std::cout << "  only hits with 0 < ToT <= max_duration_ns (leading-trailing) are considered" << std::endl;
+  std::cout << "  only hits with min_duration <= ToT <= max_duration_ns are considered" << std::endl;
   std::cout << "  fine calibration file uses hFineMin/hFineMax; default formula used when missing" << std::endl;
   std::cout << "  channel calibration uses hChanCalib_chXX vs ToT; applied to leading-edge times" << std::endl;
   std::cout << "  force_window=true ignores per-line windows in the pairs file" << std::endl;
@@ -75,6 +78,7 @@ void PrintCoincidenceHelp()
   std::cout << "  out_root writes histograms to a ROOT file when non-empty" << std::endl;
   std::cout << "  out_txt writes search/coincidence histograms and FWHM info when non-empty" << std::endl;
   std::cout << "  use_lut=false disables LUT even if hFineLut is present" << std::endl;
+  std::cout << "  preview_hits prints the first N leading-hit timestamps per channel after corrections" << std::endl;
 }
 
 struct Hit {
@@ -104,6 +108,132 @@ struct DurationInfo {
   std::vector<char> leading_mask;
   std::vector<int> leading_to_trailing;
 };
+
+struct ScopedErrorIgnoreLevel {
+  int previous = 0;
+  explicit ScopedErrorIgnoreLevel(int level)
+      : previous(gErrorIgnoreLevel)
+  {
+    gErrorIgnoreLevel = level;
+  }
+  ~ScopedErrorIgnoreLevel()
+  {
+    gErrorIgnoreLevel = previous;
+  }
+};
+
+std::unordered_map<int, std::vector<size_t>> CollectLeadingIndicesByChannel(const std::vector<int> &channel_list,
+                                                                            const std::vector<Hit> &hits,
+                                                                            const std::vector<char> &leading_mask)
+{
+  std::unordered_map<int, std::vector<size_t>> indices_by_channel;
+  indices_by_channel.reserve(channel_list.size());
+  for (int ch : channel_list) {
+    indices_by_channel.emplace(ch, std::vector<size_t>{});
+  }
+
+  for (size_t i = 0; i < hits.size(); ++i) {
+    if (i >= leading_mask.size() || !leading_mask[i]) {
+      continue;
+    }
+    auto it = indices_by_channel.find(hits[i].channel);
+    if (it == indices_by_channel.end()) {
+      continue;
+    }
+    it->second.push_back(i);
+  }
+
+  for (auto &kv : indices_by_channel) {
+    auto &indices = kv.second;
+    std::sort(indices.begin(), indices.end(), [&hits](size_t lhs, size_t rhs) {
+      if (hits[lhs].time_ns != hits[rhs].time_ns) {
+        return hits[lhs].time_ns < hits[rhs].time_ns;
+      }
+      return lhs < rhs;
+    });
+  }
+
+  return indices_by_channel;
+}
+
+void PrintLeadingEventPreview(const std::vector<int> &channel_list,
+                              const std::vector<Hit> &hits,
+                              const std::vector<char> &leading_mask,
+                              size_t max_events = 100)
+{
+  if (max_events == 0) {
+    return;
+  }
+  const auto indices_by_channel = CollectLeadingIndicesByChannel(channel_list, hits, leading_mask);
+
+  std::cout << "First " << max_events
+            << " leading-hit timestamps per channel, ordered by time (after timing corrections / duration filter)"
+            << std::endl;
+  for (int ch : channel_list) {
+    const auto it = indices_by_channel.find(ch);
+    const size_t total = (it != indices_by_channel.end()) ? it->second.size() : 0;
+    const size_t shown = std::min(max_events, total);
+    std::cout << "  channel " << ch << " -> showing " << shown << " / " << total << std::endl;
+    if (it == indices_by_channel.end() || it->second.empty()) {
+      continue;
+    }
+
+    for (size_t order = 0; order < shown; ++order) {
+      const size_t idx = it->second[order];
+      const auto &hit = hits[idx];
+      std::ostringstream line;
+      line << std::fixed << std::setprecision(3);
+      line << "    [" << order << "] time_ns=" << hit.time_ns;
+      std::cout << line.str() << std::endl;
+    }
+  }
+}
+
+void PrintLeadingTotPreview(const std::vector<int> &channel_list,
+                            const std::vector<Hit> &hits,
+                            const std::vector<char> &leading_mask,
+                            const std::vector<double> &tot_per_hit,
+                            size_t max_events = 100)
+{
+  if (max_events == 0) {
+    return;
+  }
+  const auto indices_by_channel = CollectLeadingIndicesByChannel(channel_list, hits, leading_mask);
+
+  std::cout << "First " << max_events
+            << " leading-hit ToT per channel, ordered by time (after duration filter)" << std::endl;
+  for (int ch : channel_list) {
+    const auto it = indices_by_channel.find(ch);
+    size_t total_with_tot = 0;
+    if (it != indices_by_channel.end()) {
+      for (size_t idx : it->second) {
+        if (idx < tot_per_hit.size() && tot_per_hit[idx] > 0.0) {
+          ++total_with_tot;
+        }
+      }
+    }
+    const size_t shown = std::min(max_events, total_with_tot);
+    std::cout << "  channel " << ch << " -> showing " << shown << " / " << total_with_tot << std::endl;
+    if (it == indices_by_channel.end() || it->second.empty()) {
+      continue;
+    }
+
+    size_t printed = 0;
+    for (size_t idx : it->second) {
+      if (idx >= tot_per_hit.size() || tot_per_hit[idx] <= 0.0) {
+        continue;
+      }
+      std::ostringstream line;
+      line << std::fixed << std::setprecision(3);
+      line << "    [" << printed << "] tot_ns=" << tot_per_hit[idx];
+      std::cout << line.str() << std::endl;
+      ++printed;
+      if (printed >= max_events) {
+        break;
+      }
+    }
+  }
+}
 
 int BinsForRange(double lo, double hi)
 {
@@ -271,6 +401,7 @@ bool ComputeFwhmBootstrap(const TH1D &hist_coinc,
   auto tmp_search = std::unique_ptr<TH1D>(static_cast<TH1D *>(hist_search.Clone("h_boot_search")));
   tmp_coinc->SetDirectory(nullptr);
   tmp_search->SetDirectory(nullptr);
+  ScopedErrorIgnoreLevel silence_fit_warnings(kError);
 
   std::vector<double> fwhm_vals;
   std::vector<double> bkg_vals;
@@ -436,6 +567,22 @@ bool ParseWindowToken(const std::string &token, double &value)
   return value > 0.0;
 }
 
+bool IsDurationMinDirective(const std::string &token)
+{
+  return token == "dmin" || token == "min_duration" || token == "duration_min" || token == "minduration";
+}
+
+double ChannelMinDurationNs(const std::unordered_map<int, double> &per_channel_min_duration_ns,
+                            int channel,
+                            double default_min_duration_ns)
+{
+  auto it = per_channel_min_duration_ns.find(channel);
+  if (it != per_channel_min_duration_ns.end()) {
+    return it->second;
+  }
+  return default_min_duration_ns;
+}
+
 uint64_t GroupKey(int run_id, int channel, int spill)
 {
   uint64_t key = static_cast<uint64_t>(run_id);
@@ -486,7 +633,9 @@ int ValueForVar(const Hit &hit, const std::string &var)
 DurationInfo ComputeDurationInfo(const std::vector<Hit> &hits,
                                  const analysis_time::FineCalib &fine_calib,
                                  double tick_ns,
+                                 double min_duration_ns,
                                  double max_duration_ns,
+                                 const std::unordered_map<int, double> &per_channel_min_duration_ns,
                                  bool use_fine)
 {
   DurationInfo info;
@@ -511,6 +660,9 @@ DurationInfo ComputeDurationInfo(const std::vector<Hit> &hits,
 
   for (auto &kv : groups) {
     auto &indices = kv.second;
+    const int channel = hits[indices.front()].channel;
+    const double channel_min_duration_ns =
+        std::max(0.0, ChannelMinDurationNs(per_channel_min_duration_ns, channel, min_duration_ns));
     std::vector<EdgeRef> edges;
     edges.reserve(indices.size());
     for (size_t idx : indices) {
@@ -557,7 +709,9 @@ DurationInfo ComputeDurationInfo(const std::vector<Hit> &hits,
         continue;
       }
       double dt_ns = time_ns - leading_time_ns[pair];
-      if (dt_ns > 0.0 && dt_ns <= max_duration_ns) {
+      const bool pass_min = dt_ns >= channel_min_duration_ns;
+      const bool pass_max = (max_duration_ns <= 0.0) || (dt_ns <= max_duration_ns);
+      if (dt_ns > 0.0 && pass_min && pass_max) {
         info.leading_mask[leading_idx[pair]] = 1;
         info.leading_to_trailing[leading_idx[pair]] = static_cast<int>(edge.index);
       }
@@ -674,7 +828,8 @@ bool LoadCoincidenceConfig(const std::string &path,
                            bool force_window,
                            std::vector<PairConfig> &pairs,
                            std::vector<GroupConfig> &groups,
-                           std::unordered_set<int> &channels)
+                           std::unordered_set<int> &channels,
+                           std::unordered_map<int, double> &per_channel_min_duration_ns)
 {
   std::ifstream fin(path);
   if (!fin) {
@@ -697,6 +852,21 @@ bool LoadCoincidenceConfig(const std::string &path,
       tokens.push_back(token);
     }
     if (tokens.empty()) {
+      continue;
+    }
+
+    if (IsDurationMinDirective(tokens[0])) {
+      if (tokens.size() != 3) {
+        std::cerr << "Skipping invalid duration-min line " << line_no << std::endl;
+        continue;
+      }
+      int ch = -1;
+      double val = 0.0;
+      if (!ParseChannelToken(tokens[1], ch) || !ParseDoubleToken(tokens[2], val) || val < 0.0) {
+        std::cerr << "Skipping invalid duration-min line " << line_no << std::endl;
+        continue;
+      }
+      per_channel_min_duration_ns[ch] = val;
       continue;
     }
 
@@ -1144,6 +1314,9 @@ bool BuildCoincidentHitDistributions(const std::vector<Hit> &hits,
                                      const std::vector<int> &channel_list,
                                      double tick_ns,
                                      bool use_fine,
+                                     const std::vector<double> &tot_per_hit,
+                                     double min_duration_ns,
+                                     const std::unordered_map<int, double> &per_channel_min_duration_ns,
                                      double duration_plot_max_ns,
                                      const std::string &label,
                                      const std::string &title_prefix,
@@ -1269,64 +1442,30 @@ bool BuildCoincidentHitDistributions(const std::vector<Hit> &hits,
   const double duration_max_ns = duration_plot_max_ns > 0.0 ? duration_plot_max_ns : 0.0;
   std::vector<std::vector<double>> durations(channel_list.size());
 
-  struct EdgeHit {
-    const Hit *hit = nullptr;
-  };
-
-  for (size_t i = 0; i < hits_by_channel.size(); ++i) {
-    auto &channel_hits = hits_by_channel[i];
-    if (channel_hits.empty()) {
+  for (size_t i = 0; i < hits.size(); ++i) {
+    if (i >= coincident_hits.size() || !coincident_hits[i]) {
       continue;
     }
-    std::vector<EdgeHit> edges;
-    edges.reserve(channel_hits.size());
-    for (const auto *hit : channel_hits) {
-      edges.push_back({hit});
+    if (i >= tot_per_hit.size() || !IsLeadingTdc(hits[i].tdc)) {
+      continue;
     }
-    std::sort(edges.begin(), edges.end(), [](const EdgeHit &a, const EdgeHit &b) {
-      if (a.hit->time_tick != b.hit->time_tick) {
-        return a.hit->time_tick < b.hit->time_tick;
-      }
-      return a.hit->fine < b.hit->fine;
-    });
-
-    std::array<bool, 2> have_leading = {false, false};
-    std::array<double, 2> leading_time_ns = {0.0, 0.0};
-    std::array<int, 2> leading_tdc = {-1, -1};
-    for (const auto &edge : edges) {
-      if (!IsLeadingTdc(edge.hit->tdc) && !IsTrailingTdc(edge.hit->tdc)) {
-        continue;
-      }
-      if (!IsValidTdcId(edge.hit->tdc)) {
-        continue;
-      }
-      int pair = TdcPairIndex(edge.hit->tdc);
-      if (pair < 0 || pair > 1) {
-        continue;
-      }
-      int tdc_index = analysis_time::TdcIndex(edge.hit->fifo, edge.hit->column, edge.hit->pixel, edge.hit->tdc);
-      double time_ns = analysis_time::TimeNsFromTick(
-          fine_calib, edge.hit->time_tick, edge.hit->fine, tdc_index, tick_ns, use_fine);
-      if (IsLeadingTdc(edge.hit->tdc)) {
-        leading_time_ns[pair] = time_ns;
-        leading_tdc[pair] = edge.hit->tdc;
-        have_leading[pair] = true;
-        continue;
-      }
-      if (!have_leading[pair]) {
-        continue;
-      }
-      if (leading_tdc[pair] < 0 || edge.hit->tdc != (leading_tdc[pair] ^ 0x1)) {
-        continue;
-      }
-      double dt_ns = time_ns - leading_time_ns[pair];
-      if (duration_max_ns > 0.0) {
-        if (dt_ns >= 0.0 && dt_ns <= duration_max_ns) {
-          durations[i].push_back(dt_ns);
-        }
-      }
-      have_leading[pair] = false;
+    auto idx_it = channel_index.find(hits[i].channel);
+    if (idx_it == channel_index.end()) {
+      continue;
     }
+    const double dt_ns = tot_per_hit[i];
+    if (dt_ns <= 0.0) {
+      continue;
+    }
+    const double channel_min_duration =
+        std::max(0.0, ChannelMinDurationNs(per_channel_min_duration_ns, hits[i].channel, min_duration_ns));
+    if (dt_ns < channel_min_duration) {
+      continue;
+    }
+    if (duration_max_ns > 0.0 && dt_ns > duration_max_ns) {
+      continue;
+    }
+    durations[idx_it->second].push_back(dt_ns);
   }
 
   if (duration_max_ns > 0.0) {
@@ -1395,6 +1534,13 @@ bool BuildCoincidentHitDistributions(const std::vector<Hit> &hits,
   return true;
 }
 
+void FitAndAnnotateDurationStack(const CoincPlotSet &set,
+                                 const CoincPlotGroup &group,
+                                 std::vector<std::unique_ptr<TF1>> &fits,
+                                 std::vector<std::unique_ptr<TLatex>> &labels,
+                                 double x0 = 0.15,
+                                 double y0 = 0.85);
+
 void DrawCoincidentStacksPerPair(const std::vector<CoincPlotSet> &sets, const char *out_pdf)
 {
   if (sets.empty()) {
@@ -1417,6 +1563,8 @@ void DrawCoincidentStacksPerPair(const std::vector<CoincPlotSet> &sets, const ch
 
     std::vector<std::unique_ptr<THStack>> stacks;
     std::vector<std::unique_ptr<TLegend>> legends;
+    std::vector<std::unique_ptr<TF1>> duration_fits;
+    std::vector<std::unique_ptr<TLatex>> duration_labels;
     stacks.reserve(set.groups.size());
     legends.reserve(set.groups.size());
 
@@ -1441,12 +1589,86 @@ void DrawCoincidentStacksPerPair(const std::vector<CoincPlotSet> &sets, const ch
       }
       leg->Draw();
 
+      FitAndAnnotateDurationStack(set, group, duration_fits, duration_labels);
+
       stacks.push_back(std::move(stack));
       legends.push_back(std::move(leg));
     }
 
     c_summary.Print(out_pdf);
   }
+}
+
+void FitAndAnnotateDurationStack(const CoincPlotSet &set,
+                                 const CoincPlotGroup &group,
+                                 std::vector<std::unique_ptr<TF1>> &fits,
+                                 std::vector<std::unique_ptr<TLatex>> &labels,
+                                 double x0,
+                                 double y0)
+{
+  if (group.kind != "duration" || group.hists.empty()) {
+    return;
+  }
+
+  size_t printed_labels = 0;
+  for (size_t i = 0; i < group.hists.size(); ++i) {
+    TH1D *hist = group.hists[i].get();
+    if (!hist || i >= set.channels.size() || hist->GetEntries() < 5) {
+      continue;
+    }
+
+    const double mean_seed = hist->GetMean();
+    const double sigma_seed = hist->GetRMS();
+    if (!std::isfinite(mean_seed) || !std::isfinite(sigma_seed) || sigma_seed <= 0.0) {
+      continue;
+    }
+
+    const double x_min = hist->GetXaxis()->GetXmin();
+    const double x_max = hist->GetXaxis()->GetXmax();
+    double fit_min = std::max(x_min, mean_seed - 6.0 * sigma_seed);
+    double fit_max = std::min(x_max, mean_seed + 6.0 * sigma_seed);
+    if (fit_max <= fit_min) {
+      fit_min = x_min;
+      fit_max = x_max;
+    }
+
+    auto fit = std::make_unique<TF1>(
+        Form("f_%s_ch%d_gaus", group.name.c_str(), set.channels[i]),
+        "gaus",
+        fit_min,
+        fit_max);
+    fit->SetParameters(hist->GetMaximum(), mean_seed, sigma_seed);
+    fit->SetParLimits(2, 1e-6, std::max(1e-6, x_max - x_min));
+    fit->SetLineColor(kRed);
+    fit->SetLineWidth(1);
+
+    hist->Fit(fit.get(), "RQ0");
+    const double mean = fit->GetParameter(1);
+    const double sigma = std::abs(fit->GetParameter(2));
+    if (!std::isfinite(mean) || !std::isfinite(sigma) || sigma <= 0.0) {
+      continue;
+    }
+
+    fit->Draw("same");
+
+    const double npe = (mean / sigma) * (mean / sigma);
+    auto text = std::make_unique<TLatex>();
+    text->SetNDC(true);
+    text->SetTextFont(42);
+    text->SetTextSize(0.04);
+    text->SetTextColor(hist->GetLineColor());
+    std::ostringstream line;
+    line << std::fixed << std::setprecision(2)
+         << "ch " << set.channels[i] << ": N_{P.E.} = " << npe;
+    text->DrawLatex(x0, y0 - 0.06 * printed_labels, line.str().c_str());
+    ++printed_labels;
+
+    fits.push_back(std::move(fit));
+    labels.push_back(std::move(text));
+  }
+
+  gPad->Modified();
+  gPad->Update();
 }
 
 void DrawCoincidentStacksPerVariable(const std::vector<CoincPlotSet> &sets, const char *out_pdf)
@@ -1474,6 +1696,8 @@ void DrawCoincidentStacksPerVariable(const std::vector<CoincPlotSet> &sets, cons
 
     std::vector<std::unique_ptr<THStack>> stacks;
     std::vector<std::unique_ptr<TLegend>> legends;
+    std::vector<std::unique_ptr<TF1>> duration_fits;
+    std::vector<std::unique_ptr<TLatex>> duration_labels;
     stacks.reserve(sets.size());
     legends.reserve(sets.size());
 
@@ -1509,6 +1733,8 @@ void DrawCoincidentStacksPerVariable(const std::vector<CoincPlotSet> &sets, cons
       }
       leg->Draw();
 
+      FitAndAnnotateDurationStack(set, *group_ptr, duration_fits, duration_labels);
+
       stacks.push_back(std::move(stack));
       legends.push_back(std::move(leg));
       ++pad;
@@ -1534,9 +1760,11 @@ void WriteCoincidenceTxt(const char *out_txt,
                          const std::vector<PairStats> &pair_stats,
                          double clock_mhz,
                          bool use_fine,
+                         double min_duration_ns,
                          double max_duration_ns,
                          int fine_cut,
-                         const char *pairs_file)
+                         const char *pairs_file,
+                         const std::unordered_map<int, double> &per_channel_min_duration_ns)
 {
   if (!out_txt || out_txt[0] == '\0') {
     return;
@@ -1550,8 +1778,12 @@ void WriteCoincidenceTxt(const char *out_txt,
   out << "# pairs_file: " << (pairs_file ? pairs_file : "") << "\n";
   out << "# clock_mhz: " << clock_mhz << "\n";
   out << "# use_fine: " << (use_fine ? 1 : 0) << "\n";
+  out << "# min_duration_ns: " << min_duration_ns << "\n";
   out << "# max_duration_ns: " << max_duration_ns << "\n";
   out << "# fine_cut: " << fine_cut << "\n";
+  for (const auto &kv : per_channel_min_duration_ns) {
+    out << "# channel_min_duration_ns ch=" << kv.first << " value=" << kv.second << "\n";
+  }
 
   for (size_t i = 0; i < pairs.size(); ++i) {
     const auto &pair = pairs[i];
@@ -1582,9 +1814,11 @@ void WriteCoincidenceRoot(const char *out_root,
                           const std::vector<CoincPlotSet> &pair_plot_sets,
                           double clock_mhz,
                           bool use_fine,
+                          double min_duration_ns,
                           double max_duration_ns,
                           int fine_cut,
-                          const char *pairs_file)
+                          const char *pairs_file,
+                          const std::unordered_map<int, double> &per_channel_min_duration_ns)
 {
   if (!out_root || out_root[0] == '\0') {
     return;
@@ -1601,12 +1835,19 @@ void WriteCoincidenceRoot(const char *out_root,
   }
   TParameter<double> p_clock("clock_mhz", clock_mhz);
   TParameter<int> p_use_fine("use_fine", use_fine ? 1 : 0);
+  TParameter<double> p_mindur("min_duration_ns", min_duration_ns);
   TParameter<double> p_maxdur("max_duration_ns", max_duration_ns);
   TParameter<int> p_fine_cut("fine_cut", fine_cut);
   p_clock.Write();
   p_use_fine.Write();
+  p_mindur.Write();
   p_maxdur.Write();
   p_fine_cut.Write();
+  for (const auto &kv : per_channel_min_duration_ns) {
+    const std::string name = "min_duration_ch" + std::to_string(kv.first);
+    TParameter<double> p(name.c_str(), kv.second);
+    p.Write();
+  }
 
   for (const auto &pair : pairs) {
     if (pair.hist_search) {
@@ -1682,13 +1923,15 @@ void coincidence_rdf(const char *decoded_dir = "../raw_data/latest/kc705-196/dec
                      double clock_mhz = 320.0,
                      bool use_fine = true,
                      double max_duration_ns = 15.0,
+                     double min_duration_ns = 0.0,
                      const char *fine_calib_path = "",
                      bool force_window = false,
                      const char *chan_calib_path = "",
                      int fine_cut = analysis_time::kDefaultFineCut,
                      const char *out_root = "",
                      const char *out_txt = "",
-                     bool use_lut = true)
+                     bool use_lut = true,
+                     int preview_hits = 100)
 {
   ScopedTimer timer("coincidence_rdf");
   ROOT::EnableImplicitMT();
@@ -1709,7 +1952,9 @@ void coincidence_rdf(const char *decoded_dir = "../raw_data/latest/kc705-196/dec
   std::unordered_set<int> channels;
   std::vector<PairConfig> pairs;
   std::vector<GroupConfig> groups;
-  if (!LoadCoincidenceConfig(pairs_file, default_window_ns, force_window, pairs, groups, channels)) {
+  std::unordered_map<int, double> per_channel_min_duration_ns;
+  if (!LoadCoincidenceConfig(
+          pairs_file, default_window_ns, force_window, pairs, groups, channels, per_channel_min_duration_ns)) {
     return;
   }
   if (pairs.empty() && groups.empty()) {
@@ -1744,7 +1989,21 @@ void coincidence_rdf(const char *decoded_dir = "../raw_data/latest/kc705-196/dec
   std::cout << "Output: " << out_pdf << std::endl;
   std::cout << "Clock (MHz): " << clock_mhz << std::endl;
   std::cout << "Use fine: " << (use_fine ? 1 : 0) << std::endl;
+  std::cout << "Min duration (ns): " << min_duration_ns << std::endl;
   std::cout << "Max duration (ns): " << max_duration_ns << std::endl;
+  if (!per_channel_min_duration_ns.empty()) {
+    std::vector<int> channels_with_min;
+    channels_with_min.reserve(per_channel_min_duration_ns.size());
+    for (const auto &kv : per_channel_min_duration_ns) {
+      channels_with_min.push_back(kv.first);
+    }
+    std::sort(channels_with_min.begin(), channels_with_min.end());
+    std::cout << "Per-channel min duration overrides (ns):";
+    for (int ch : channels_with_min) {
+      std::cout << " ch" << ch << "=" << per_channel_min_duration_ns[ch];
+    }
+    std::cout << std::endl;
+  }
   if (use_fine && fine_cut > 0) {
     std::cout << "Fine cut (bins): " << fine_cut << std::endl;
   } else {
@@ -1762,7 +2021,7 @@ void coincidence_rdf(const char *decoded_dir = "../raw_data/latest/kc705-196/dec
     const double hist_window_ns = pair.window_ns * 1.0;
     const double search_window_ns = std::max(pair.window_ns * 15.0, 100.0 + 4.0 * pair.window_ns);
 
-    int bins = BinsForWindow(hist_window_ns);
+    int bins = 2 * BinsForWindow(hist_window_ns);
     const double bin_width = (bins > 0) ? (2.0 * hist_window_ns / static_cast<double>(bins)) : 1.0;
     std::ostringstream title;
     title << "ch " << pair.channel_a << " vs " << pair.channel_b
@@ -2137,6 +2396,9 @@ void coincidence_rdf(const char *decoded_dir = "../raw_data/latest/kc705-196/dec
   if (max_duration_ns < 0.0) {
     max_duration_ns = 0.0;
   }
+  if (min_duration_ns < 0.0) {
+    min_duration_ns = 0.0;
+  }
 
   int current_spill = 0;
   for (size_t i = 0; i < types_val.size(); ++i) {
@@ -2193,8 +2455,10 @@ void coincidence_rdf(const char *decoded_dir = "../raw_data/latest/kc705-196/dec
 
   std::vector<char> leading_mask;
   std::vector<int> leading_to_trailing;
-  if (max_duration_ns > 0.0) {
-    auto duration_info = ComputeDurationInfo(hits, fine_calib, tick_ns, max_duration_ns, use_fine);
+  const bool use_duration_filter = max_duration_ns > 0.0 || min_duration_ns > 0.0 || !per_channel_min_duration_ns.empty();
+  if (use_duration_filter) {
+    auto duration_info = ComputeDurationInfo(
+        hits, fine_calib, tick_ns, min_duration_ns, max_duration_ns, per_channel_min_duration_ns, use_fine);
     leading_mask = std::move(duration_info.leading_mask);
     leading_to_trailing = std::move(duration_info.leading_to_trailing);
   } else {
@@ -2208,7 +2472,7 @@ void coincidence_rdf(const char *decoded_dir = "../raw_data/latest/kc705-196/dec
   }
 
   std::vector<double> tot_per_hit(hits.size(), -1.0);
-  if (max_duration_ns > 0.0) {
+  if (use_duration_filter) {
     for (size_t i = 0; i < hits.size(); ++i) {
       if (i >= leading_mask.size() || !leading_mask[i]) {
         continue;
@@ -2218,7 +2482,9 @@ void coincidence_rdf(const char *decoded_dir = "../raw_data/latest/kc705-196/dec
         continue;
       }
       double dt = hits[trailing].time_ns - hits[i].time_ns;
-      if (dt <= 0.0 || dt > max_duration_ns) {
+      const double channel_min_duration =
+          std::max(0.0, ChannelMinDurationNs(per_channel_min_duration_ns, hits[i].channel, min_duration_ns));
+      if (dt <= 0.0 || dt < channel_min_duration || (max_duration_ns > 0.0 && dt > max_duration_ns)) {
         continue;
       }
       tot_per_hit[i] = dt;
@@ -2242,6 +2508,12 @@ void coincidence_rdf(const char *decoded_dir = "../raw_data/latest/kc705-196/dec
       }
     }
   }
+
+  if (preview_hits < 0) {
+    preview_hits = 0;
+  }
+  PrintLeadingEventPreview(channel_list, hits, leading_mask, static_cast<size_t>(preview_hits));
+  PrintLeadingTotPreview(channel_list, hits, leading_mask, tot_per_hit, static_cast<size_t>(preview_hits));
 
   for (auto &pair : pairs) {
     pair.coincident_hits.assign(hits.size(), 0);
@@ -2524,6 +2796,9 @@ void coincidence_rdf(const char *decoded_dir = "../raw_data/latest/kc705-196/dec
                                         pair_channels,
                                         tick_ns,
                                         use_fine,
+                                        tot_per_hit,
+                                        min_duration_ns,
+                                        per_channel_min_duration_ns,
                                         duration_plot_max,
                                         label_tag,
                                         title.str(),
@@ -2541,18 +2816,22 @@ void coincidence_rdf(const char *decoded_dir = "../raw_data/latest/kc705-196/dec
                        pair_plot_sets,
                        clock_mhz,
                        use_fine,
+                       min_duration_ns,
                        max_duration_ns,
                        fine_cut,
-                       pairs_file);
+                       pairs_file,
+                       per_channel_min_duration_ns);
 
   WriteCoincidenceTxt(out_txt,
                       pairs,
                       pair_stats,
                       clock_mhz,
                       use_fine,
+                      min_duration_ns,
                       max_duration_ns,
                       fine_cut,
-                      pairs_file);
+                      pairs_file,
+                      per_channel_min_duration_ns);
 
   c_open.Print(out_close.c_str());
 }

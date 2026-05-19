@@ -23,9 +23,11 @@ Optional options:
   -m, --clock MHz          clock frequency (default 320)
   -f, --use-fine [0|1]     enable fine timing (default 1)
       --no-fine            disable fine timing
+      --min-duration NS    minimum leading-trailing duration (ns), default 0
   -d, --duration NS        max leading-trailing duration (ns), default 15 (<=0 disables duration filter)
       --no-duration        disable duration filter (use leading edges only)
   -F, --fine-cut N         exclude hits with |fine - cut| <= N (default 0; 0 disables)
+      --preview-hits N     print first N leading-hit timestamps per channel to terminal/log (default 100)
   -k, --calib FILE         fine calibration ROOT file (default: calibration/fine_calibration.root)
       --no-calib           disable fine calibration file (use default linear mapping)
   -K, --chan-calib FILE    channel calibration ROOT file (default: calibration/channel_calibration.root)
@@ -39,6 +41,7 @@ Input directory can be:
   - a parent directory with exactly one decoded folder within 3 levels
 Spill markers (type==15) are used when spill is not provided (decoded input).
 Pairs file can include group lines: group ch1 ch2 ch3 [window=ns]
+Pairs file can include per-channel minimum ToT lines: dmin CH NS
 USAGE
 }
 
@@ -50,8 +53,10 @@ pairs_file=""
 default_window_ns=10
 clock_mhz=320
 use_fine=1
+min_duration_ns=0
 max_duration_ns=15
 fine_cut=0
+preview_hits=100
 use_lut=1
 fine_calib_path=""
 chan_calib_path=""
@@ -65,8 +70,10 @@ cli_pairs_set=0
 cli_window_set=0
 cli_clock_set=0
 cli_use_fine_set=0
+cli_min_duration_set=0
 cli_duration_set=0
 cli_fine_cut_set=0
+cli_preview_hits_set=0
 cli_use_lut_set=0
 cli_calib_set=0
 cli_chan_calib_set=0
@@ -193,6 +200,17 @@ while [ "$#" -gt 0 ]; do
       cli_use_fine_set=1
       shift
       ;;
+    --min-duration)
+      need_arg "$@"
+      min_duration_ns=${2:-}
+      cli_min_duration_set=1
+      shift 2
+      ;;
+    --min-duration=*)
+      min_duration_ns=${1#*=}
+      cli_min_duration_set=1
+      shift
+      ;;
     -d|--duration)
       need_arg "$@"
       max_duration_ns=${2:-}
@@ -218,6 +236,17 @@ while [ "$#" -gt 0 ]; do
     --fine-cut=*)
       fine_cut=${1#*=}
       cli_fine_cut_set=1
+      shift
+      ;;
+    --preview-hits)
+      need_arg "$@"
+      preview_hits=${2:-}
+      cli_preview_hits_set=1
+      shift 2
+      ;;
+    --preview-hits=*)
+      preview_hits=${1#*=}
+      cli_preview_hits_set=1
       shift
       ;;
     -L|--use-lut)
@@ -362,11 +391,17 @@ apply_config() {
       use_fine|fine)
         if [ "${cli_use_fine_set}" -eq 0 ]; then use_fine="$(parse_bool "${value}")"; fi
         ;;
+      min_duration|min_duration_ns)
+        if [ "${cli_min_duration_set}" -eq 0 ]; then min_duration_ns="${value}"; fi
+        ;;
       duration|max_duration)
         if [ "${cli_duration_set}" -eq 0 ]; then max_duration_ns="${value}"; fi
         ;;
       fine_cut|fine_cut_bins|fine_cut_distance)
         if [ "${cli_fine_cut_set}" -eq 0 ]; then fine_cut="${value}"; fi
+        ;;
+      preview_hits|preview|print_hits)
+        if [ "${cli_preview_hits_set}" -eq 0 ]; then preview_hits="${value}"; fi
         ;;
       use_lut|lut)
         if [ "${cli_use_lut_set}" -eq 0 ]; then use_lut="$(parse_bool "${value}")"; fi
@@ -490,4 +525,4 @@ log_path="${out_dir}/log_${out_base}_macro.txt"
 
 exec > >(tee "${log_path}") 2>&1
 
-root -l -b -q "${macro_path}(\"${resolved_dir}\",\"${pairs_file}\",\"${out_path}\",${default_window_ns},${clock_mhz},${use_fine},${max_duration_ns},\"${fine_calib_path}\",${force_window},\"${chan_calib_path}\",${fine_cut},\"${root_out}\",\"${txt_out}\",${use_lut})"
+root -l -b -q "${macro_path}(\"${resolved_dir}\",\"${pairs_file}\",\"${out_path}\",${default_window_ns},${clock_mhz},${use_fine},${max_duration_ns},${min_duration_ns},\"${fine_calib_path}\",${force_window},\"${chan_calib_path}\",${fine_cut},\"${root_out}\",\"${txt_out}\",${use_lut},${preview_hits})"

@@ -683,6 +683,7 @@ void channel_calibration_rdf(const char *input = "../data/calibration",
     auto hist_raw = std::make_unique<TH1D>(raw_name.c_str(), raw_title.c_str(), offset_bins, -offset_range, offset_range);
     hist_raw->SetDirectory(nullptr);
     h_offset_raw[ch] = std::move(hist_raw);
+
   }
 
   for (int ch = 0; ch < 32; ++ch) {
