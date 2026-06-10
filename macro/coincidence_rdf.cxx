@@ -51,7 +51,8 @@ void PrintCoincidenceHelp()
 {
   std::cout << "coincidence_rdf usage:" << std::endl;
   std::cout << "  coincidence_rdf(\"/path/to/decoded.root\", \"pairs.txt\", \"out.pdf\", 10.0, 320.0, true,"
-               " 15.0, 0.0, \"fine_calibration.root\", false, \"channel_calibration.root\", 0, \"out.root\", \"out.txt\", true, 100)"
+               " 15.0, 0.0, \"fine_calibration.root\", false, \"channel_calibration.root\", 0, \"out.root\", \"out.txt\", true, 100,"
+               " \"laser_timewalk.root\")"
             << std::endl;
   std::cout << "Inputs:" << std::endl;
   std::cout << "  decoded dir must contain alcdaq.fifo_*.root with TTree 'alcor'" << std::endl;
@@ -73,6 +74,7 @@ void PrintCoincidenceHelp()
   std::cout << "  only hits with min_duration <= ToT <= max_duration_ns are considered" << std::endl;
   std::cout << "  fine calibration file uses hFineMin/hFineMax; default formula used when missing" << std::endl;
   std::cout << "  channel calibration uses hChanCalib_chXX vs ToT; applied to leading-edge times" << std::endl;
+  std::cout << "  timewalk calibration reads timewalk_corr_*_chXX parameters from a laser analysis ROOT file" << std::endl;
   std::cout << "  force_window=true ignores per-line windows in the pairs file" << std::endl;
   std::cout << "  fine_cut excludes hits with |fine - cut| <= fine_cut (fine units)" << std::endl;
   std::cout << "  out_root writes histograms to a ROOT file when non-empty" << std::endl;
@@ -581,6 +583,92 @@ double ChannelMinDurationNs(const std::unordered_map<int, double> &per_channel_m
     return it->second;
   }
   return default_min_duration_ns;
+}
+
+struct TimewalkCorrection {
+  bool valid = false;
+  int model = 0;
+  double p0 = 0.0;
+  double p1 = 0.0;
+  double p2 = 0.0;
+  double p3 = 1.0;
+  double p4 = 0.0;
+
+  double CorrectionNs(double tot) const
+  {
+    if (!valid || !std::isfinite(tot)) {
+      return 0.0;
+    }
+    double value = 0.0;
+    if (model == 1) {
+      if (tot <= p2 || p3 <= 0.0) {
+        value = p0 + p1 * tot;
+      } else {
+        value = p4 + (p0 + p1 * p2 - p4) * std::exp(-(tot - p2) / p3);
+      }
+    } else {
+      value = p0 + p1 * tot;
+    }
+    if (!std::isfinite(value) || value <= 0.0) {
+      return 0.0;
+    }
+    return value;
+  }
+};
+
+template <typename T>
+bool ReadTParameter(TFile &file, const std::string &name, T &value)
+{
+  auto *param = dynamic_cast<TParameter<T> *>(file.Get(name.c_str()));
+  if (!param) {
+    return false;
+  }
+  value = param->GetVal();
+  return true;
+}
+
+std::unordered_map<int, TimewalkCorrection> LoadTimewalkCorrections(const char *path,
+                                                                    const std::vector<int> &channel_list)
+{
+  std::unordered_map<int, TimewalkCorrection> corrections;
+  if (!path || path[0] == '\0') {
+    return corrections;
+  }
+
+  std::unique_ptr<TFile> file(TFile::Open(path, "READ"));
+  if (!file || file->IsZombie()) {
+    std::cout << "Failed to load timewalk calibration: " << path << " (ignored)" << std::endl;
+    return corrections;
+  }
+
+  for (int ch : channel_list) {
+    TimewalkCorrection correction;
+    int valid = 0;
+    if (!ReadTParameter(*file, "timewalk_corr_valid_ch" + std::to_string(ch), valid) || valid == 0) {
+      continue;
+    }
+    ReadTParameter(*file, "timewalk_corr_model_ch" + std::to_string(ch), correction.model);
+    if (!ReadTParameter(*file, "timewalk_corr_p0_ch" + std::to_string(ch), correction.p0) ||
+        !ReadTParameter(*file, "timewalk_corr_p1_ch" + std::to_string(ch), correction.p1)) {
+      continue;
+    }
+    ReadTParameter(*file, "timewalk_corr_p2_ch" + std::to_string(ch), correction.p2);
+    ReadTParameter(*file, "timewalk_corr_p3_ch" + std::to_string(ch), correction.p3);
+    ReadTParameter(*file, "timewalk_corr_p4_ch" + std::to_string(ch), correction.p4);
+    correction.valid = true;
+    corrections[ch] = correction;
+
+    std::cout << "Loaded timewalk correction ch" << ch << " model=" << correction.model << " p0="
+              << correction.p0 << " p1=" << correction.p1 << " p2=" << correction.p2 << " p3="
+              << correction.p3 << " p4=" << correction.p4 << std::endl;
+  }
+
+  if (corrections.empty()) {
+    std::cout << "No valid timewalk corrections found in " << path << std::endl;
+  } else {
+    std::cout << "Loaded timewalk calibration: " << path << std::endl;
+  }
+  return corrections;
 }
 
 uint64_t GroupKey(int run_id, int channel, int spill)
@@ -1931,7 +2019,8 @@ void coincidence_rdf(const char *decoded_dir = "../raw_data/latest/kc705-196/dec
                      const char *out_root = "",
                      const char *out_txt = "",
                      bool use_lut = true,
-                     int preview_hits = 100)
+                     int preview_hits = 100,
+                     const char *timewalk_calib_path = "")
 {
   ScopedTimer timer("coincidence_rdf");
   ROOT::EnableImplicitMT();
@@ -2368,6 +2457,10 @@ void coincidence_rdf(const char *decoded_dir = "../raw_data/latest/kc705-196/dec
 
   std::vector<int> channel_list(channels.begin(), channels.end());
   std::sort(channel_list.begin(), channel_list.end());
+  const auto timewalk_corrections = LoadTimewalkCorrections(timewalk_calib_path, channel_list);
+  if (timewalk_calib_path && timewalk_calib_path[0] != '\0' && timewalk_corrections.empty()) {
+    std::cout << "Timewalk calibration requested but no correction will be applied." << std::endl;
+  }
 
   std::vector<Hit> hits;
   hits.reserve(types_val.size());
@@ -2393,6 +2486,9 @@ void coincidence_rdf(const char *decoded_dir = "../raw_data/latest/kc705-196/dec
     }
   }
   analysis_time::PrintChannelCalibSummary(chan_calib);
+  if (timewalk_calib_path && timewalk_calib_path[0] != '\0') {
+    std::cout << "Timewalk calib: " << timewalk_calib_path << std::endl;
+  }
   if (max_duration_ns < 0.0) {
     max_duration_ns = 0.0;
   }
@@ -2507,6 +2603,30 @@ void coincidence_rdf(const char *decoded_dir = "../raw_data/latest/kc705-196/dec
         hits[i].time_ns -= chan_calib.CorrectionNs(hits[i].channel, tot);
       }
     }
+  }
+
+  if (!timewalk_corrections.empty()) {
+    long long corrected_hits = 0;
+    for (size_t i = 0; i < hits.size(); ++i) {
+      if (i >= leading_mask.size() || !leading_mask[i]) {
+        continue;
+      }
+      const double tot = tot_per_hit[i];
+      if (tot <= 0.0) {
+        continue;
+      }
+      auto correction_it = timewalk_corrections.find(hits[i].channel);
+      if (correction_it == timewalk_corrections.end()) {
+        continue;
+      }
+      const double correction_ns = correction_it->second.CorrectionNs(tot);
+      if (correction_ns <= 0.0) {
+        continue;
+      }
+      hits[i].time_ns -= correction_ns;
+      ++corrected_hits;
+    }
+    std::cout << "Applied timewalk correction to " << corrected_hits << " leading hits" << std::endl;
   }
 
   if (preview_hits < 0) {

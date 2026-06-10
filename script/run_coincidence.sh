@@ -32,6 +32,11 @@ Optional options:
       --no-calib           disable fine calibration file (use default linear mapping)
   -K, --chan-calib FILE    channel calibration ROOT file (default: calibration/channel_calibration.root)
       --no-chan-calib      disable channel calibration file
+      --timewalk-calib FILE
+                            laser-analysis ROOT file with timewalk_corr_* parameters
+                            (default: calibration/timewalk_correction.root if present)
+                            disables default channel calibration unless -K is set
+      --no-timewalk-calib   disable default timewalk correction symlink
       --config FILE        load defaults from config file (CLI overrides)
   -h, --help               show this help
 
@@ -60,6 +65,7 @@ preview_hits=100
 use_lut=1
 fine_calib_path=""
 chan_calib_path=""
+timewalk_calib_path=""
 config_file=""
 force_window=0
 cli_out_set=0
@@ -77,6 +83,7 @@ cli_preview_hits_set=0
 cli_use_lut_set=0
 cli_calib_set=0
 cli_chan_calib_set=0
+cli_timewalk_calib_set=0
 
 need_arg() {
   if [ "$#" -lt 2 ] || [ -z "${2-}" ]; then
@@ -302,6 +309,22 @@ while [ "$#" -gt 0 ]; do
       cli_chan_calib_set=1
       shift
       ;;
+    --timewalk-calib)
+      need_arg "$@"
+      timewalk_calib_path=${2:-}
+      cli_timewalk_calib_set=1
+      shift 2
+      ;;
+    --timewalk-calib=*)
+      timewalk_calib_path=${1#*=}
+      cli_timewalk_calib_set=1
+      shift
+      ;;
+    --no-timewalk-calib)
+      timewalk_calib_path=""
+      cli_timewalk_calib_set=1
+      shift
+      ;;
     --config)
       need_arg "$@"
       config_file=${2:-}
@@ -412,6 +435,9 @@ apply_config() {
       chan_calib|channel_calib|channel_calibration)
         if [ "${cli_chan_calib_set}" -eq 0 ]; then chan_calib_path="${value}"; fi
         ;;
+      timewalk_calib|timewalk_calibration|timewalk)
+        if [ "${cli_timewalk_calib_set}" -eq 0 ]; then timewalk_calib_path="${value}"; fi
+        ;;
       *)
         echo "Ignoring unknown config key: ${key}" >&2
         ;;
@@ -442,6 +468,14 @@ if [ -z "${fine_calib_path}" ] && [ "${cli_calib_set}" -eq 0 ]; then
 fi
 if [ -z "${chan_calib_path}" ] && [ "${cli_chan_calib_set}" -eq 0 ]; then
   chan_calib_path="${qa_dir}/calibration/channel_calibration.root"
+fi
+if [ -z "${timewalk_calib_path}" ] && [ "${cli_timewalk_calib_set}" -eq 0 ] &&
+  [ -s "${qa_dir}/calibration/timewalk_correction.root" ]; then
+  timewalk_calib_path="${qa_dir}/calibration/timewalk_correction.root"
+fi
+if [ -n "${timewalk_calib_path}" ] && [ "${cli_chan_calib_set}" -eq 0 ]; then
+  # Avoid applying two independent ToT/timewalk corrections unless explicitly requested.
+  chan_calib_path=""
 fi
 
 mkdir -p "${out_dir}"
@@ -525,4 +559,4 @@ log_path="${out_dir}/log_${out_base}_macro.txt"
 
 exec > >(tee "${log_path}") 2>&1
 
-root -l -b -q "${macro_path}(\"${resolved_dir}\",\"${pairs_file}\",\"${out_path}\",${default_window_ns},${clock_mhz},${use_fine},${max_duration_ns},${min_duration_ns},\"${fine_calib_path}\",${force_window},\"${chan_calib_path}\",${fine_cut},\"${root_out}\",\"${txt_out}\",${use_lut},${preview_hits})"
+root -l -b -q "${macro_path}(\"${resolved_dir}\",\"${pairs_file}\",\"${out_path}\",${default_window_ns},${clock_mhz},${use_fine},${max_duration_ns},${min_duration_ns},\"${fine_calib_path}\",${force_window},\"${chan_calib_path}\",${fine_cut},\"${root_out}\",\"${txt_out}\",${use_lut},${preview_hits},\"${timewalk_calib_path}\")"

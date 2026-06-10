@@ -21,8 +21,11 @@
 #include <chrono>
 #include <cmath>
 #include <iostream>
+#include <iterator>
 #include <limits>
+#include <memory>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace {
@@ -428,6 +431,8 @@ void fine_calibration_rdf(const char *input = "../data/calibration",
   hlut->SetDirectory(nullptr);
   std::array<std::unique_ptr<TH1D>, 4> htdc{};
   std::array<std::unique_ptr<TH1D>, 4> htdc_cdf{};
+  std::array<std::unique_ptr<TH1D>, 4> hfraction_raw_tdc{};
+  std::array<std::unique_ptr<TH1D>, 4> hfraction_lut_tdc{};
   for (int t = 0; t < 4; ++t) {
     std::string name = "hFineTdc" + std::to_string(t);
     std::string title = "Fine distribution (TDC " + std::to_string(t) + ");fine;entries";
@@ -440,6 +445,20 @@ void fine_calibration_rdf(const char *input = "../data/calibration",
     auto cdf_hist = std::make_unique<TH1D>(cdf_name.c_str(), cdf_title.c_str(), bins, 0.5, bins + 0.5);
     cdf_hist->SetDirectory(nullptr);
     htdc_cdf[t] = std::move(cdf_hist);
+
+    std::string raw_name = "hFineFractionRawTdc" + std::to_string(t);
+    std::string raw_title = "Fine fraction before LUT (TDC " + std::to_string(t) + ");fine fraction;entries";
+    auto raw_hist = std::make_unique<TH1D>(raw_name.c_str(), raw_title.c_str(), bins, -0.5, 0.5);
+    raw_hist->SetDirectory(nullptr);
+    raw_hist->SetStats(false);
+    hfraction_raw_tdc[t] = std::move(raw_hist);
+
+    std::string lut_name = "hFineFractionLutTdc" + std::to_string(t);
+    std::string lut_title = "Fine fraction after LUT (TDC " + std::to_string(t) + ");fine fraction;entries";
+    auto lut_hist = std::make_unique<TH1D>(lut_name.c_str(), lut_title.c_str(), bins, -0.5, 0.5);
+    lut_hist->SetDirectory(nullptr);
+    lut_hist->SetStats(false);
+    hfraction_lut_tdc[t] = std::move(lut_hist);
   }
 
   std::array<double, analysis_time::kFineCalibSize> min_vals{};
@@ -518,6 +537,26 @@ void fine_calibration_rdf(const char *input = "../data/calibration",
   };
   std::vector<TdcProfileInfo> tdc_profiles;
   std::vector<int> candidate_idx;
+  const std::vector<int> diagnostic_channels = {17, 19, 22};
+  std::vector<std::unique_ptr<TH1D>> hfraction_raw_channel;
+  std::vector<std::unique_ptr<TH1D>> hfraction_lut_channel;
+  hfraction_raw_channel.reserve(diagnostic_channels.size());
+  hfraction_lut_channel.reserve(diagnostic_channels.size());
+  for (int channel : diagnostic_channels) {
+    std::string raw_name = "hFineFractionRawCh" + std::to_string(channel);
+    std::string raw_title = "Fine fraction before LUT (ch " + std::to_string(channel) + ");fine fraction;entries";
+    auto raw_hist = std::make_unique<TH1D>(raw_name.c_str(), raw_title.c_str(), bins, -0.5, 0.5);
+    raw_hist->SetDirectory(nullptr);
+    raw_hist->SetStats(false);
+    hfraction_raw_channel.push_back(std::move(raw_hist));
+
+    std::string lut_name = "hFineFractionLutCh" + std::to_string(channel);
+    std::string lut_title = "Fine fraction after LUT (ch " + std::to_string(channel) + ");fine fraction;entries";
+    auto lut_hist = std::make_unique<TH1D>(lut_name.c_str(), lut_title.c_str(), bins, -0.5, 0.5);
+    lut_hist->SetDirectory(nullptr);
+    lut_hist->SetStats(false);
+    hfraction_lut_channel.push_back(std::move(lut_hist));
+  }
   candidate_idx.reserve(size);
   for (int idx = 0; idx < size; ++idx) {
     if (!valid_vals[idx]) {
@@ -529,7 +568,7 @@ void fine_calibration_rdf(const char *input = "../data/calibration",
     const int rem2 = rem % (analysis_time::kTdcPerPixel * analysis_time::kPixelsPerColumn);
     const int pixel = rem2 / analysis_time::kTdcPerPixel;
     const int channel = column * 4 + pixel;
-    if (channel == 17 || channel == 19) {
+    if (std::find(diagnostic_channels.begin(), diagnostic_channels.end(), channel) != diagnostic_channels.end()) {
       candidate_idx.push_back(idx);
     }
   }
@@ -558,6 +597,40 @@ void fine_calibration_rdf(const char *input = "../data/calibration",
       prof->Fill(static_cast<double>(b + 1), cdf_val);
     }
     tdc_profiles.push_back({idx, fifo, column, pixel, tdc, channel, entries[idx], std::move(prof)});
+  }
+
+  for (int idx = 0; idx < size; ++idx) {
+    if (!valid_vals[idx]) {
+      continue;
+    }
+    const int fifo = idx / analysis_time::kTdcPerFifo;
+    const int local = idx % analysis_time::kTdcPerFifo;
+    const int column = local / (analysis_time::kPixelsPerColumn * analysis_time::kTdcPerPixel);
+    const int rem = local % (analysis_time::kPixelsPerColumn * analysis_time::kTdcPerPixel);
+    const int pixel = rem / analysis_time::kTdcPerPixel;
+    const int tdc = rem % analysis_time::kTdcPerPixel;
+    const int channel = column * 4 + pixel;
+    (void)fifo;
+
+    const auto channel_it = std::find(diagnostic_channels.begin(), diagnostic_channels.end(), channel);
+    const bool is_diagnostic_channel = channel_it != diagnostic_channels.end();
+    const size_t channel_pos = is_diagnostic_channel
+                                   ? static_cast<size_t>(std::distance(diagnostic_channels.begin(), channel_it))
+                                   : 0;
+    for (int b = 0; b < bins; ++b) {
+      const long long count = counts[idx * bins + b];
+      if (count <= 0) {
+        continue;
+      }
+      const double raw_fraction = (static_cast<double>(b) + 0.5) / static_cast<double>(bins) - 0.5;
+      const double lut_fraction = hlut->GetBinContent(idx + 1, b + 1);
+      hfraction_raw_tdc[tdc]->Fill(raw_fraction, static_cast<double>(count));
+      hfraction_lut_tdc[tdc]->Fill(lut_fraction, static_cast<double>(count));
+      if (is_diagnostic_channel) {
+        hfraction_raw_channel[channel_pos]->Fill(raw_fraction, static_cast<double>(count));
+        hfraction_lut_channel[channel_pos]->Fill(lut_fraction, static_cast<double>(count));
+      }
+    }
   }
 
   auto tree = std::make_unique<TTree>("fine_calib", "Fine calibration values");
@@ -608,6 +681,12 @@ void fine_calibration_rdf(const char *input = "../data/calibration",
     }
     htdc[t]->Write();
     htdc_cdf[t]->Write();
+    hfraction_raw_tdc[t]->Write();
+    hfraction_lut_tdc[t]->Write();
+  }
+  for (size_t i = 0; i < diagnostic_channels.size(); ++i) {
+    hfraction_raw_channel[i]->Write();
+    hfraction_lut_channel[i]->Write();
   }
   for (auto &item : tdc_profiles) {
     if (item.profile) {
@@ -681,7 +760,7 @@ void fine_calibration_rdf(const char *input = "../data/calibration",
       return true;
     };
 
-    TCanvas c_summary("c_fine_calib_summary", "Fine calibration summary", 1200, 900);
+    TCanvas c_summary("c_fine_calib_summary", "Fine calibration summary", 1600, 900);
     c_summary.Divide(2, 2);
     c_summary.cd(1);
     hmin->Draw("hist");
@@ -695,7 +774,7 @@ void fine_calibration_rdf(const char *input = "../data/calibration",
     c_summary.Print((pdf_path + "[").c_str());
     c_summary.Print(pdf_path.c_str());
 
-    TCanvas c_tdc("c_fine_calib_tdc", "Fine calibration TDC distributions", 1200, 900);
+    TCanvas c_tdc("c_fine_calib_tdc", "Fine calibration TDC distributions", 1600, 900);
     c_tdc.Divide(2, 2);
     for (int t = 0; t < 4; ++t) {
       c_tdc.cd(t + 1);
@@ -703,13 +782,88 @@ void fine_calibration_rdf(const char *input = "../data/calibration",
     }
     c_tdc.Print(pdf_path.c_str());
 
-    TCanvas c_tdc_cdf("c_fine_calib_tdc_cdf", "Fine calibration TDC CDFs", 1200, 900);
+    TCanvas c_tdc_cdf("c_fine_calib_tdc_cdf", "Fine calibration TDC CDFs", 1600, 900);
     c_tdc_cdf.Divide(2, 2);
     for (int t = 0; t < 4; ++t) {
       c_tdc_cdf.cd(t + 1);
       htdc_cdf[t]->Draw("hist");
     }
     c_tdc_cdf.Print(pdf_path.c_str());
+
+    auto draw_before_after_stack = [](TH1D *raw_hist,
+                                      TH1D *lut_hist,
+                                      const std::string &stack_name,
+                                      const std::string &title) {
+      auto stack = std::make_unique<THStack>(stack_name.c_str(), title.c_str());
+      if (raw_hist) {
+        raw_hist->SetLineColor(kRed + 1);
+        raw_hist->SetLineWidth(2);
+        raw_hist->SetStats(false);
+        stack->Add(raw_hist, "hist");
+      }
+      if (lut_hist) {
+        lut_hist->SetLineColor(kBlue + 1);
+        lut_hist->SetLineWidth(2);
+        lut_hist->SetStats(false);
+        stack->Add(lut_hist, "hist");
+      }
+      stack->Draw("nostack hist");
+      stack->GetXaxis()->SetTitle("fine fraction");
+      stack->GetYaxis()->SetTitle("entries");
+      auto legend = std::make_unique<TLegend>(0.68, 0.76, 0.9, 0.9);
+      legend->SetBorderSize(0);
+      legend->SetFillStyle(0);
+      if (raw_hist) {
+        legend->AddEntry(raw_hist, "raw", "l");
+      }
+      if (lut_hist) {
+        legend->AddEntry(lut_hist, "LUT corrected", "l");
+      }
+      legend->Draw();
+      return std::make_pair(std::move(stack), std::move(legend));
+    };
+
+    TCanvas c_tdc_before_after("c_fine_fraction_before_after_tdc",
+                               "Fine fraction before/after TDC LUT",
+                               1600,
+                               900);
+    c_tdc_before_after.Divide(2, 2);
+    std::vector<std::unique_ptr<THStack>> tdc_before_after_stacks;
+    std::vector<std::unique_ptr<TLegend>> tdc_before_after_legends;
+    tdc_before_after_stacks.reserve(4);
+    tdc_before_after_legends.reserve(4);
+    for (int t = 0; t < 4; ++t) {
+      c_tdc_before_after.cd(t + 1);
+      auto drawn = draw_before_after_stack(hfraction_raw_tdc[t].get(),
+                                           hfraction_lut_tdc[t].get(),
+                                           "stack_fine_fraction_before_after_tdc" + std::to_string(t),
+                                           "TDC " + std::to_string(t) + ";fine fraction;entries");
+      tdc_before_after_stacks.push_back(std::move(drawn.first));
+      tdc_before_after_legends.push_back(std::move(drawn.second));
+    }
+    c_tdc_before_after.Print(pdf_path.c_str());
+
+    TCanvas c_channel_before_after("c_fine_fraction_before_after_channels",
+                                   "Fine fraction before/after TDC LUT (channels)",
+                                   1600,
+                                   900);
+    c_channel_before_after.Divide(static_cast<int>(diagnostic_channels.size()), 1);
+    std::vector<std::unique_ptr<THStack>> channel_before_after_stacks;
+    std::vector<std::unique_ptr<TLegend>> channel_before_after_legends;
+    channel_before_after_stacks.reserve(diagnostic_channels.size());
+    channel_before_after_legends.reserve(diagnostic_channels.size());
+    for (size_t i = 0; i < diagnostic_channels.size(); ++i) {
+      c_channel_before_after.cd(static_cast<int>(i + 1));
+      auto drawn = draw_before_after_stack(hfraction_raw_channel[i].get(),
+                                           hfraction_lut_channel[i].get(),
+                                           "stack_fine_fraction_before_after_ch" +
+                                               std::to_string(diagnostic_channels[i]),
+                                           "channel " + std::to_string(diagnostic_channels[i]) +
+                                               ";fine fraction;entries");
+      channel_before_after_stacks.push_back(std::move(drawn.first));
+      channel_before_after_legends.push_back(std::move(drawn.second));
+    }
+    c_channel_before_after.Print(pdf_path.c_str());
 
     if (!tdc_profiles.empty()) {
       auto build_stack = [&](int channel, const std::string &name, const std::string &title, TLegend &legend) {
@@ -732,49 +886,56 @@ void fine_calibration_rdf(const char *input = "../data/calibration",
         return stack;
       };
 
-      TCanvas c_lut_profiles("c_fine_cdf_profiles", "Fine CDF profiles (ch 17/19)", 1000, 800);
-      c_lut_profiles.Divide(1, 2);
-      TLegend legend17(0.7, 0.2, 0.9, 0.4);
-      TLegend legend19(0.7, 0.2, 0.9, 0.4);
-      legend17.SetBorderSize(0);
-      legend17.SetFillStyle(0);
-      legend19.SetBorderSize(0);
-      legend19.SetFillStyle(0);
-      auto stack17 = build_stack(17, "stack_fine_cdf_17", "Fine CDF profiles (ch 17);fine;CDF", legend17);
-      auto stack19 = build_stack(19, "stack_fine_cdf_19", "Fine CDF profiles (ch 19);fine;CDF", legend19);
-      c_lut_profiles.cd(1);
-      if (stack17 && stack17->GetHists() && stack17->GetHists()->GetSize() > 0) {
-        stack17->Draw("nostack");
-        legend17.Draw();
+      TCanvas c_lut_profiles("c_fine_cdf_profiles", "Fine CDF profiles (ch 17/19/22)", 1600, 900);
+      c_lut_profiles.Divide(static_cast<int>(diagnostic_channels.size()), 1);
+      std::vector<std::unique_ptr<TLegend>> legends;
+      std::vector<std::unique_ptr<THStack>> stacks;
+      legends.reserve(diagnostic_channels.size());
+      stacks.reserve(diagnostic_channels.size());
+      for (int channel : diagnostic_channels) {
+        auto legend = std::make_unique<TLegend>(0.7, 0.2, 0.9, 0.4);
+        legend->SetBorderSize(0);
+        legend->SetFillStyle(0);
+        auto stack = build_stack(channel,
+                                 "stack_fine_cdf_" + std::to_string(channel),
+                                 "Fine CDF profiles (ch " + std::to_string(channel) + ");fine;CDF",
+                                 *legend);
+        legends.push_back(std::move(legend));
+        stacks.push_back(std::move(stack));
       }
-      c_lut_profiles.cd(2);
-      if (stack19 && stack19->GetHists() && stack19->GetHists()->GetSize() > 0) {
-        stack19->Draw("nostack");
-        legend19.Draw();
+      for (size_t i = 0; i < diagnostic_channels.size(); ++i) {
+        c_lut_profiles.cd(static_cast<int>(i + 1));
+        if (stacks[i] && stacks[i]->GetHists() && stacks[i]->GetHists()->GetSize() > 0) {
+          stacks[i]->Draw("nostack");
+          legends[i]->Draw();
+        }
       }
       c_lut_profiles.Print(pdf_path.c_str());
 
-      TCanvas c_lut_profiles_zoom("c_fine_cdf_profiles_zoom", "Fine CDF profiles (ch 17/19) zoom", 1000, 800);
-      c_lut_profiles_zoom.Divide(1, 2);
-      TLegend legend17_zoom(0.7, 0.2, 0.9, 0.4);
-      TLegend legend19_zoom(0.7, 0.2, 0.9, 0.4);
-      legend17_zoom.SetBorderSize(0);
-      legend17_zoom.SetFillStyle(0);
-      legend19_zoom.SetBorderSize(0);
-      legend19_zoom.SetFillStyle(0);
-      auto stack17_zoom = build_stack(17, "stack_fine_cdf_17_zoom", "Fine CDF profiles (ch 17);fine;CDF", legend17_zoom);
-      auto stack19_zoom = build_stack(19, "stack_fine_cdf_19_zoom", "Fine CDF profiles (ch 19);fine;CDF", legend19_zoom);
-      c_lut_profiles_zoom.cd(1);
-      if (stack17_zoom && stack17_zoom->GetHists() && stack17_zoom->GetHists()->GetSize() > 0) {
-        stack17_zoom->Draw("nostack");
-        stack17_zoom->GetXaxis()->SetRangeUser(20.0, 120.0);
-        legend17_zoom.Draw();
+      TCanvas c_lut_profiles_zoom("c_fine_cdf_profiles_zoom", "Fine CDF profiles (ch 17/19/22) zoom", 1600, 900);
+      c_lut_profiles_zoom.Divide(static_cast<int>(diagnostic_channels.size()), 1);
+      std::vector<std::unique_ptr<TLegend>> legends_zoom;
+      std::vector<std::unique_ptr<THStack>> stacks_zoom;
+      legends_zoom.reserve(diagnostic_channels.size());
+      stacks_zoom.reserve(diagnostic_channels.size());
+      for (int channel : diagnostic_channels) {
+        auto legend = std::make_unique<TLegend>(0.7, 0.2, 0.9, 0.4);
+        legend->SetBorderSize(0);
+        legend->SetFillStyle(0);
+        auto stack = build_stack(channel,
+                                 "stack_fine_cdf_" + std::to_string(channel) + "_zoom",
+                                 "Fine CDF profiles (ch " + std::to_string(channel) + ");fine;CDF",
+                                 *legend);
+        legends_zoom.push_back(std::move(legend));
+        stacks_zoom.push_back(std::move(stack));
       }
-      c_lut_profiles_zoom.cd(2);
-      if (stack19_zoom && stack19_zoom->GetHists() && stack19_zoom->GetHists()->GetSize() > 0) {
-        stack19_zoom->Draw("nostack");
-        stack19_zoom->GetXaxis()->SetRangeUser(20.0, 120.0);
-        legend19_zoom.Draw();
+      for (size_t i = 0; i < diagnostic_channels.size(); ++i) {
+        c_lut_profiles_zoom.cd(static_cast<int>(i + 1));
+        if (stacks_zoom[i] && stacks_zoom[i]->GetHists() && stacks_zoom[i]->GetHists()->GetSize() > 0) {
+          stacks_zoom[i]->Draw("nostack");
+          stacks_zoom[i]->GetXaxis()->SetRangeUser(20.0, 120.0);
+          legends_zoom[i]->Draw();
+        }
       }
       c_lut_profiles_zoom.Print(pdf_path.c_str());
     }
@@ -786,7 +947,7 @@ void fine_calibration_rdf(const char *input = "../data/calibration",
       gStyle->SetStatY(0.4);
       gStyle->SetStatW(0.2);
       gStyle->SetStatH(0.2);
-      TCanvas c_lut_single("c_fine_cdf_profiles_single", "Fine CDF profiles (single)", 900, 700);
+      TCanvas c_lut_single("c_fine_cdf_profiles_single", "Fine CDF profiles (single)", 1600, 900);
       for (auto &item : tdc_profiles) {
         if (!item.profile) {
           continue;
@@ -823,16 +984,15 @@ void fine_calibration_rdf(const char *input = "../data/calibration",
         c_lut_single.Print(png_path.c_str());
       }
 
-      std::vector<const TdcProfileInfo *> ch17;
-      std::vector<const TdcProfileInfo *> ch19;
+      std::vector<std::vector<const TdcProfileInfo *>> profiles_by_channel(diagnostic_channels.size());
       for (const auto &item : tdc_profiles) {
         if (!item.profile) {
           continue;
         }
-        if (item.channel == 17) {
-          ch17.push_back(&item);
-        } else if (item.channel == 19) {
-          ch19.push_back(&item);
+        auto ch_it = std::find(diagnostic_channels.begin(), diagnostic_channels.end(), item.channel);
+        if (ch_it != diagnostic_channels.end()) {
+          const auto pos = static_cast<size_t>(std::distance(diagnostic_channels.begin(), ch_it));
+          profiles_by_channel[pos].push_back(&item);
         }
       }
       auto sort_profiles = [](const TdcProfileInfo *a, const TdcProfileInfo *b) {
@@ -841,19 +1001,20 @@ void fine_calibration_rdf(const char *input = "../data/calibration",
         }
         return a->tdc < b->tdc;
       };
-      std::sort(ch17.begin(), ch17.end(), sort_profiles);
-      std::sort(ch19.begin(), ch19.end(), sort_profiles);
-      const size_t rows = std::max(ch17.size(), ch19.size());
+      size_t rows = 0;
+      for (auto &profiles : profiles_by_channel) {
+        std::sort(profiles.begin(), profiles.end(), sort_profiles);
+        rows = std::max(rows, profiles.size());
+      }
       if (rows > 0) {
         gStyle->SetOptStat(1110);
         gStyle->SetOptFit(1111);
-        const int height = static_cast<int>(350 * rows);
-        TCanvas c_grid("c_fine_cdf_profiles_grid", "Fine CDF profiles grid", 1000, height);
-        c_grid.Divide(2, static_cast<int>(rows));
+        TCanvas c_grid("c_fine_cdf_profiles_grid", "Fine CDF profiles grid", 1600, 900);
+        c_grid.Divide(static_cast<int>(diagnostic_channels.size()), static_cast<int>(rows));
         for (size_t r = 0; r < rows; ++r) {
-          for (int col = 0; col < 2; ++col) {
-            const auto &vec = (col == 0) ? ch17 : ch19;
-            c_grid.cd(static_cast<int>(r * 2 + col + 1));
+          for (size_t col = 0; col < diagnostic_channels.size(); ++col) {
+            const auto &vec = profiles_by_channel[col];
+            c_grid.cd(static_cast<int>(r * diagnostic_channels.size() + col + 1));
             if (r >= vec.size()) {
               continue;
             }
