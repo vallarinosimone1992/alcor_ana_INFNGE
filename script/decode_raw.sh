@@ -3,7 +3,7 @@ set -euo pipefail
 
 usage() {
   cat <<'USAGE'
-usage: decode_raw.sh raw_run_dir_or_root [--force] [--include-trigger-fifo] [--fifo N] [--keep-going]
+usage: decode_raw.sh raw_run_dir_or_root [--force] [--fifo N] [--keep-going]
 
 Scans for raw directories and decodes alcdaq.fifo_*.dat into ROOT files.
 
@@ -16,9 +16,8 @@ Environment:
       DECODER_BIN  path to decoder binary (default: ALCOR_ANA_GE/decoder/bin/decoder)
   DATA_ROOT    output root directory (default: ../data)
 
-By default the script skips alcdaq.fifo_24.dat. That trigger FIFO is not needed
-for the standard channel analysis and has a different payload path in some runs.
-Pass --include-trigger-fifo to decode it explicitly.
+By default the script decodes every available alcdaq.fifo_*.dat file,
+including trigger FIFO alcdaq.fifo_24.dat.
 
 Use --fifo N to decode only one FIFO. The option can be repeated.
 Use --keep-going to continue after a decoder failure and report the final status.
@@ -51,6 +50,7 @@ if [ "$#" -gt 0 ]; then
         shift
         ;;
       --include-trigger-fifo)
+        echo "--include-trigger-fifo is now the default; option kept for compatibility"
         include_trigger_fifo=true
         shift
         ;;
@@ -161,10 +161,6 @@ while IFS= read -r -d '' raw_dir; do
       continue
     fi
     base="$(basename "${dat}")"
-    if [ "${base}" = "alcdaq.fifo_24.dat" ] && [ "${include_trigger_fifo}" = false ]; then
-      echo "skipping trigger FIFO ${dat} (use --include-trigger-fifo to decode it)"
-      continue
-    fi
     dat_size="$(wc -c < "${dat}")"
     dat_size="${dat_size//[[:space:]]/}"
     if [ "${dat_size}" -lt "${main_header_bytes}" ]; then

@@ -62,5 +62,6 @@ if(ALCOR_BUILD_READOUT)
 endif()
 
 add_executable(decoder decoder.cc)
+target_compile_options(decoder PRIVATE ${ROOT_CXX_FLAGS_LIST})
 target_link_libraries(decoder ${Boost_LIBRARIES} ${ROOT_LIBS})
 install(TARGETS decoder RUNTIME DESTINATION bin)

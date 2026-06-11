@@ -518,8 +518,7 @@ int main(int argc, char *argv[])
     return 1;
   }
   fout->cd();
-  auto tout = std::make_unique<TTree>("alcor", "ALCOR");
-  tout->SetDirectory(fout.get());
+  auto tout = std::make_unique<TTree>("alcor", "ALCOR", 99, nullptr);
   data_t data;
   tout->Branch("device", &data.device, "device/I");
   tout->Branch("fifo", &data.fifo, "fifo/I");
@@ -540,13 +539,11 @@ int main(int argc, char *argv[])
 
   if (tout->Write() <= 0) {
     std::cerr << " --- [ERROR] failed to write output tree: " << output_filename << std::endl;
-    tout->SetDirectory(nullptr);
     tout.reset();
     fout->Close();
     return 1;
   }
   std::cout << " --- integrated spill: " << integrated_spill << std::endl;
-  tout->SetDirectory(nullptr);
   tout.reset();
   fout->Close();
   fout.reset();
