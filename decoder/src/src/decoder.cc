@@ -517,32 +517,36 @@ int main(int argc, char *argv[])
     return 1;
   }
   fout->cd();
-  TTree tout("alcor", "ALCOR");
-  tout.SetDirectory(fout.get());
+  auto tout = std::make_unique<TTree>("alcor", "ALCOR");
+  tout->SetDirectory(fout.get());
   data_t data;
-  tout.Branch("device", &data.device, "device/I");
-  tout.Branch("fifo", &data.fifo, "fifo/I");
-  tout.Branch("type", &data.type, "type/I");
-  tout.Branch("counter", &data.counter, "counter/I");
-  tout.Branch("spill", &data.spill, "spill/I");
-  tout.Branch("column", &data.column, "column/I");
-  tout.Branch("pixel", &data.pixel, "pixel/I");
-  tout.Branch("tdc", &data.tdc, "tdc/I");
-  tout.Branch("rollover", &data.rollover, "rollover/I");
-  tout.Branch("coarse", &data.coarse, "coarse/I");
-  tout.Branch("fine", &data.fine, "fine/I");
+  tout->Branch("device", &data.device, "device/I");
+  tout->Branch("fifo", &data.fifo, "fifo/I");
+  tout->Branch("type", &data.type, "type/I");
+  tout->Branch("counter", &data.counter, "counter/I");
+  tout->Branch("spill", &data.spill, "spill/I");
+  tout->Branch("column", &data.column, "column/I");
+  tout->Branch("pixel", &data.pixel, "pixel/I");
+  tout->Branch("tdc", &data.tdc, "tdc/I");
+  tout->Branch("rollover", &data.rollover, "rollover/I");
+  tout->Branch("coarse", &data.coarse, "coarse/I");
+  tout->Branch("fine", &data.fine, "fine/I");
 
   for (const auto &record : records) {
     data = record;
-    tout.Fill();
+    tout->Fill();
   }
 
-  if (tout.Write() <= 0) {
+  if (tout->Write() <= 0) {
     std::cerr << " --- [ERROR] failed to write output tree: " << output_filename << std::endl;
+    tout->SetDirectory(nullptr);
+    tout.reset();
     fout->Close();
     return 1;
   }
   std::cout << " --- integrated spill: " << integrated_spill << std::endl;
+  tout->SetDirectory(nullptr);
+  tout.reset();
   fout->Close();
   fout.reset();
   
