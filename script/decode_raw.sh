@@ -96,6 +96,7 @@ root_dir="$(cd "${qa_dir}/.." && pwd)"
 
 decoder_bin="${DECODER_BIN:-${qa_dir}/decoder/bin/decoder}"
 data_root="${DATA_ROOT:-${root_dir}/data}"
+main_header_bytes=64
 
 if [ ! -x "${decoder_bin}" ]; then
   echo "decoder not found or not executable: ${decoder_bin}" >&2
@@ -109,6 +110,15 @@ if [ ! -d "${input_dir}" ]; then
   echo "input path not found: ${input_dir}" >&2
   exit 1
 fi
+
+fail_or_continue() {
+  status="${1}"
+  shift
+  echo "$*" >&2
+  if [ "${keep_going}" = false ]; then
+    exit "${status}"
+  fi
+}
 
 found=false
 status=0
@@ -155,6 +165,12 @@ while IFS= read -r -d '' raw_dir; do
       echo "skipping trigger FIFO ${dat} (use --include-trigger-fifo to decode it)"
       continue
     fi
+    dat_size="$(wc -c < "${dat}")"
+    dat_size="${dat_size//[[:space:]]/}"
+    if [ "${dat_size}" -lt "${main_header_bytes}" ]; then
+      fail_or_continue 1 "invalid raw file ${dat}: ${dat_size} bytes, expected at least ${main_header_bytes}"
+      continue
+    fi
     out="${out_dir}/${base%.dat}.root"
     if [ -s "${out}" ] && [ "${force}" = false ]; then
       echo "skipping existing ${out}"
@@ -168,11 +184,7 @@ while IFS= read -r -d '' raw_dir; do
       :
     else
       rc=$?
-      status="${rc}"
-      echo "decoder failed for ${dat} with exit status ${rc}" >&2
-      if [ "${keep_going}" = false ]; then
-        exit "${rc}"
-      fi
+      fail_or_continue "${rc}" "decoder failed for ${dat} with exit status ${rc}"
     fi
   done
 done < <(find -L "${input_dir}" -type d -name raw -print0 2>/dev/null)

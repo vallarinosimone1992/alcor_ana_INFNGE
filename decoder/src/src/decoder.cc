@@ -1,6 +1,8 @@
 #include <iostream>
 #include <fstream>
 #include <cstring>
+#include <cstdint>
+#include <cstdio>
 #include <limits>
 #include <memory>
 #include <string>
@@ -125,7 +127,7 @@ bool has_words(uint32_t pos, uint32_t size, uint32_t needed)
   return pos <= size && needed <= (size - pos);
 }
                 
-void decode_trigger(const char *buffer, int device, int fifo, int size, records_t &records)
+bool decode_trigger(const char *buffer, int device, int fifo, int size, records_t &records)
 {
   if (verbose) printf(" --- decode_trigger: device-%d fifo-%d, size=%d \n", device, fifo, size); 
 
@@ -139,7 +141,7 @@ void decode_trigger(const char *buffer, int device, int fifo, int size, records_
     if ((word & 0xf0000000) == 0x70000000) {
       if (!has_words(pos, size, 2)) {
         std::cerr << " --- [ERROR] truncated trigger spill header in fifo " << fifo << std::endl;
-        break;
+        return false;
       }
       ++spill_counter[fifo];
       uint32_t counter = (word & 0x0fff0000) >> 16;
@@ -160,7 +162,7 @@ void decode_trigger(const char *buffer, int device, int fifo, int size, records_
     else if ((word & 0xf0000000) == 0xf0000000) {
       if (!has_words(pos, size, 2)) {
         std::cerr << " --- [ERROR] truncated trigger spill trailer in fifo " << fifo << std::endl;
-        break;
+        return false;
       }
       uint32_t counter = (word & 0x0fff0000) >> 16;
       uint64_t trigger_time = 0x0;
@@ -181,7 +183,7 @@ void decode_trigger(const char *buffer, int device, int fifo, int size, records_
     else if ((word & 0xf0000000) == 0x90000000) {
       if (!has_words(pos, size, 2)) {
         std::cerr << " --- [ERROR] truncated trigger word in fifo " << fifo << std::endl;
-        break;
+        return false;
       }
       uint64_t trigger_time = 0x0;
       if (verbose) printf(" 0x%08x -- trigger header\n", word);
@@ -213,9 +215,10 @@ void decode_trigger(const char *buffer, int device, int fifo, int size, records_
     
   }
 
+  return true;
 }
 
-void decode(const char *buffer, int device, int fifo, int size, records_t &records, bool is_filtered)
+bool decode(const char *buffer, int device, int fifo, int size, records_t &records, bool is_filtered)
 {
   (void)is_filtered;
   size /= 4;
@@ -232,7 +235,7 @@ void decode(const char *buffer, int device, int fifo, int size, records_t &recor
       if ((word & 0xf0000000) == 0x70000000) {
         if (!has_words(pos, size, 2)) {
           std::cerr << " --- [ERROR] truncated spill header in fifo " << fifo << std::endl;
-          return;
+          return false;
         }
         ++spill_counter[fifo];
         uint32_t counter = (word & 0x0fff0000) >> 16;
@@ -280,7 +283,7 @@ void decode(const char *buffer, int device, int fifo, int size, records_t &recor
       if ((word & 0xf0000000) == 0xf0000000) {
         if (!has_words(pos, size, 2)) {
           std::cerr << " --- [ERROR] truncated spill trailer in fifo " << fifo << std::endl;
-          return;
+          return false;
         }
         uint32_t counter = (word & 0x0fff0000) >> 16;
         uint64_t trigger_time = 0x0;
@@ -333,6 +336,7 @@ void decode(const char *buffer, int device, int fifo, int size, records_t &recor
     }
   }
 
+  return true;
 }
 
 int main(int argc, char *argv[])
@@ -425,6 +429,7 @@ int main(int argc, char *argv[])
     spill_counter[i] = -1;
   }
   buffer_header_t buffer_header;
+  bool input_error = false;
   while (true) {
     fin.read((char *)(&buffer_header), sizeof(buffer_header_t));
     const std::streamsize header_bytes = fin.gcount();
@@ -433,10 +438,12 @@ int main(int argc, char *argv[])
     }
     if (header_bytes != static_cast<std::streamsize>(sizeof(buffer_header_t))) {
       std::cerr << " --- [ERROR] truncated buffer header after " << header_bytes << " bytes" << std::endl;
+      input_error = true;
       break;
     }
     if (buffer_header.caffe != 0x123caffe) {
       printf(" --- [ERROR] caffe header mismatch in buffer header: %08x \n", buffer_header.caffe);
+      input_error = true;
       break;
     }
     if (verbose) {
@@ -448,30 +455,44 @@ int main(int argc, char *argv[])
     if (buffer_header.size > staging_size) {
       std::cerr << " --- [ERROR] buffer size " << buffer_header.size
                 << " exceeds staging buffer size " << staging_size << std::endl;
+      input_error = true;
       break;
     }
     if ((buffer_header.size % 4) != 0) {
       std::cerr << " --- [ERROR] buffer size is not 32-bit aligned: " << buffer_header.size << std::endl;
+      input_error = true;
       break;
     }
     fin.read(buffer.data(), buffer_header.size);
     if (fin.gcount() != static_cast<std::streamsize>(buffer_header.size)) {
       std::cerr << " --- [ERROR] truncated payload for buffer counter " << buffer_header.counter
                 << ": expected " << buffer_header.size << " bytes, got " << fin.gcount() << std::endl;
+      input_error = true;
       break;
     }
 
     if (buffer_header.id < 24) {
       if (verbose) printf(" --- decoding ALCOR FIFO \n");
-      decode(buffer.data(), main_header.device, buffer_header.id, buffer_header.size, records, is_filtered);
+      if (!decode(buffer.data(), main_header.device, buffer_header.id, buffer_header.size, records, is_filtered)) {
+        input_error = true;
+        break;
+      }
     }
     else if (buffer_header.id == 24) {
       if (verbose) printf(" --- decoding TRIGGER FIFO \n");
-      decode_trigger(buffer.data(), main_header.device, buffer_header.id, buffer_header.size, records);
+      if (!decode_trigger(buffer.data(), main_header.device, buffer_header.id, buffer_header.size, records)) {
+        input_error = true;
+        break;
+      }
     }
     else {
       std::cerr << " --- [WARNING] skipping unsupported buffer id: " << buffer_header.id << std::endl;
     }
+  }
+
+  if (input_error) {
+    std::cerr << " --- [ERROR] input decode failed; output file will not be written" << std::endl;
+    return 1;
   }
   
   double integrated = (double)integrated_rollover * 0.0001024;
