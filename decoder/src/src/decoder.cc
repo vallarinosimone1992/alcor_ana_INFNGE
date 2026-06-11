@@ -1,6 +1,7 @@
 #include <iostream>
 #include <fstream>
 #include <limits>
+#include <memory>
 #include <string>
 #include <vector>
 #include <boost/program_options.hpp>
@@ -434,12 +435,12 @@ int main(int argc, char *argv[])
   
   /** open output file **/
   std::cout << " --- opening output file: " << output_filename << std::endl;
-  auto fout = TFile::Open(output_filename.c_str(), "RECREATE");
+  std::unique_ptr<TFile> fout(TFile::Open(output_filename.c_str(), "RECREATE"));
   if (!fout || fout->IsZombie()) {
     std::cerr << " --- [ERROR] cannot open output file: " << output_filename << std::endl;
     return 1;
   }
-  auto tout = new TTree("alcor", "ALCOR");
+  auto tout = std::make_unique<TTree>("alcor", "ALCOR");
   tout->Branch("device", &data.device, "device/I");
   tout->Branch("fifo", &data.fifo, "fifo/I");
   tout->Branch("type", &data.type, "type/I");
@@ -496,11 +497,11 @@ int main(int argc, char *argv[])
 
     if (buffer_header.id < 24) {
       if (verbose) printf(" --- decoding ALCOR FIFO \n");
-      decode(buffer.data(), main_header.device, buffer_header.id, buffer_header.size, tout, is_filtered);
+      decode(buffer.data(), main_header.device, buffer_header.id, buffer_header.size, tout.get(), is_filtered);
     }
     else if (buffer_header.id == 24) {
       if (verbose) printf(" --- decoding TRIGGER FIFO \n");
-      decode_trigger(buffer.data(), main_header.device, buffer_header.id, buffer_header.size, tout);
+      decode_trigger(buffer.data(), main_header.device, buffer_header.id, buffer_header.size, tout.get());
     }
     else {
       std::cerr << " --- [WARNING] skipping unsupported buffer id: " << buffer_header.id << std::endl;
@@ -508,9 +509,10 @@ int main(int argc, char *argv[])
   }
   
   double integrated = (double)integrated_rollover * 0.0001024;
+  double integrated_rate = integrated > 0.0 ? (double)integrated_hits / integrated : 0.0;
   std::cout << " --- integrated seconds: " << integrated << std::endl;
   std::cout << " --- integrated hits: " <<integrated_hits << std::endl;
-  std::cout << " --- integrated rate: " <<((double)integrated_hits/integrated) << std::endl;
+  std::cout << " --- integrated rate: " << integrated_rate << std::endl;
   std::cout << " --- entries: " << tout->GetEntries() << std::endl;
   if (unexpected_word_count > 0) {
     std::cout << " --- unexpected words: " << unexpected_word_count;
@@ -521,9 +523,13 @@ int main(int argc, char *argv[])
   }
 
   /** write tree and close output */
+  fout->cd();
   tout->Write();
+  tout->SetDirectory(nullptr);
   std::cout << " --- integrated spill: " << integrated_spill << std::endl;
   fout->Close();
+  tout.reset();
+  fout.reset();
   
   /** close input file **/
   fin.close();
