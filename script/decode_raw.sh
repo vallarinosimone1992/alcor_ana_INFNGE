@@ -108,6 +108,9 @@ while IFS= read -r -d '' raw_dir; do
       echo "skipping existing ${out}"
       continue
     fi
+    if [ -e "${out}" ] && [ "${force}" = true ]; then
+      rm -f "${out}"
+    fi
     echo "decoding ${dat} -> ${out}"
     "${decoder_bin}" --input "${dat}" --output "${out}"
   done

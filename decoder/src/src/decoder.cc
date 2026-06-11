@@ -440,7 +440,7 @@ int main(int argc, char *argv[])
     std::cerr << " --- [ERROR] cannot open output file: " << output_filename << std::endl;
     return 1;
   }
-  auto tout = std::make_unique<TTree>("alcor", "ALCOR");
+  auto tout = std::make_unique<TTree>("alcor", "ALCOR", 99, nullptr);
   tout->Branch("device", &data.device, "device/I");
   tout->Branch("fifo", &data.fifo, "fifo/I");
   tout->Branch("type", &data.type, "type/I");
@@ -525,7 +525,6 @@ int main(int argc, char *argv[])
   /** write tree and close output */
   fout->cd();
   tout->Write();
-  tout->SetDirectory(nullptr);
   std::cout << " --- integrated spill: " << integrated_spill << std::endl;
   fout->Close();
   tout.reset();
