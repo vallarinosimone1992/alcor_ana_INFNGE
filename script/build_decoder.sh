@@ -136,6 +136,7 @@ echo "Install: ${install_dir}"
 echo "Jobs: ${jobs}"
 
 cmake -S "${src_dir}" -B "${build_dir}" -DCMAKE_INSTALL_PREFIX="${install_dir}" -DALCOR_BUILD_READOUT=OFF
+rm -f "${build_dir}/src/decoder"
 cmake --build "${build_dir}" --target decoder -j "${jobs}"
 cmake --install "${build_dir}"
 
@@ -152,11 +153,16 @@ fi
 
 if [ -n "${decoder_target}" ]; then
   root_lib_dir="$(root-config --libdir 2>/dev/null || true)"
+  rm -f "${bin_dir}/decoder"
   cat > "${bin_dir}/decoder" <<EOF
 #!/usr/bin/env bash
 set -euo pipefail
 decoder_target="${decoder_target}"
 root_lib_dir="${root_lib_dir}"
+if [ "\$(readlink -f "\${decoder_target}" 2>/dev/null || realpath "\${decoder_target}")" = "\$(readlink -f "\$0" 2>/dev/null || realpath "\$0")" ]; then
+  echo "decoder wrapper points to itself: \${decoder_target}" >&2
+  exit 127
+fi
 if [ -n "\${root_lib_dir}" ]; then
   export LD_LIBRARY_PATH="\${root_lib_dir}\${LD_LIBRARY_PATH:+:\${LD_LIBRARY_PATH}}"
 fi
