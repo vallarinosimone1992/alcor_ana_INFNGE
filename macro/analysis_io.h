@@ -6,6 +6,8 @@
 #include <TString.h>
 
 #include <algorithm>
+#include <cctype>
+#include <fstream>
 #include <iostream>
 #include <memory>
 #include <sstream>
@@ -18,6 +20,19 @@ struct InputSpec {
   std::vector<std::string> files;
   std::string tree_name;
 };
+
+inline std::string Trim(const std::string &value)
+{
+  size_t first = 0;
+  while (first < value.size() && std::isspace(static_cast<unsigned char>(value[first]))) {
+    ++first;
+  }
+  size_t last = value.size();
+  while (last > first && std::isspace(static_cast<unsigned char>(value[last - 1]))) {
+    --last;
+  }
+  return value.substr(first, last - first);
+}
 
 inline bool HasTree(const std::string &path, const char *tree_name)
 {
@@ -96,6 +111,45 @@ inline std::vector<std::string> FindDecodedDirs(const std::string &input, int ma
   return decoded_dirs;
 }
 
+inline std::vector<std::string> CollectFilesFromList(const std::string &list_path)
+{
+  std::vector<std::string> files;
+  std::ifstream fin(list_path);
+  if (!fin) {
+    return files;
+  }
+
+  std::string line;
+  while (std::getline(fin, line)) {
+    auto hash = line.find('#');
+    if (hash != std::string::npos) {
+      line = line.substr(0, hash);
+    }
+    line = Trim(line);
+    if (line.empty()) {
+      continue;
+    }
+    if (!gSystem->AccessPathName(line.c_str()) && !IsDirectory(line)) {
+      if (HasTree(line, "alcor")) {
+        files.push_back(line);
+      } else {
+        std::cout << "Skipping " << line << " (missing 'alcor' TTree)" << std::endl;
+      }
+      continue;
+    }
+
+    auto decoded_files = CollectDecodedFiles(line);
+    if (decoded_files.empty()) {
+      decoded_files = CollectDecodedFiles(line + "/decoded");
+    }
+    files.insert(files.end(), decoded_files.begin(), decoded_files.end());
+  }
+
+  std::sort(files.begin(), files.end());
+  files.erase(std::unique(files.begin(), files.end()), files.end());
+  return files;
+}
+
 inline InputSpec ResolveInputSpec(const std::string &input)
 {
   InputSpec spec;
@@ -105,6 +159,12 @@ inline InputSpec ResolveInputSpec(const std::string &input)
     if (!tree.empty()) {
       spec.files.push_back(input);
       spec.tree_name = tree;
+      return spec;
+    }
+    auto list_files = CollectFilesFromList(input);
+    if (!list_files.empty()) {
+      spec.files = std::move(list_files);
+      spec.tree_name = "alcor";
       return spec;
     }
   }

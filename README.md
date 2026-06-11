@@ -1,187 +1,175 @@
 # alcor_ana_INFNGE
 
-ROOT/RDataFrame-based analysis for ALCOR timing studies. This package works on decoded ROOT files (`alcdaq.fifo_*.root`) and provides:
+ROOT/RDataFrame-based analysis for ALCOR timing data. The public workflow is now intentionally small:
 
-- fine-time calibration
-- channel-level ToT and offset calibration
-- coincidence analysis
-- validation scripts for fine calibration and time-walk calibration
+- build/decode raw data
+- read/update `config/logbook.csv`
+- build the standard TDC calibration
+- build the standard timewalk/ToT calibration
+- run the standard analysis with JSON-defined coincidence groups
 
-Algorithmic details and calibration notes are documented in `report/report.tex` and in the compiled `report/report.pdf`. This README is intentionally limited to software structure and usage.
+## Environment
 
-## Requirements
-
-- ROOT available in the environment
-- decoder built and available at `decoder/bin/decoder`, or provided via `DECODER_BIN`
-
-Optional but recommended:
-
-- set `ALCOR_ANA_GE` to this directory so the scripts resolve paths consistently
+ROOT must be available in the shell. The scripts can resolve the repository automatically, but setting `ALCOR_ANA_GE` is still useful:
 
 ```bash
 export ALCOR_ANA_GE=/Users/simone/Work/BNL/EIC/ePIC/ALCOR/directory_apcx12/alcor_ana_INFNGE
 ```
 
-If `ALCOR_ANA_GE` is not set, scripts fall back to paths relative to their own location.
+Raw and decoded data are expected next to this repository:
 
-## Directory Layout
+```text
+../raw_data/<run>/...
+../data/<run>/kc705-196/decoded/alcdaq.fifo_*.root
+```
 
-- `script/`: entry-point shell scripts
-- `macro/`: ROOT C++ macros
-- `config/`: coincidence pair and group configuration files
-- `calibration/`: generated calibration ROOT files
-- `output/`: generated PDF, ROOT, TXT, and log outputs
-- `decoder/`: decoder sources, build tree, and binary
+## Decoder
 
-## Data Layout
-
-The analysis distinguishes raw data and decoded data:
-
-- `../raw_data/<run>/...`: raw `.dat` files and DAQ-side run content
-- `../data/<run>/kc705-196/decoded/*.root`: decoded ROOT files used by the analysis
-
-Common symlinks:
-
-- `../raw_data/calibration`
-- `../raw_data/golden_run`
-- `../data/calibration`
-- `../data/golden_run`
-
-Important:
-
-- pipeline scripts can depend on both `raw_data/*` and `data/*`
-- if you retarget the calibration or golden dataset, either update both symlink pairs or pass explicit input paths
-- calibration files should be built from the calibration run and then validated on an independent golden run
-
-## Build the Decoder
-
-The analysis scripts expect a decoder binary at `decoder/bin/decoder` unless `DECODER_BIN` is set explicitly.
-
-Standard build:
+Build the decoder:
 
 ```bash
 script/build_decoder.sh
 ```
 
-Useful options:
+Decode one raw run:
 
-- `script/build_decoder.sh --clean`: remove the build directory before configuring
-- `script/build_decoder.sh -j 8`: build with a fixed number of parallel jobs
-- `script/build_decoder.sh -h`: show all supported options
+```bash
+script/decode_raw.sh ../raw_data/20260610-171026 --force
+```
 
-The build script configures CMake in `decoder/build`, installs into `decoder/local`, and creates or refreshes the `decoder/bin/decoder` symlink automatically.
+Decode runs listed in the logbook:
 
-After the build, you should have:
+```bash
+script/decode_logbook_runs.sh --mode 1 --force
+```
+
+## Logbook
+
+The canonical local logbook is:
 
 ```text
-decoder/bin/decoder
+config/logbook.csv
 ```
 
-## Quick Start
-
-### 1. Decode raw data
+Update it from Google Sheets:
 
 ```bash
-script/decode_raw.sh /path/to/raw_or_run [--force]
+script/get_logbook.sh
 ```
 
-Decoded files are written to:
+The parser normalizes run names from `YYYYMMDD_HHMMSS`, `YYYYMMDD-HHMMSS`, and rows with a trailing `/`.
+
+## Calibrations
+
+### TDC Calibration
+
+The standard output is:
 
 ```text
-../data/<run>/kc705-196/decoded/alcdaq.fifo_*.root
+calibration/TDC_calibration.root
 ```
 
-By default the decoder is taken from `decoder/bin/decoder`. Override with `DECODER_BIN=...` if needed.
-
-### 2. Build the fine calibration
+Run it on one or more decoded inputs:
 
 ```bash
-script/run_fine_calibration.sh -i ../data/calibration
+script/run_tdc_calibration.sh \
+  --input ../data/20260610-171026 \
+  --input ../data/20260610-171245
 ```
 
-Outputs:
+Every input run is checked against `config/logbook.csv`; all `Operating Mode` values for that run must be `1`.
 
-- `calibration/fine_calibration.root`
-- `output/fine_calibration.pdf`
+### Timewalk / ToT Calibration
 
-### 3. Build the channel calibration
+The standard output is:
+
+```text
+calibration/timewalk_correction.root
+```
+
+Trigger-based mode keeps the previous three-channel method, for example trigger channel 22 and signal channels 17,19:
 
 ```bash
-script/run_channel_calibration.sh -i ../data/calibration -k calibration/fine_calibration.root
+script/run_timewalk_calibration.sh \
+  --mode trigger \
+  --input ../data/20260610-171026 \
+  --trigger 22 \
+  --sensors 17,19
 ```
 
-Output:
-
-- `calibration/channel_calibration.root`
-
-### 4. Run coincidence analysis
+Laser-intensity mode characterizes `ToT` versus laser intensity from a series of logbook runs:
 
 ```bash
-script/run_coincidence.sh \
-  -i ../data/<run> \
-  -p config/coincidence_17_19.txt \
-  -k calibration/fine_calibration.root \
-  -K calibration/channel_calibration.root
+script/run_timewalk_calibration.sh \
+  --mode intensity \
+  --input ../data/20260610-171026 \
+  --input ../data/20260610-171245
 ```
 
-Outputs are written to `output/` as PDF, ROOT, and TXT files.
+This second mode does not extract an absolute timewalk correction by itself. Without a timing reference, `ToT(intensity)` is observable, but the absolute leading-edge delay versus `ToT` is underconstrained.
 
-### 5. Optional validation
+Practical options for the future 8-channel setup:
 
-Fine-calibration validation:
+- reserve one channel for a synchronous pulser/laser reference during dedicated calibration runs
+- split the calibration into repeated runs with one temporary reference channel if simultaneous trigger readout is impossible
+- use pairwise relative timewalk between channels illuminated by the same laser pulse, then solve a relative correction graph
+- keep the ToT/intensity scan as a stability and response-linearity diagnostic, not as the sole timing correction
+
+Run both calibration steps with one command:
 
 ```bash
-script/run_fine_validation.sh -i ../data/calibration
+script/run_all_calibrations.sh \
+  --tdc-input ../data/20260610-171026 \
+  --tw-input ../data/20260610-171245 \
+  --tw-mode intensity
 ```
 
-Time-walk validation:
+## Analysis
+
+Default analysis config:
+
+```text
+config/analysis.json
+```
+
+It defines active channels (`"logbook"` by default), timing settings, and coincidence groups. Groups may contain two or more channels:
+
+```json
+{
+  "channels": "logbook",
+  "coincidences": [
+    { "name": "ch17_ch19", "channels": [17, 19], "window_ns": 20 },
+    { "name": "triple", "channels": [17, 19, 22], "window_ns": 30 }
+  ]
+}
+```
+
+Run the analysis:
 
 ```bash
-script/run_tw_validation.sh \
-  --calib-input ../data/calibration \
-  --golden-input ../data/golden_run
+script/run_analysis.sh --input ../data/20260610-171026
 ```
 
-## Main Scripts
+Outputs are written to `output/`:
 
-- `decode_raw.sh`: decode raw `.dat` files into ROOT files
-- `build_decoder.sh`: build the decoder from `decoder/src/`
-- `run_fine_calibration.sh`: build the fine calibration ROOT file
-- `run_fine_validation.sh`: validate the fine calibration
-- `run_channel_calibration.sh`: build per-channel ToT and offset calibration
-- `run_coincidence.sh`: run coincidence analysis and write PDF/ROOT/TXT outputs
-- `run_plot.sh`: channel and spill plots
-- `run_plot_lut.sh`: visualize the fine LUT
-- `run_tw_validation.sh`: validate time-walk corrections
-- `run_golden_pipeline.sh`: compact decode -> calibrate -> coincidence workflow
-- `run_test_calib_pipeline.sh`: extended calibration/golden comparison workflow
+```text
+output/<run>_channels.pdf
+output/<run>_coincidence.pdf
+output/<run>_coincidence.root
+output/<run>_coincidence.txt
+```
 
-## Typical Outputs
+The analysis uses `calibration/TDC_calibration.root` and, when present, `calibration/timewalk_correction.root`.
 
-Calibration products:
+## Public Scripts
 
-- `calibration/fine_calibration.root`
-- `calibration/channel_calibration.root`
+- `script/build_decoder.sh`
+- `script/decode_raw.sh`
+- `script/decode_logbook_runs.sh`
+- `script/get_logbook.sh`
+- `script/run_tdc_calibration.sh`
+- `script/run_timewalk_calibration.sh`
+- `script/run_all_calibrations.sh`
+- `script/run_analysis.sh`
 
-Run outputs:
-
-- `output/<label>.pdf`
-- `output/<label>.root`
-- `output/<label>.txt`
-- `output/log_<label>_macro.txt`
-
-## Practical Notes
-
-- `run_golden_pipeline.sh` and `run_test_calib_pipeline.sh` expect the standard calibration and golden symlinks unless you edit the script or invoke lower-level commands directly.
-- `run_coincidence.sh` can be pointed to explicit decoded paths if you do not want to rely on symlinks.
-- If you change the calibration dataset, regenerate both fine and channel calibration files before comparing runs.
-
-## Further Documentation
-
-See `report/report.tex` or `report/report.pdf` for:
-
-- timing model details
-- fine LUT construction
-- ToT and offset calibration method
-- validation metrics
-- important caveats when interpreting the outputs
+The remaining ROOT macros are implementation details for these entry points.

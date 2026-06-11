@@ -5,30 +5,30 @@ usage() {
   cat <<'USAGE'
 usage: decode_logbook_runs.sh [options]
 
-Decode, in series, the raw runs listed in the GeLab ALCOR CSV logbook.
+Decode, in series, the raw runs listed in config/logbook.csv.
 
 Options:
-  -l, --logbook FILE      CSV logbook (default: GeLab OneDrive logbook)
+  -l, --logbook FILE      CSV logbook (default: config/logbook.csv)
   -R, --raw-root DIR      raw data root (default: ../raw_data)
   -D, --data-root DIR     decoded data root passed as DATA_ROOT (default: ../data)
-      --channels VALUE    only decode rows whose Ch field matches VALUE, e.g. 17_19_22
+      --channels LIST     only decode rows whose Channels field matches LIST
+      --mode VALUE        only decode rows whose Operating Mode values all match VALUE
       --force             pass --force to decode_raw.sh
       --dry-run           print commands without executing them
   -h, --help              show this help
-
-The logbook run names use YYYYMMDD_HHMMSS. Local raw/data directories use
-YYYYMMDD-HHMMSS, so the script converts '_' to '-'.
 USAGE
 }
 
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 qa_dir="${ALCOR_ANA_GE:-$(cd "${script_dir}/.." && pwd)}"
 base_dir="$(cd "${qa_dir}/.." && pwd)"
+source "${script_dir}/lib/logbook.sh"
 
-logbook="/Users/simone/OneDrive - Istituto Nazionale di Fisica Nucleare/EIC/ePIC/dRICH/dRICH_Interaction_Tagger/GeLab_test/ALCOR_tests/ge_alcor_logbook.csv"
+logbook="$(logbook_default_path)"
 raw_root="${base_dir}/raw_data"
 data_root="${base_dir}/data"
 channels_filter=""
+mode_filter=""
 force=0
 dry_run=0
 
@@ -38,6 +38,22 @@ need_arg() {
     usage >&2
     exit 1
   fi
+}
+
+normalize_list() {
+  local value="$1"
+  value="${value//,/ }"
+  value="${value//_/ }"
+  awk -v value="${value}" 'BEGIN {
+    n = split(value, a, /[[:space:]]+/)
+    out = ""
+    for (i = 1; i <= n; ++i) {
+      if (a[i] == "") continue
+      if (out != "") out = out " "
+      out = out a[i]
+    }
+    print out
+  }'
 }
 
 while [ "$#" -gt 0 ]; do
@@ -75,11 +91,20 @@ while [ "$#" -gt 0 ]; do
       ;;
     --channels)
       need_arg "$@"
-      channels_filter=${2:-}
+      channels_filter="$(normalize_list "${2:-}")"
       shift 2
       ;;
     --channels=*)
-      channels_filter=${1#*=}
+      channels_filter="$(normalize_list "${1#*=}")"
+      shift
+      ;;
+    --mode)
+      need_arg "$@"
+      mode_filter=${2:-}
+      shift 2
+      ;;
+    --mode=*)
+      mode_filter=${1#*=}
       shift
       ;;
     --force)
@@ -115,20 +140,34 @@ decoded=0
 missing=0
 skipped=0
 
-while IFS=';' read -r name ch thr intensity spill vbias note rest; do
-  name="${name#$'\xef\xbb\xbf'}"
-  name="${name//$'\r'/}"
-  ch="${ch//$'\r'/}"
-  [ -z "${name}" ] && continue
-  [ "${name}" = "Name" ] && continue
+while IFS=, read -r date spills intensity rate vbias channels mode threshold offset1 gain1 gain2 rest || [ -n "${date:-}" ]; do
+  date="$(logbook_normalize_run "${date}")"
+  channels="$(normalize_list "${channels}")"
+  mode="$(normalize_list "${mode}")"
+  [ -z "${date}" ] && continue
 
-  if [ -n "${channels_filter}" ] && [ "${ch}" != "${channels_filter}" ]; then
+  if [ -n "${channels_filter}" ] && [ "${channels}" != "${channels_filter}" ]; then
     skipped=$((skipped + 1))
     continue
   fi
+  if [ -n "${mode_filter}" ]; then
+    if ! awk -v modes="${mode}" -v required="${mode_filter}" 'BEGIN {
+      n = split(modes, a, /[[:space:]]+/)
+      ok = 1
+      seen = 0
+      for (i = 1; i <= n; ++i) {
+        if (a[i] == "") continue
+        seen = 1
+        if (a[i] != required) ok = 0
+      }
+      exit(seen && ok ? 0 : 1)
+    }'; then
+      skipped=$((skipped + 1))
+      continue
+    fi
+  fi
 
-  run_name="${name//_/-}"
-  raw_run="${raw_root}/${run_name}"
+  raw_run="${raw_root}/${date}"
   if [ ! -d "${raw_run}" ]; then
     echo "missing raw run: ${raw_run}" >&2
     missing=$((missing + 1))
@@ -140,23 +179,20 @@ while IFS=';' read -r name ch thr intensity spill vbias note rest; do
     cmd+=(--force)
   fi
 
-  printf '== %s  Ch=%s  laser=%s\n' "${name}" "${ch}" "${intensity}"
+  printf '== %s  Channels=%s  mode=%s  laser=%s\n' "${date}" "${channels}" "${mode}" "${intensity}"
   if [ "${dry_run}" -eq 1 ]; then
-    printf 'DATA_ROOT=%q %q %q' "${data_root}" "${script_dir}/decode_raw.sh" "${raw_run}"
-    if [ "${force}" -eq 1 ]; then
-      printf ' --force'
-    fi
+    printf '%q ' "${cmd[@]}"
     printf '\n'
   else
     "${cmd[@]}"
   fi
   decoded=$((decoded + 1))
-done < "${logbook}"
+done < <(tail -n +2 "${logbook}")
 
 echo "Decoded/listed runs: ${decoded}"
-echo "Skipped by channel filter: ${skipped}"
+echo "Skipped by filters: ${skipped}"
 echo "Missing raw runs: ${missing}"
 
-if [ "${missing}" -gt 0 ]; then
+if [ "${missing}" -gt 0 ] && [ "${dry_run}" -eq 0 ]; then
   exit 2
 fi

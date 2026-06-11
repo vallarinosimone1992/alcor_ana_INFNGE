@@ -3,28 +3,40 @@ set -euo pipefail
 
 usage() {
   cat <<'USAGE'
-usage: run_all_calibrations.sh [options]
+usage: run_all_calibrations.sh --tdc-input PATH [--tw-input PATH ...] [options]
 
-Runs the full calibration chain (fine + channel) on a calibration run.
+Run the standard timing calibration chain:
+  1. TDC calibration -> calibration/TDC_calibration.root
+  2. Timewalk/ToT calibration -> calibration/timewalk_correction.root
 
-Optional options:
-  -i, --input PATH         decoded dir, run dir, or parent dir (default: ../data/calibration)
-  -d, --duration NS        max ToT (ns) for channel calibration (default: 30)
-  -w, --window NS          coincidence window for channel calibration (default: 40)
-  -b, --bins N             ToT bins for channel calibration (default: 60)
-  -m, --clock MHz          clock frequency (default: 320)
-  -f, --use-fine [0|1]     enable fine timing for channel calibration (default 1)
-      --no-fine            disable fine timing for channel calibration
-  -h, --help               show this help
+Options:
+      --tdc-input PATH    input for TDC calibration (repeatable)
+      --tw-input PATH     input for timewalk/ToT calibration (repeatable)
+      --tw-mode MODE      trigger or intensity (default: trigger)
+      --channels LIST     channels for --tw-mode intensity
+      --trigger CH        trigger/reference channel for --tw-mode trigger
+      --sensors CSV       sensor channels for --tw-mode trigger
+  -l, --logbook FILE      CSV logbook (default: config/logbook.csv)
+  -d, --duration NS       max ToT duration passed to both steps (default: 30)
+  -m, --clock MHz         clock frequency (default: 320)
+      --dry-run           print commands without executing them
+  -h, --help              show this help
 USAGE
 }
 
-input_dir="../data/calibration"
+script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+qa_dir="${ALCOR_ANA_GE:-$(cd "${script_dir}/.." && pwd)}"
+
+tdc_inputs=()
+tw_inputs=()
+tw_mode="trigger"
+channels=""
+trigger_channel=22
+sensor_channels="17,19"
+logbook="${qa_dir}/config/logbook.csv"
 duration_ns=30
-window_ns=40
-tot_bins=60
 clock_mhz=320
-use_fine=1
+dry_run=0
 
 need_arg() {
   if [ "$#" -lt 2 ] || [ -z "${2-}" ]; then
@@ -40,13 +52,67 @@ while [ "$#" -gt 0 ]; do
       usage
       exit 0
       ;;
-    -i|--input)
+    --tdc-input)
       need_arg "$@"
-      input_dir=${2:-}
+      tdc_inputs+=("${2:-}")
       shift 2
       ;;
-    --input=*)
-      input_dir=${1#*=}
+    --tdc-input=*)
+      tdc_inputs+=("${1#*=}")
+      shift
+      ;;
+    --tw-input)
+      need_arg "$@"
+      tw_inputs+=("${2:-}")
+      shift 2
+      ;;
+    --tw-input=*)
+      tw_inputs+=("${1#*=}")
+      shift
+      ;;
+    --tw-mode)
+      need_arg "$@"
+      tw_mode=${2:-}
+      shift 2
+      ;;
+    --tw-mode=*)
+      tw_mode=${1#*=}
+      shift
+      ;;
+    --channels)
+      need_arg "$@"
+      channels=${2:-}
+      shift 2
+      ;;
+    --channels=*)
+      channels=${1#*=}
+      shift
+      ;;
+    --trigger)
+      need_arg "$@"
+      trigger_channel=${2:-}
+      shift 2
+      ;;
+    --trigger=*)
+      trigger_channel=${1#*=}
+      shift
+      ;;
+    --sensors)
+      need_arg "$@"
+      sensor_channels=${2:-}
+      shift 2
+      ;;
+    --sensors=*)
+      sensor_channels=${1#*=}
+      shift
+      ;;
+    -l|--logbook)
+      need_arg "$@"
+      logbook=${2:-}
+      shift 2
+      ;;
+    --logbook=*)
+      logbook=${1#*=}
       shift
       ;;
     -d|--duration)
@@ -58,24 +124,6 @@ while [ "$#" -gt 0 ]; do
       duration_ns=${1#*=}
       shift
       ;;
-    -w|--window)
-      need_arg "$@"
-      window_ns=${2:-}
-      shift 2
-      ;;
-    --window=*)
-      window_ns=${1#*=}
-      shift
-      ;;
-    -b|--bins)
-      need_arg "$@"
-      tot_bins=${2:-}
-      shift 2
-      ;;
-    --bins=*)
-      tot_bins=${1#*=}
-      shift
-      ;;
     -m|--clock)
       need_arg "$@"
       clock_mhz=${2:-}
@@ -85,21 +133,8 @@ while [ "$#" -gt 0 ]; do
       clock_mhz=${1#*=}
       shift
       ;;
-    -f|--use-fine)
-      if [ "$#" -ge 2 ] && [[ "${2-}" =~ ^[01]$ ]]; then
-        use_fine=${2}
-        shift 2
-      else
-        use_fine=1
-        shift
-      fi
-      ;;
-    --use-fine=*)
-      use_fine=${1#*=}
-      shift
-      ;;
-    --no-fine)
-      use_fine=0
+    --dry-run)
+      dry_run=1
       shift
       ;;
     *)
@@ -110,23 +145,32 @@ while [ "$#" -gt 0 ]; do
   esac
 done
 
-script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-qa_dir="${ALCOR_ANA_GE:-$(cd "${script_dir}/.." && pwd)}"
-fine_calib="${qa_dir}/calibration/fine_calibration.root"
+if [ "${#tdc_inputs[@]}" -eq 0 ] || [ "${#tw_inputs[@]}" -eq 0 ]; then
+  usage >&2
+  exit 1
+fi
 
-echo "== Fine calibration"
-"${script_dir}/run_fine_calibration.sh" \
-  -i "${input_dir}" \
-  -d "${duration_ns}" \
-  --match-coincidence \
-  -m "${clock_mhz}"
+tdc_cmd=("${script_dir}/run_tdc_calibration.sh" --logbook "${logbook}" --duration "${duration_ns}" --clock "${clock_mhz}")
+for input in "${tdc_inputs[@]}"; do
+  tdc_cmd+=(--input "${input}")
+done
 
-echo "== Channel calibration"
-"${script_dir}/run_channel_calibration.sh" \
-  -i "${input_dir}" \
-  -k "${fine_calib}" \
-  -d "${duration_ns}" \
-  -w "${window_ns}" \
-  -b "${tot_bins}" \
-  -m "${clock_mhz}" \
-  -f "${use_fine}"
+tw_cmd=("${script_dir}/run_timewalk_calibration.sh" --mode "${tw_mode}" --logbook "${logbook}" --duration "${duration_ns}" --clock "${clock_mhz}")
+for input in "${tw_inputs[@]}"; do
+  tw_cmd+=(--input "${input}")
+done
+if [ -n "${channels}" ]; then
+  tw_cmd+=(--channels "${channels}")
+fi
+tw_cmd+=(--trigger "${trigger_channel}" --sensors "${sensor_channels}")
+
+if [ "${dry_run}" -eq 1 ]; then
+  tdc_cmd+=(--dry-run)
+  tw_cmd+=(--dry-run)
+fi
+
+echo "== TDC calibration"
+"${tdc_cmd[@]}"
+
+echo "== Timewalk/ToT calibration"
+"${tw_cmd[@]}"

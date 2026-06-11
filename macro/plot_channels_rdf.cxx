@@ -43,8 +43,8 @@ void PrintPlotHelp()
 {
   std::cout << "plot_channels_rdf usage:" << std::endl;
   std::cout
-      << "  plot_channels_rdf(\"/path/to/decoded.root\", \"out.pdf\", \"17,19\", \"fine_calibration.root\","
-         " 1, 0, true, 320, 1, 15, \"channel_calibration.root\")"
+      << "  plot_channels_rdf(\"/path/to/decoded.root\", \"out.pdf\", \"17,19\", \"TDC_calibration.root\","
+         " 1, 0, true, 320, 1, 15, \"\")"
             << std::endl;
   std::cout << "Inputs:" << std::endl;
   std::cout << "  decoded dir must contain alcdaq.fifo_*.root with TTree 'alcor'" << std::endl;
@@ -53,7 +53,7 @@ void PrintPlotHelp()
   std::cout << "  channels list can be comma- or space-separated" << std::endl;
   std::cout << "  fine calibration file uses hFineMin/hFineMax; default formula used when missing" << std::endl;
   std::cout << "  use_lut=false disables LUT even if hFineLut is present" << std::endl;
-  std::cout << "  channel calibration uses hChanCalib_chXX vs ToT; applied to leading-edge times" << std::endl;
+  std::cout << "  optional channel calibration uses hChanCalib_chXX vs ToT when a file path is provided" << std::endl;
   std::cout << "  spill index is 0-based; default 1 (second spill)" << std::endl;
   std::cout << "  includes extra plot: leading-edge time distribution in selected spill" << std::endl;
   std::cout << "  with exactly two channels, adds Delta t histogram for same-index leading hits" << std::endl;

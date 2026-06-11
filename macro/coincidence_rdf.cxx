@@ -51,7 +51,7 @@ void PrintCoincidenceHelp()
 {
   std::cout << "coincidence_rdf usage:" << std::endl;
   std::cout << "  coincidence_rdf(\"/path/to/decoded.root\", \"pairs.txt\", \"out.pdf\", 10.0, 320.0, true,"
-               " 15.0, 0.0, \"fine_calibration.root\", false, \"channel_calibration.root\", 0, \"out.root\", \"out.txt\", true, 100,"
+               " 15.0, 0.0, \"TDC_calibration.root\", false, \"\", 0, \"out.root\", \"out.txt\", true, 100,"
                " \"laser_timewalk.root\")"
             << std::endl;
   std::cout << "Inputs:" << std::endl;
@@ -73,7 +73,7 @@ void PrintCoincidenceHelp()
   std::cout << "  coincidence-hit distributions are appended to the same PDF" << std::endl;
   std::cout << "  only hits with min_duration <= ToT <= max_duration_ns are considered" << std::endl;
   std::cout << "  fine calibration file uses hFineMin/hFineMax; default formula used when missing" << std::endl;
-  std::cout << "  channel calibration uses hChanCalib_chXX vs ToT; applied to leading-edge times" << std::endl;
+  std::cout << "  optional channel calibration uses hChanCalib_chXX vs ToT when a file path is provided" << std::endl;
   std::cout << "  timewalk calibration reads timewalk_corr_*_chXX parameters from a laser analysis ROOT file" << std::endl;
   std::cout << "  force_window=true ignores per-line windows in the pairs file" << std::endl;
   std::cout << "  fine_cut excludes hits with |fine - cut| <= fine_cut (fine units)" << std::endl;
@@ -2005,7 +2005,7 @@ void WriteCoincidenceRoot(const char *out_root,
 }  // namespace
 
 void coincidence_rdf(const char *decoded_dir = "../raw_data/latest/kc705-196/decoded",
-                     const char *pairs_file = "../config/coincidence_pairs.txt",
+                     const char *pairs_file = "pairs.txt",
                      const char *out_pdf = "coincidences.pdf",
                      double default_window_ns = 10.0,
                      double clock_mhz = 320.0,

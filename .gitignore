@@ -11,3 +11,8 @@ decoder/src/bin/
 output/
 calibration/*.root
 calibration/log_*.txt
+
+# ROOT ACLiC build artifacts
+macro/*_cxx.d
+macro/*_cxx.so
+macro/*_ACLiC_dict_rdict.pcm

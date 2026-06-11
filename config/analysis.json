@@ -1,0 +1,22 @@
+{
+  "channels": "logbook",
+  "timing": {
+    "clock_mhz": 320,
+    "use_fine": true,
+    "use_lut": true,
+    "max_duration_ns": 15,
+    "min_duration_ns": 0,
+    "fine_cut": 0
+  },
+  "plots": {
+    "spill_index": 1
+  },
+  "coincidences": [
+    {
+      "name": "ch17_ch19",
+      "channels": [17, 19],
+      "window_ns": 20
+    }
+  ],
+  "duration_min_by_channel": {}
+}

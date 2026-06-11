@@ -1,4 +1,0 @@
-# channelA channelB [window_ns]
-dmin 17 240
-dmin 19 220
-17 19 w=20
