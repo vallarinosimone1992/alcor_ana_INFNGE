@@ -3,7 +3,7 @@
 ROOT/RDataFrame-based analysis for ALCOR timing data. The public workflow is now intentionally small:
 
 - build/decode raw data
-- read/update `config/logbook.csv`
+- read/update `config/logbook.json`
 - build the standard TDC calibration
 - build the standard timewalk/ToT calibration
 - run the standard analysis with JSON-defined coincidence groups
@@ -45,19 +45,25 @@ script/decode_logbook_runs.sh --mode 1 --force
 
 ## Logbook
 
-The canonical local logbook is:
+The canonical local logbook used by the scripts is:
 
 ```text
-config/logbook.csv
+config/logbook.json
 ```
 
-Update it from Google Sheets:
+Update it from Google Sheets. The script downloads the CSV copy and regenerates
+the JSON logbook used by the software:
 
 ```bash
 script/get_logbook.sh
 ```
 
-The parser normalizes run names from `YYYYMMDD_HHMMSS`, `YYYYMMDD-HHMMSS`, and rows with a trailing `/`.
+The downloaded CSV is kept at `config/logbook.csv`; it is treated as an input
+artifact. The generated JSON stores normalized run keys, typed values, and
+arrays for fields such as `channels` and `operating_mode`.
+
+The parser normalizes run names from `YYYYMMDD_HHMMSS`, `YYYYMMDD-HHMMSS`, and
+rows with a trailing `/`.
 
 ## Calibrations
 
@@ -77,7 +83,7 @@ script/run_tdc_calibration.sh \
   --input ../data/20260610-171245
 ```
 
-Every input run is checked against `config/logbook.csv`; all `Operating Mode` values for that run must be `1`.
+Every input run is checked against `config/logbook.json`; all `Operating Mode` values for that run must be `1`.
 
 ### Timewalk / ToT Calibration
 
@@ -150,6 +156,12 @@ Run the analysis:
 script/run_analysis.sh --input ../data/20260610-171026
 ```
 
+Run the same analysis without the timewalk correction, while still using the fine-TDC calibration:
+
+```bash
+script/run_analysis.sh --input ../data/20260610-171026 --no-timewalk
+```
+
 Outputs are written to `output/`:
 
 ```text
@@ -159,7 +171,7 @@ output/<run>_coincidence.root
 output/<run>_coincidence.txt
 ```
 
-The analysis uses `calibration/TDC_calibration.root` and, when present, `calibration/timewalk_correction.root`.
+The analysis always uses `calibration/TDC_calibration.root` for fine timing unless explicitly disabled with `--no-fine`. It also uses `calibration/timewalk_correction.root` when present, unless `--no-timewalk` is passed.
 
 ## Public Scripts
 

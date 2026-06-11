@@ -12,14 +12,16 @@ Run the standard analysis on decoded ALCOR data:
 Options:
   -i, --input PATH         decoded dir, run dir, or ROOT file
   -c, --config FILE       JSON analysis config (default: config/analysis.json)
-  -l, --logbook FILE      CSV logbook (default: config/logbook.csv)
+  -l, --logbook FILE      JSON logbook (default: config/logbook.json)
       --channels LIST     override active channels (default: config/logbook)
   -o, --output-prefix STR output prefix (default: derived from input run)
   -k, --tdc-calib FILE    TDC calibration ROOT file (default: calibration/TDC_calibration.root)
       --calib FILE        alias for --tdc-calib
       --timewalk-calib FILE
                            timewalk correction ROOT file (default: calibration/timewalk_correction.root if present)
-      --no-timewalk-calib disable timewalk correction
+      --no-timewalk, --no-tw
+                           disable timewalk correction only; fine calibration is still used
+      --no-timewalk-calib compatibility alias for --no-timewalk
   -w, --window NS         override all coincidence windows
   -d, --duration NS       max ToT duration override
       --min-duration NS   minimum ToT duration override
@@ -139,7 +141,7 @@ while [ "$#" -gt 0 ]; do
       timewalk_set=1
       shift
       ;;
-    --no-timewalk-calib)
+    --no-timewalk|--no-tw|--skip-timewalk|--without-timewalk|--no-timewalk-calib)
       timewalk_calib=""
       timewalk_set=1
       shift

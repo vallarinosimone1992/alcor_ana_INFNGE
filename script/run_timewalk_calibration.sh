@@ -15,7 +15,7 @@ Modes:
 
 Common options:
   -i, --input PATH         decoded dir, run dir, or ROOT file (repeatable)
-  -l, --logbook FILE      CSV logbook (default: config/logbook.csv)
+  -l, --logbook FILE      JSON logbook (default: config/logbook.json)
   -k, --tdc-calib FILE    TDC calibration ROOT file (default: calibration/TDC_calibration.root)
       --calib FILE        alias for --tdc-calib
   -o, --output FILE       output ROOT file (default: calibration/timewalk_correction.root)
@@ -454,11 +454,14 @@ for input in "${inputs[@]}"; do
   vbias=""
   if [ "${logbook_available}" -eq 1 ] && logbook_has_run "${logbook}" "${run}"; then
     intensity="$(logbook_field "${logbook}" "${run}" intensity)"
-    if [ -z "${channels}" ]; then
+    if [ -z "${channels}" ] || [ "${channels}" = "logbook" ]; then
       channels="$(logbook_channels_csv "${logbook}" "${run}")"
     fi
     thresholds="$(logbook_field "${logbook}" "${run}" threshold || true)"
     vbias="$(logbook_field "${logbook}" "${run}" vbias || true)"
+  fi
+  if [ "${channels}" = "logbook" ]; then
+    channels=""
   fi
   if [ -z "${channels}" ]; then
     if [ "${mode}" = "trigger" ]; then

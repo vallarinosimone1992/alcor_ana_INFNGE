@@ -1,0 +1,805 @@
+{
+  "schema": "alcor-logbook-v1",
+  "source_csv": "logbook.csv",
+  "run_order": [
+    "20260610-160356",
+    "20260610-163533",
+    "20260610-170718",
+    "20260610-171026",
+    "20260610-171245",
+    "20260610-171734",
+    "20260610-171954",
+    "20260610-172308",
+    "20260610-172539",
+    "20260610-172720",
+    "20260610-172959",
+    "20260610-173149",
+    "20260610-173320",
+    "20260610-173547",
+    "20260611-145555",
+    "20260611-152621",
+    "20260611-154505",
+    "20260611-155006",
+    "20260611-155737",
+    "20260611-160407",
+    "20260611-161045"
+  ],
+  "runs": {
+    "20260610-160356": {
+      "run": "20260610-160356",
+      "raw_run": "20260610-160356",
+      "row": 2,
+      "spills": 10,
+      "laser_on": true,
+      "laser_intensity": 8.5,
+      "laser_rate_khz": 10,
+      "radio_src": false,
+      "src_position": "",
+      "vbias": 30,
+      "channels": [
+        17,
+        19
+      ],
+      "operating_mode": [
+        4,
+        4
+      ],
+      "threshold": [
+        20,
+        20
+      ],
+      "offset1": [
+        2,
+        2
+      ],
+      "gain1": [
+        0,
+        0
+      ],
+      "gain2": [
+        0,
+        0
+      ],
+      "notes": ""
+    },
+    "20260610-163533": {
+      "run": "20260610-163533",
+      "raw_run": "20260610-163533",
+      "row": 3,
+      "spills": 100,
+      "laser_on": true,
+      "laser_intensity": 5.2,
+      "laser_rate_khz": 50,
+      "radio_src": false,
+      "src_position": "",
+      "vbias": 30,
+      "channels": [
+        17,
+        19
+      ],
+      "operating_mode": [
+        4,
+        4
+      ],
+      "threshold": [
+        20,
+        20
+      ],
+      "offset1": [
+        2,
+        2
+      ],
+      "gain1": [
+        0,
+        0
+      ],
+      "gain2": [
+        0,
+        0
+      ],
+      "notes": ""
+    },
+    "20260610-170718": {
+      "run": "20260610-170718",
+      "raw_run": "20260610-170718",
+      "row": 4,
+      "spills": 100,
+      "laser_on": true,
+      "laser_intensity": 15.25,
+      "laser_rate_khz": 50,
+      "radio_src": false,
+      "src_position": "",
+      "vbias": 30,
+      "channels": [
+        17,
+        19
+      ],
+      "operating_mode": [
+        4,
+        4
+      ],
+      "threshold": [
+        20,
+        20
+      ],
+      "offset1": [
+        2,
+        2
+      ],
+      "gain1": [
+        0,
+        0
+      ],
+      "gain2": [
+        0,
+        0
+      ],
+      "notes": ""
+    },
+    "20260610-171026": {
+      "run": "20260610-171026",
+      "raw_run": "20260610-171026",
+      "row": 5,
+      "spills": 100,
+      "laser_on": true,
+      "laser_intensity": 15.25,
+      "laser_rate_khz": 50,
+      "radio_src": false,
+      "src_position": "",
+      "vbias": 30,
+      "channels": [
+        17,
+        19
+      ],
+      "operating_mode": [
+        1
+      ],
+      "threshold": [
+        20,
+        20
+      ],
+      "offset1": [
+        2,
+        2
+      ],
+      "gain1": [
+        0,
+        0
+      ],
+      "gain2": [
+        0,
+        0
+      ],
+      "notes": ""
+    },
+    "20260610-171245": {
+      "run": "20260610-171245",
+      "raw_run": "20260610-171245",
+      "row": 6,
+      "spills": 100,
+      "laser_on": true,
+      "laser_intensity": 15.25,
+      "laser_rate_khz": 50,
+      "radio_src": false,
+      "src_position": "",
+      "vbias": 30,
+      "channels": [
+        17,
+        19
+      ],
+      "operating_mode": [
+        1,
+        1
+      ],
+      "threshold": [
+        20,
+        20
+      ],
+      "offset1": [
+        2,
+        2
+      ],
+      "gain1": [
+        0,
+        0
+      ],
+      "gain2": [
+        0,
+        0
+      ],
+      "notes": "Laser intensity scan on SiPM"
+    },
+    "20260610-171734": {
+      "run": "20260610-171734",
+      "raw_run": "20260610-171734",
+      "row": 7,
+      "spills": 100,
+      "laser_on": true,
+      "laser_intensity": 6.5,
+      "laser_rate_khz": 50,
+      "radio_src": false,
+      "src_position": "",
+      "vbias": 30,
+      "channels": [
+        17,
+        19
+      ],
+      "operating_mode": [
+        4,
+        4
+      ],
+      "threshold": [
+        20,
+        20
+      ],
+      "offset1": [
+        2,
+        2
+      ],
+      "gain1": [
+        0,
+        0
+      ],
+      "gain2": [
+        0,
+        0
+      ],
+      "notes": "\"\""
+    },
+    "20260610-171954": {
+      "run": "20260610-171954",
+      "raw_run": "20260610-171954",
+      "row": 8,
+      "spills": 100,
+      "laser_on": true,
+      "laser_intensity": 7.5,
+      "laser_rate_khz": 50,
+      "radio_src": false,
+      "src_position": "",
+      "vbias": 30,
+      "channels": [
+        17,
+        19
+      ],
+      "operating_mode": [
+        4,
+        4
+      ],
+      "threshold": [
+        20,
+        20
+      ],
+      "offset1": [
+        2,
+        2
+      ],
+      "gain1": [
+        0,
+        0
+      ],
+      "gain2": [
+        0,
+        0
+      ],
+      "notes": "\"\""
+    },
+    "20260610-172308": {
+      "run": "20260610-172308",
+      "raw_run": "20260610-172308",
+      "row": 9,
+      "spills": 100,
+      "laser_on": true,
+      "laser_intensity": 8.5,
+      "laser_rate_khz": 50,
+      "radio_src": false,
+      "src_position": "",
+      "vbias": 30,
+      "channels": [
+        17,
+        19
+      ],
+      "operating_mode": [
+        4,
+        4
+      ],
+      "threshold": [
+        20,
+        20
+      ],
+      "offset1": [
+        2,
+        2
+      ],
+      "gain1": [
+        0,
+        0
+      ],
+      "gain2": [
+        0,
+        0
+      ],
+      "notes": "\"\""
+    },
+    "20260610-172539": {
+      "run": "20260610-172539",
+      "raw_run": "20260610-172539",
+      "row": 10,
+      "spills": 100,
+      "laser_on": true,
+      "laser_intensity": 9.5,
+      "laser_rate_khz": 50,
+      "radio_src": false,
+      "src_position": "",
+      "vbias": 30,
+      "channels": [
+        17,
+        19
+      ],
+      "operating_mode": [
+        4,
+        4
+      ],
+      "threshold": [
+        20,
+        20
+      ],
+      "offset1": [
+        2,
+        2
+      ],
+      "gain1": [
+        0,
+        0
+      ],
+      "gain2": [
+        0,
+        0
+      ],
+      "notes": "\"\""
+    },
+    "20260610-172720": {
+      "run": "20260610-172720",
+      "raw_run": "20260610-172720",
+      "row": 11,
+      "spills": 100,
+      "laser_on": true,
+      "laser_intensity": 10.5,
+      "laser_rate_khz": 50,
+      "radio_src": false,
+      "src_position": "",
+      "vbias": 30,
+      "channels": [
+        17,
+        19
+      ],
+      "operating_mode": [
+        4,
+        4
+      ],
+      "threshold": [
+        20,
+        20
+      ],
+      "offset1": [
+        2,
+        2
+      ],
+      "gain1": [
+        0,
+        0
+      ],
+      "gain2": [
+        0,
+        0
+      ],
+      "notes": "\"\""
+    },
+    "20260610-172959": {
+      "run": "20260610-172959",
+      "raw_run": "20260610-172959",
+      "row": 12,
+      "spills": 100,
+      "laser_on": true,
+      "laser_intensity": 11.5,
+      "laser_rate_khz": 50,
+      "radio_src": false,
+      "src_position": "",
+      "vbias": 30,
+      "channels": [
+        17,
+        19
+      ],
+      "operating_mode": [
+        4,
+        4
+      ],
+      "threshold": [
+        20,
+        20
+      ],
+      "offset1": [
+        2,
+        2
+      ],
+      "gain1": [
+        0,
+        0
+      ],
+      "gain2": [
+        0,
+        0
+      ],
+      "notes": "\"\""
+    },
+    "20260610-173149": {
+      "run": "20260610-173149",
+      "raw_run": "20260610-173149",
+      "row": 13,
+      "spills": 100,
+      "laser_on": true,
+      "laser_intensity": 12.5,
+      "laser_rate_khz": 50,
+      "radio_src": false,
+      "src_position": "",
+      "vbias": 30,
+      "channels": [
+        17,
+        19
+      ],
+      "operating_mode": [
+        4,
+        4
+      ],
+      "threshold": [
+        20,
+        20
+      ],
+      "offset1": [
+        2,
+        2
+      ],
+      "gain1": [
+        0,
+        0
+      ],
+      "gain2": [
+        0,
+        0
+      ],
+      "notes": "\"\""
+    },
+    "20260610-173320": {
+      "run": "20260610-173320",
+      "raw_run": "20260610-173320",
+      "row": 14,
+      "spills": 100,
+      "laser_on": true,
+      "laser_intensity": 13.5,
+      "laser_rate_khz": 50,
+      "radio_src": false,
+      "src_position": "",
+      "vbias": 30,
+      "channels": [
+        17,
+        19
+      ],
+      "operating_mode": [
+        4,
+        4
+      ],
+      "threshold": [
+        20,
+        20
+      ],
+      "offset1": [
+        2,
+        2
+      ],
+      "gain1": [
+        0,
+        0
+      ],
+      "gain2": [
+        0,
+        0
+      ],
+      "notes": "\"\""
+    },
+    "20260610-173547": {
+      "run": "20260610-173547",
+      "raw_run": "20260610-173547",
+      "row": 15,
+      "spills": 100,
+      "laser_on": true,
+      "laser_intensity": 14.5,
+      "laser_rate_khz": 50,
+      "radio_src": false,
+      "src_position": "",
+      "vbias": 30,
+      "channels": [
+        17,
+        19
+      ],
+      "operating_mode": [
+        4,
+        4
+      ],
+      "threshold": [
+        20,
+        20
+      ],
+      "offset1": [
+        2,
+        2
+      ],
+      "gain1": [
+        0,
+        0
+      ],
+      "gain2": [
+        0,
+        0
+      ],
+      "notes": "\"\""
+    },
+    "20260611-145555": {
+      "run": "20260611-145555",
+      "raw_run": "20260611-145555",
+      "row": 16,
+      "spills": 500,
+      "laser_on": false,
+      "laser_intensity": null,
+      "laser_rate_khz": null,
+      "radio_src": false,
+      "src_position": "",
+      "vbias": 30.1,
+      "channels": [
+        17,
+        19
+      ],
+      "operating_mode": [
+        4,
+        4
+      ],
+      "threshold": [
+        30,
+        30
+      ],
+      "offset1": [
+        2,
+        2
+      ],
+      "gain1": [
+        0,
+        0
+      ],
+      "gain2": [
+        0,
+        0
+      ],
+      "notes": "SciFi calibration (no radio. src)"
+    },
+    "20260611-152621": {
+      "run": "20260611-152621",
+      "raw_run": "20260611-152621",
+      "row": 17,
+      "spills": 500,
+      "laser_on": false,
+      "laser_intensity": null,
+      "laser_rate_khz": null,
+      "radio_src": true,
+      "src_position": "Near 3rd SiPM",
+      "vbias": 30.1,
+      "channels": [
+        17,
+        19
+      ],
+      "operating_mode": [
+        4,
+        4
+      ],
+      "threshold": [
+        30,
+        30
+      ],
+      "offset1": [
+        2,
+        2
+      ],
+      "gain1": [
+        0,
+        0
+      ],
+      "gain2": [
+        0,
+        0
+      ],
+      "notes": "SciFi calibration (with radio. src, closer to 3rd SiPM)"
+    },
+    "20260611-154505": {
+      "run": "20260611-154505",
+      "raw_run": "20260611-154505",
+      "row": 18,
+      "spills": 500,
+      "laser_on": false,
+      "laser_intensity": null,
+      "laser_rate_khz": null,
+      "radio_src": false,
+      "src_position": "middle (no source)",
+      "vbias": 30.1,
+      "channels": [
+        17,
+        19
+      ],
+      "operating_mode": [
+        4,
+        4
+      ],
+      "threshold": [
+        30,
+        30
+      ],
+      "offset1": [
+        2,
+        2
+      ],
+      "gain1": [
+        0,
+        0
+      ],
+      "gain2": [
+        0,
+        0
+      ],
+      "notes": "SciFi calibration (no radio. src)"
+    },
+    "20260611-155006": {
+      "run": "20260611-155006",
+      "raw_run": "20260611-155006",
+      "row": 19,
+      "spills": 500,
+      "laser_on": false,
+      "laser_intensity": null,
+      "laser_rate_khz": null,
+      "radio_src": true,
+      "src_position": "middle",
+      "vbias": 30.1,
+      "channels": [
+        17,
+        19
+      ],
+      "operating_mode": [
+        4,
+        4
+      ],
+      "threshold": [
+        30,
+        30
+      ],
+      "offset1": [
+        2,
+        2
+      ],
+      "gain1": [
+        0,
+        0
+      ],
+      "gain2": [
+        0,
+        0
+      ],
+      "notes": "SciFi calibration (with radio. src, closer to middle of SciFi)"
+    },
+    "20260611-155737": {
+      "run": "20260611-155737",
+      "raw_run": "20260611-155737",
+      "row": 20,
+      "spills": 500,
+      "laser_on": false,
+      "laser_intensity": null,
+      "laser_rate_khz": null,
+      "radio_src": false,
+      "src_position": "Near 4th SiPM (no src)",
+      "vbias": 30.1,
+      "channels": [
+        17,
+        19
+      ],
+      "operating_mode": [
+        4,
+        4
+      ],
+      "threshold": [
+        30,
+        30
+      ],
+      "offset1": [
+        2,
+        2
+      ],
+      "gain1": [
+        0,
+        0
+      ],
+      "gain2": [
+        0,
+        0
+      ],
+      "notes": "SciFi calibration (no radio. src, close to front of box)"
+    },
+    "20260611-160407": {
+      "run": "20260611-160407",
+      "raw_run": "20260611-160407",
+      "row": 21,
+      "spills": 500,
+      "laser_on": false,
+      "laser_intensity": null,
+      "laser_rate_khz": null,
+      "radio_src": true,
+      "src_position": "Near 4th SiPM",
+      "vbias": 30.1,
+      "channels": [
+        17,
+        19
+      ],
+      "operating_mode": [
+        4,
+        4
+      ],
+      "threshold": [
+        30,
+        30
+      ],
+      "offset1": [
+        2,
+        2
+      ],
+      "gain1": [
+        0,
+        0
+      ],
+      "gain2": [
+        0,
+        0
+      ],
+      "notes": "SciFi calibration (with radio. src, close to front of box)"
+    },
+    "20260611-161045": {
+      "run": "20260611-161045",
+      "raw_run": "20260611-161045",
+      "row": 22,
+      "spills": 5000,
+      "laser_on": false,
+      "laser_intensity": null,
+      "laser_rate_khz": null,
+      "radio_src": true,
+      "src_position": "Near 4th SiPM",
+      "vbias": 30.1,
+      "channels": [
+        17,
+        19
+      ],
+      "operating_mode": [
+        4,
+        4
+      ],
+      "threshold": [
+        30,
+        30
+      ],
+      "offset1": [
+        2,
+        2
+      ],
+      "gain1": [
+        0,
+        0
+      ],
+      "gain2": [
+        0,
+        0
+      ],
+      "notes": "SciFi calibration (with radio. src, close to front of box)"
+    }
+  }
+}

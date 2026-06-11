@@ -5,10 +5,10 @@ usage() {
   cat <<'USAGE'
 usage: decode_logbook_runs.sh [options]
 
-Decode, in series, the raw runs listed in config/logbook.csv.
+Decode, in series, the raw runs listed in config/logbook.json.
 
 Options:
-  -l, --logbook FILE      CSV logbook (default: config/logbook.csv)
+  -l, --logbook FILE      JSON logbook (default: config/logbook.json)
   -R, --raw-root DIR      raw data root (default: ../raw_data)
   -D, --data-root DIR     decoded data root passed as DATA_ROOT (default: ../data)
       --channels LIST     only decode rows whose Channels field matches LIST
@@ -140,11 +140,12 @@ decoded=0
 missing=0
 skipped=0
 
-while IFS=, read -r date spills intensity rate vbias channels mode threshold offset1 gain1 gain2 rest || [ -n "${date:-}" ]; do
+while IFS= read -r date || [ -n "${date:-}" ]; do
   date="$(logbook_normalize_run "${date}")"
-  channels="$(normalize_list "${channels}")"
-  mode="$(normalize_list "${mode}")"
   [ -z "${date}" ] && continue
+  channels="$(normalize_list "$(logbook_channels "${logbook}" "${date}")")"
+  mode="$(normalize_list "$(logbook_modes "${logbook}" "${date}")")"
+  intensity="$(logbook_field "${logbook}" "${date}" intensity)"
 
   if [ -n "${channels_filter}" ] && [ "${channels}" != "${channels_filter}" ]; then
     skipped=$((skipped + 1))
@@ -187,7 +188,7 @@ while IFS=, read -r date spills intensity rate vbias channels mode threshold off
     "${cmd[@]}"
   fi
   decoded=$((decoded + 1))
-done < <(tail -n +2 "${logbook}")
+done < <(logbook_list_runs "${logbook}")
 
 echo "Decoded/listed runs: ${decoded}"
 echo "Skipped by filters: ${skipped}"

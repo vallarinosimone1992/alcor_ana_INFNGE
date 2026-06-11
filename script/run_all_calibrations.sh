@@ -16,7 +16,7 @@ Options:
       --channels LIST     channels for --tw-mode intensity
       --trigger CH        trigger/reference channel for --tw-mode trigger
       --sensors CSV       sensor channels for --tw-mode trigger
-  -l, --logbook FILE      CSV logbook (default: config/logbook.csv)
+  -l, --logbook FILE      JSON logbook (default: config/logbook.json)
   -d, --duration NS       max ToT duration passed to both steps (default: 30)
   -m, --clock MHz         clock frequency (default: 320)
       --dry-run           print commands without executing them
@@ -26,6 +26,7 @@ USAGE
 
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 qa_dir="${ALCOR_ANA_GE:-$(cd "${script_dir}/.." && pwd)}"
+source "${script_dir}/lib/logbook.sh"
 
 tdc_inputs=()
 tw_inputs=()
@@ -33,7 +34,7 @@ tw_mode="trigger"
 channels=""
 trigger_channel=22
 sensor_channels="17,19"
-logbook="${qa_dir}/config/logbook.csv"
+logbook="$(logbook_default_path)"
 duration_ns=30
 clock_mhz=320
 dry_run=0

@@ -7,12 +7,12 @@ usage: run_tdc_calibration.sh --input PATH [--input PATH ...] [options]
 
 Build the fine-TDC LUT calibration from decoded operation-mode-1 runs.
 Each input is explicit: pass decoded directories, run directories, or ROOT files.
-The script checks config/logbook.csv and requires Operating Mode 1 for every
+The script checks config/logbook.json and requires Operating Mode 1 for every
 input run unless --skip-logbook-check is used.
 
 Options:
   -i, --input PATH         decoded dir, run dir, or ROOT file (repeatable)
-  -l, --logbook FILE      CSV logbook (default: config/logbook.csv)
+  -l, --logbook FILE      JSON logbook (default: config/logbook.json)
   -o, --output FILE       output ROOT file (default: calibration/TDC_calibration.root)
   -P, --pdf FILE          output PDF file (default: output/TDC_calibration.pdf)
       --skip-logbook-check
