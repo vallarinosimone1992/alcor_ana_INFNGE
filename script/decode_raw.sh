@@ -184,6 +184,7 @@ while IFS= read -r -d '' raw_dir; do
       :
     else
       rc=$?
+      rm -f "${out}"
       fail_or_continue "${rc}" "decoder failed for ${dat} with exit status ${rc}"
     fi
   done

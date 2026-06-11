@@ -26,7 +26,7 @@ find_package(Boost COMPONENTS program_options REQUIRED)
 if(ALCOR_BUILD_READOUT)
   find_package(uHAL REQUIRED)
 endif()
-find_package(ROOT COMPONENTS RIO REQUIRED)
+find_package(ROOT COMPONENTS Core RIO Tree REQUIRED)
 
 
 set(CMAKE_INSTALL_PREFIX ${CMAKE_CURRENT_SOURCE_DIR})
