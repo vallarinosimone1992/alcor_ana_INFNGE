@@ -3,7 +3,7 @@ set -euo pipefail
 
 usage() {
   cat <<'USAGE'
-usage: decode_raw.sh raw_run_dir_or_root [--force]
+usage: decode_raw.sh raw_run_dir_or_root [--force] [--include-trigger-fifo]
 
 Scans for raw directories and decodes alcdaq.fifo_*.dat into ROOT files.
 
@@ -15,6 +15,10 @@ Input directory can be:
 Environment:
       DECODER_BIN  path to decoder binary (default: ALCOR_ANA_GE/decoder/bin/decoder)
   DATA_ROOT    output root directory (default: ../data)
+
+By default the script skips alcdaq.fifo_24.dat. That trigger FIFO is not needed
+for the standard channel analysis and has a different payload path in some runs.
+Pass --include-trigger-fifo to decode it explicitly.
 USAGE
 }
 
@@ -32,13 +36,24 @@ input_dir=$1
 shift
 
 force=false
+include_trigger_fifo=false
 if [ "$#" -gt 0 ]; then
-  if [ "$1" = "--force" ]; then
-    force=true
-  else
-    echo "unknown option: $1" >&2
-    exit 1
-  fi
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --force)
+        force=true
+        shift
+        ;;
+      --include-trigger-fifo)
+        include_trigger_fifo=true
+        shift
+        ;;
+      *)
+        echo "unknown option: $1" >&2
+        exit 1
+        ;;
+    esac
+  done
 fi
 
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -84,6 +99,10 @@ while IFS= read -r -d '' raw_dir; do
   for dat in "${raw_dir}"/alcdaq.fifo_*.dat; do
     [ -e "${dat}" ] || continue
     base="$(basename "${dat}")"
+    if [ "${base}" = "alcdaq.fifo_24.dat" ] && [ "${include_trigger_fifo}" = false ]; then
+      echo "skipping trigger FIFO ${dat} (use --include-trigger-fifo to decode it)"
+      continue
+    fi
     out="${out_dir}/${base%.dat}.root"
     if [ -s "${out}" ] && [ "${force}" = false ]; then
       echo "skipping existing ${out}"
