@@ -3,7 +3,7 @@ set -euo pipefail
 
 usage() {
   cat <<'USAGE'
-usage: decode_raw.sh raw_run_dir_or_root [--force] [--include-trigger-fifo]
+usage: decode_raw.sh raw_run_dir_or_root [--force] [--include-trigger-fifo] [--fifo N] [--keep-going]
 
 Scans for raw directories and decodes alcdaq.fifo_*.dat into ROOT files.
 
@@ -19,6 +19,9 @@ Environment:
 By default the script skips alcdaq.fifo_24.dat. That trigger FIFO is not needed
 for the standard channel analysis and has a different payload path in some runs.
 Pass --include-trigger-fifo to decode it explicitly.
+
+Use --fifo N to decode only one FIFO. The option can be repeated.
+Use --keep-going to continue after a decoder failure and report the final status.
 USAGE
 }
 
@@ -37,6 +40,8 @@ shift
 
 force=false
 include_trigger_fifo=false
+keep_going=false
+selected_fifos=()
 if [ "$#" -gt 0 ]; then
   while [ "$#" -gt 0 ]; do
     case "$1" in
@@ -48,6 +53,22 @@ if [ "$#" -gt 0 ]; then
         include_trigger_fifo=true
         shift
         ;;
+      --keep-going)
+        keep_going=true
+        shift
+        ;;
+      --fifo)
+        if [ "$#" -lt 2 ] || [ -z "${2:-}" ]; then
+          echo "missing value for --fifo" >&2
+          exit 1
+        fi
+        selected_fifos+=("$2")
+        shift 2
+        ;;
+      --fifo=*)
+        selected_fifos+=("${1#*=}")
+        shift
+        ;;
       *)
         echo "unknown option: $1" >&2
         exit 1
@@ -55,6 +76,13 @@ if [ "$#" -gt 0 ]; then
     esac
   done
 fi
+
+for fifo in "${selected_fifos[@]}"; do
+  if ! [[ "${fifo}" =~ ^[0-9]+$ ]]; then
+    echo "invalid FIFO number: ${fifo}" >&2
+    exit 1
+  fi
+done
 
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 qa_dir="${ALCOR_ANA_GE:-$(cd "${script_dir}/.." && pwd)}"
@@ -78,6 +106,7 @@ if [ ! -d "${input_dir}" ]; then
 fi
 
 found=false
+status=0
 while IFS= read -r -d '' raw_dir; do
   found=true
   device_dir="$(dirname "${raw_dir}")"
@@ -96,8 +125,26 @@ while IFS= read -r -d '' raw_dir; do
   out_dir="${data_root}/${run_name}/${device}/decoded"
   mkdir -p "${out_dir}"
 
-  for dat in "${raw_dir}"/alcdaq.fifo_*.dat; do
-    [ -e "${dat}" ] || continue
+  echo "Raw dir: ${raw_dir}"
+  echo "Output dir: ${out_dir}"
+
+  fifo_list=()
+  if [ "${#selected_fifos[@]}" -gt 0 ]; then
+    fifo_list=("${selected_fifos[@]}")
+  else
+    for ((fifo = 0; fifo <= 24; ++fifo)); do
+      fifo_list+=("${fifo}")
+    done
+  fi
+
+  for fifo in "${fifo_list[@]}"; do
+    dat="${raw_dir}/alcdaq.fifo_${fifo}.dat"
+    if [ ! -e "${dat}" ]; then
+      if [ "${#selected_fifos[@]}" -gt 0 ]; then
+        echo "missing requested FIFO ${fifo}: ${dat}" >&2
+      fi
+      continue
+    fi
     base="$(basename "${dat}")"
     if [ "${base}" = "alcdaq.fifo_24.dat" ] && [ "${include_trigger_fifo}" = false ]; then
       echo "skipping trigger FIFO ${dat} (use --include-trigger-fifo to decode it)"
@@ -112,7 +159,16 @@ while IFS= read -r -d '' raw_dir; do
       rm -f "${out}"
     fi
     echo "decoding ${dat} -> ${out}"
-    "${decoder_bin}" --input "${dat}" --output "${out}"
+    if "${decoder_bin}" --input "${dat}" --output "${out}"; then
+      :
+    else
+      rc=$?
+      status="${rc}"
+      echo "decoder failed for ${dat} with exit status ${rc}" >&2
+      if [ "${keep_going}" = false ]; then
+        exit "${rc}"
+      fi
+    fi
   done
 done < <(find -L "${input_dir}" -type d -name raw -print0 2>/dev/null)
 
@@ -120,3 +176,5 @@ if [ "${found}" = false ]; then
   echo "no raw directories found under ${input_dir}" >&2
   exit 1
 fi
+
+exit "${status}"
