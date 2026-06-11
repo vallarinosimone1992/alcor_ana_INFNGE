@@ -3,6 +3,7 @@
 #include <cstring>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <limits>
 #include <memory>
 #include <string>
@@ -554,5 +555,5 @@ int main(int argc, char *argv[])
   fin.close();
   std::cout << " --- all done, so long " << std::endl;
 
-  return 0;
+  std::_Exit(EXIT_SUCCESS);
 }
