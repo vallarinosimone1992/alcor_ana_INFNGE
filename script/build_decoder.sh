@@ -139,18 +139,37 @@ cmake -S "${src_dir}" -B "${build_dir}" -DCMAKE_INSTALL_PREFIX="${install_dir}" 
 cmake --build "${build_dir}" --target decoder -j "${jobs}"
 cmake --install "${build_dir}"
 
+decoder_target=""
 if [ -x "${build_dir}/src/decoder" ]; then
-  ln -sf "${build_dir}/src/decoder" "${bin_dir}/decoder"
+  decoder_target="${build_dir}/src/decoder"
 elif [ -x "${install_dir}/bin/decoder" ]; then
-  ln -sf "${install_dir}/bin/decoder" "${bin_dir}/decoder"
+  decoder_target="${install_dir}/bin/decoder"
 elif [ -x "${install_dir}/decoder" ]; then
-  ln -sf "${install_dir}/decoder" "${bin_dir}/decoder"
+  decoder_target="${install_dir}/decoder"
 elif [ -x "${src_dir}/bin/decoder" ]; then
-  ln -sf "${src_dir}/bin/decoder" "${bin_dir}/decoder"
+  decoder_target="${src_dir}/bin/decoder"
+fi
+
+if [ -n "${decoder_target}" ]; then
+  root_lib_dir="$(root-config --libdir 2>/dev/null || true)"
+  cat > "${bin_dir}/decoder" <<EOF
+#!/usr/bin/env bash
+set -euo pipefail
+decoder_target="${decoder_target}"
+root_lib_dir="${root_lib_dir}"
+if [ -n "\${root_lib_dir}" ]; then
+  export LD_LIBRARY_PATH="\${root_lib_dir}\${LD_LIBRARY_PATH:+:\${LD_LIBRARY_PATH}}"
+fi
+exec "\${decoder_target}" "\$@"
+EOF
+  chmod +x "${bin_dir}/decoder"
 fi
 
 if [ -x "${bin_dir}/decoder" ]; then
   echo "Decoder built at: ${bin_dir}/decoder"
+  if [ -n "${root_lib_dir:-}" ]; then
+    echo "Decoder runtime ROOT libdir: ${root_lib_dir}"
+  fi
 else
   echo "Decoder build completed, but decoder binary not found in ${bin_dir}" >&2
   exit 1

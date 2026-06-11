@@ -97,6 +97,7 @@ root_dir="$(cd "${qa_dir}/.." && pwd)"
 decoder_bin="${DECODER_BIN:-${qa_dir}/decoder/bin/decoder}"
 data_root="${DATA_ROOT:-${root_dir}/data}"
 main_header_bytes=64
+root_lib_dir="$(root-config --libdir 2>/dev/null || true)"
 
 if [ ! -x "${decoder_bin}" ]; then
   echo "decoder not found or not executable: ${decoder_bin}" >&2
@@ -105,6 +106,9 @@ if [ ! -x "${decoder_bin}" ]; then
 fi
 
 echo "Using decoder: ${decoder_bin}"
+if [ -n "${root_lib_dir}" ]; then
+  echo "Using ROOT libdir: ${root_lib_dir}"
+fi
 
 if [ ! -d "${input_dir}" ]; then
   echo "input path not found: ${input_dir}" >&2
@@ -117,6 +121,14 @@ fail_or_continue() {
   echo "$*" >&2
   if [ "${keep_going}" = false ]; then
     exit "${status}"
+  fi
+}
+
+run_decoder() {
+  if [ -n "${root_lib_dir}" ]; then
+    LD_LIBRARY_PATH="${root_lib_dir}${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}" "${decoder_bin}" "$@"
+  else
+    "${decoder_bin}" "$@"
   fi
 }
 
@@ -176,7 +188,7 @@ while IFS= read -r -d '' raw_dir; do
       rm -f "${out}"
     fi
     echo "decoding ${dat} -> ${out}"
-    if "${decoder_bin}" --input "${dat}" --output "${out}"; then
+    if run_decoder --input "${dat}" --output "${out}"; then
       :
     else
       rc=$?
