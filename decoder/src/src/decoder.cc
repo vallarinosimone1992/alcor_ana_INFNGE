@@ -1,6 +1,8 @@
 #include <iostream>
 #include <fstream>
+#include <limits>
 #include <string>
+#include <vector>
 #include <boost/program_options.hpp>
 #include "TFile.h"
 #include "TH1F.h"
@@ -21,6 +23,8 @@ const int kUnexpectedPrintLimit = 10;
 
 TGraph *gRollover = nullptr;
 TGraph *gSpill = nullptr;
+int gRolloverPoints = 0;
+int gSpillPoints = 0;
 
 struct main_header_t {
   uint32_t caffe;
@@ -143,6 +147,20 @@ void write_alcor_data(TTree *tout,
 {
   write_data(tout, device, fifo, 1, -1, spill, column, pixel, tdc, rollover, coarse, fine);
 }
+
+void add_graph_point(TGraph *graph, int &point_counter, double x, double y)
+{
+  if (!graph) {
+    return;
+  }
+  graph->SetPoint(point_counter, x, y);
+  ++point_counter;
+}
+
+bool has_words(uint32_t pos, uint32_t size, uint32_t needed)
+{
+  return pos <= size && needed <= (size - pos);
+}
                 
 void decode_trigger(char *buffer, int device, int fifo, int size, TTree *tout)
 {
@@ -156,6 +174,10 @@ void decode_trigger(char *buffer, int device, int fifo, int size, TTree *tout)
 
     /** spill header **/
     if ((*word & 0xf0000000) == 0x70000000) {
+      if (!has_words(pos, size, 2)) {
+        std::cerr << " --- [ERROR] truncated trigger spill header in fifo " << fifo << std::endl;
+        break;
+      }
       ++spill_counter[fifo];
       uint32_t counter = (*word & 0x0fff0000) >> 16;
       uint64_t trigger_time = 0x0;
@@ -172,6 +194,10 @@ void decode_trigger(char *buffer, int device, int fifo, int size, TTree *tout)
     
     /** spill trailer **/
     else if ((*word & 0xf0000000) == 0xf0000000) {
+      if (!has_words(pos, size, 2)) {
+        std::cerr << " --- [ERROR] truncated trigger spill trailer in fifo " << fifo << std::endl;
+        break;
+      }
       spill_t *spill = (spill_t *)word;
       uint32_t counter = (*word & 0x0fff0000) >> 16;
       uint64_t trigger_time = 0x0;
@@ -182,7 +208,7 @@ void decode_trigger(char *buffer, int device, int fifo, int size, TTree *tout)
       trigger_time |= *word;
       uint32_t coarse = trigger_time & 0x7fff;
       uint32_t rollover = trigger_time >> 15;
-      gSpill->AddPoint(integrated_spill, trigger_time);
+      add_graph_point(gSpill, gSpillPoints, integrated_spill, trigger_time);
       integrated_spill++;
       write_trigger_data(tout, device, fifo, 15, counter, spill_counter[fifo], rollover, coarse);
       ++word; ++pos;
@@ -190,6 +216,10 @@ void decode_trigger(char *buffer, int device, int fifo, int size, TTree *tout)
     
     /** trigger **/
     else if ((*word & 0xf0000000) == 0x90000000) {
+      if (!has_words(pos, size, 2)) {
+        std::cerr << " --- [ERROR] truncated trigger word in fifo " << fifo << std::endl;
+        break;
+      }
       trigger_t *trigger = (trigger_t *)word;
       uint64_t trigger_time = 0x0;
       if (verbose) printf(" 0x%08x -- trigger header\n", *word);
@@ -237,6 +267,10 @@ void decode(char *buffer, int device, int fifo, int size, TTree *tout, bool is_f
       
       /** spill header **/
       if ((*word & 0xf0000000) == 0x70000000) {
+        if (!has_words(pos, size, 2)) {
+          std::cerr << " --- [ERROR] truncated spill header in fifo " << fifo << std::endl;
+          return;
+        }
         ++spill_counter[fifo];
         uint32_t counter = (*word & 0x0fff0000) >> 16;
         uint64_t trigger_time = 0x0;
@@ -279,6 +313,10 @@ void decode(char *buffer, int device, int fifo, int size, TTree *tout, bool is_f
       
       /** spill trailer **/
       if ((*word & 0xf0000000) == 0xf0000000) {
+        if (!has_words(pos, size, 2)) {
+          std::cerr << " --- [ERROR] truncated spill trailer in fifo " << fifo << std::endl;
+          return;
+        }
         spill_t *spill = (spill_t *)word;
         uint32_t counter = (*word & 0x0fff0000) >> 16;
         uint64_t trigger_time = 0x0;
@@ -292,7 +330,7 @@ void decode(char *buffer, int device, int fifo, int size, TTree *tout, bool is_f
         write_trigger_data(tout, device, fifo, 15, counter, spill_counter[fifo], rollover, coarse);
         ++word; ++pos;
         in_spill = false;
-	gRollover->AddPoint(integrated_spill, rollover_counter);
+	add_graph_point(gRollover, gRolloverPoints, integrated_spill, rollover_counter);
 	integrated_spill++;
 	rollover_counter = 0;
 	break;
@@ -364,10 +402,18 @@ int main(int argc, char *argv[])
   std::cout << " --- opening input file: " << input_filename << std::endl;
   std::ifstream fin;
   fin.open(input_filename, std::ofstream::in | std::ofstream::binary);
+  if (!fin) {
+    std::cerr << " --- [ERROR] cannot open input file: " << input_filename << std::endl;
+    return 1;
+  }
   
   /** read main header **/ 
   main_header_t main_header;
   fin.read((char *)&main_header, sizeof(main_header_t));
+  if (fin.gcount() != static_cast<std::streamsize>(sizeof(main_header_t))) {
+    std::cerr << " --- [ERROR] input file is shorter than the main header" << std::endl;
+    return 1;
+  }
   if (main_header.caffe != 0x000caffe) {
     printf(" --- [ERROR] caffe header mismatch in main header: 0x%08x \n", main_header.caffe);
     return 1;
@@ -398,11 +444,19 @@ int main(int argc, char *argv[])
   
   // create reading buffer
   auto staging_size = main_header.staging_size;
-  char *buffer = new char[staging_size];
+  if (staging_size == 0 || staging_size > 256u * 1024u * 1024u) {
+    std::cerr << " --- [ERROR] invalid staging buffer size: " << staging_size << std::endl;
+    return 1;
+  }
+  std::vector<char> buffer(staging_size);
   
   /** open output file **/
   std::cout << " --- opening output file: " << output_filename << std::endl;
   auto fout = TFile::Open(output_filename.c_str(), "RECREATE");
+  if (!fout || fout->IsZombie()) {
+    std::cerr << " --- [ERROR] cannot open output file: " << output_filename << std::endl;
+    return 1;
+  }
   auto tout = new TTree("alcor", "ALCOR");
   tout->Branch("device", &data.device, "device/I");
   tout->Branch("fifo", &data.fifo, "fifo/I");
@@ -429,7 +483,14 @@ int main(int argc, char *argv[])
   uint32_t word;
   while (true) {
     fin.read((char *)(&buffer_header), sizeof(buffer_header_t));
-    if (fin.eof()) break;
+    const std::streamsize header_bytes = fin.gcount();
+    if (header_bytes == 0 && fin.eof()) {
+      break;
+    }
+    if (header_bytes != static_cast<std::streamsize>(sizeof(buffer_header_t))) {
+      std::cerr << " --- [ERROR] truncated buffer header after " << header_bytes << " bytes" << std::endl;
+      break;
+    }
     if (buffer_header.caffe != 0x123caffe) {
       printf(" --- [ERROR] caffe header mismatch in buffer header: %08x \n", buffer_header.caffe);
       break;
@@ -440,15 +501,32 @@ int main(int argc, char *argv[])
       printf(" --- [buffer header] buffer counter: %d \n", buffer_header.counter);
       printf(" --- [buffer header] buffer size: %d \n", buffer_header.size);
     }
-    fin.read(buffer, buffer_header.size);
+    if (buffer_header.size > staging_size) {
+      std::cerr << " --- [ERROR] buffer size " << buffer_header.size
+                << " exceeds staging buffer size " << staging_size << std::endl;
+      break;
+    }
+    if ((buffer_header.size % 4) != 0) {
+      std::cerr << " --- [ERROR] buffer size is not 32-bit aligned: " << buffer_header.size << std::endl;
+      break;
+    }
+    fin.read(buffer.data(), buffer_header.size);
+    if (fin.gcount() != static_cast<std::streamsize>(buffer_header.size)) {
+      std::cerr << " --- [ERROR] truncated payload for buffer counter " << buffer_header.counter
+                << ": expected " << buffer_header.size << " bytes, got " << fin.gcount() << std::endl;
+      break;
+    }
 
     if (buffer_header.id < 24) {
       if (verbose) printf(" --- decoding ALCOR FIFO \n");
-      decode(buffer, main_header.device, buffer_header.id, buffer_header.size, tout, is_filtered);
+      decode(buffer.data(), main_header.device, buffer_header.id, buffer_header.size, tout, is_filtered);
     }
     else if (buffer_header.id == 24) {
       if (verbose) printf(" --- decoding TRIGGER FIFO \n");
-      decode_trigger(buffer, main_header.device, buffer_header.id, buffer_header.size, tout);
+      decode_trigger(buffer.data(), main_header.device, buffer_header.id, buffer_header.size, tout);
+    }
+    else {
+      std::cerr << " --- [WARNING] skipping unsupported buffer id: " << buffer_header.id << std::endl;
     }
   }
   
