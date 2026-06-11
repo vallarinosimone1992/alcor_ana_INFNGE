@@ -1,5 +1,6 @@
 #include <iostream>
 #include <fstream>
+#include <cstring>
 #include <limits>
 #include <memory>
 #include <string>
@@ -46,33 +47,6 @@ struct buffer_header_t {
   uint32_t size;
 };
 
-struct spill_t {
-  uint32_t coarse   : 15;
-  uint32_t rollover : 25;
-  uint32_t zero     : 8;
-  uint32_t counter  : 12;
-  uint32_t id       : 4;
-};
-
-struct trigger_t {
-  uint32_t coarse   : 15;
-  uint32_t rollover : 25;
-  uint32_t counter  : 16;
-  uint32_t type     : 4;
-  uint32_t id       : 4;
-};
-
-struct alcor_hit_t {
-  uint32_t fine   : 9;
-  uint32_t coarse : 15;
-  uint32_t tdc    : 2;
-  uint32_t pixel  : 3;
-  uint32_t column : 3;
-  void print() {
-    printf(" hit: %d %d %d %d %d \n", column, pixel, tdc, coarse, fine);
-  }
-};
-
 struct data_t {
   int device;
   int fifo;
@@ -85,11 +59,26 @@ struct data_t {
   int rollover;
   int coarse;
   int fine;
-} data;
+};
+
+using records_t = std::vector<data_t>;
 
 bool in_spill = false;
 
-void write_data(TTree *tout,
+uint32_t read_word(const char *buffer, uint32_t pos)
+{
+  uint32_t word = 0;
+  std::memcpy(&word, buffer + static_cast<size_t>(pos) * sizeof(uint32_t), sizeof(word));
+  return word;
+}
+
+int hit_fine(uint32_t word) { return word & 0x1ff; }
+int hit_coarse(uint32_t word) { return (word >> 9) & 0x7fff; }
+int hit_tdc(uint32_t word) { return (word >> 24) & 0x3; }
+int hit_pixel(uint32_t word) { return (word >> 26) & 0x7; }
+int hit_column(uint32_t word) { return (word >> 29) & 0x7; }
+
+void write_data(records_t &records,
                 int device,
                 int fifo,
                 int type,
@@ -102,21 +91,10 @@ void write_data(TTree *tout,
                 int coarse,
                 int fine)
 {
-  data.device = device;
-  data.fifo = fifo;
-  data.type = type;
-  data.counter = counter;
-  data.spill = spill;
-  data.column = column;
-  data.pixel = pixel;
-  data.tdc = tdc;
-  data.rollover = rollover;
-  data.coarse = coarse;
-  data.fine = fine;
-  tout->Fill();
+  records.push_back({device, fifo, type, counter, spill, column, pixel, tdc, rollover, coarse, fine});
 }
 
-void write_trigger_data(TTree *tout,
+void write_trigger_data(records_t &records,
                         int device,
                         int fifo,
                         int type,
@@ -125,10 +103,10 @@ void write_trigger_data(TTree *tout,
                         int rollover,
                         int coarse)
 {
-  write_data(tout, device, fifo, type, counter, spill, -1, -1, -1, rollover, coarse, -1);
+  write_data(records, device, fifo, type, counter, spill, -1, -1, -1, rollover, coarse, -1);
 }
 
-void write_alcor_data(TTree *tout,
+void write_alcor_data(records_t &records,
                       int device,
                       int fifo,
                       int spill,
@@ -139,7 +117,7 @@ void write_alcor_data(TTree *tout,
                       int coarse,
                       int fine)
 {
-  write_data(tout, device, fifo, 1, -1, spill, column, pixel, tdc, rollover, coarse, fine);
+  write_data(records, device, fifo, 1, -1, spill, column, pixel, tdc, rollover, coarse, fine);
 }
 
 bool has_words(uint32_t pos, uint32_t size, uint32_t needed)
@@ -147,100 +125,100 @@ bool has_words(uint32_t pos, uint32_t size, uint32_t needed)
   return pos <= size && needed <= (size - pos);
 }
                 
-void decode_trigger(char *buffer, int device, int fifo, int size, TTree *tout)
+void decode_trigger(const char *buffer, int device, int fifo, int size, records_t &records)
 {
   if (verbose) printf(" --- decode_trigger: device-%d fifo-%d, size=%d \n", device, fifo, size); 
 
   size /= 4;
-  auto word = (uint32_t *)buffer;
   uint32_t pos = 0;
 
   while (pos < size) {
+    uint32_t word = read_word(buffer, pos);
 
     /** spill header **/
-    if ((*word & 0xf0000000) == 0x70000000) {
+    if ((word & 0xf0000000) == 0x70000000) {
       if (!has_words(pos, size, 2)) {
         std::cerr << " --- [ERROR] truncated trigger spill header in fifo " << fifo << std::endl;
         break;
       }
       ++spill_counter[fifo];
-      uint32_t counter = (*word & 0x0fff0000) >> 16;
+      uint32_t counter = (word & 0x0fff0000) >> 16;
       uint64_t trigger_time = 0x0;
-      if (verbose) printf(" 0x%08x -- spill header (counter=%d)\n", *word, counter);
-      trigger_time = (uint64_t)(*word & 0xff) << 32;
-      ++word; ++pos;
-      if (verbose) printf(" 0x%08x -- spill header continued \n", *word);
-      trigger_time |= *word;
+      if (verbose) printf(" 0x%08x -- spill header (counter=%d)\n", word, counter);
+      trigger_time = (uint64_t)(word & 0xff) << 32;
+      ++pos;
+      word = read_word(buffer, pos);
+      if (verbose) printf(" 0x%08x -- spill header continued \n", word);
+      trigger_time |= word;
       uint32_t coarse = trigger_time & 0x7fff;
       uint32_t rollover = trigger_time >> 15;
-      write_trigger_data(tout, device, fifo, 7, counter, spill_counter[fifo], rollover, coarse);
-      ++word; ++pos;
+      write_trigger_data(records, device, fifo, 7, counter, spill_counter[fifo], rollover, coarse);
+      ++pos;
     }
     
     /** spill trailer **/
-    else if ((*word & 0xf0000000) == 0xf0000000) {
+    else if ((word & 0xf0000000) == 0xf0000000) {
       if (!has_words(pos, size, 2)) {
         std::cerr << " --- [ERROR] truncated trigger spill trailer in fifo " << fifo << std::endl;
         break;
       }
-      spill_t *spill = (spill_t *)word;
-      uint32_t counter = (*word & 0x0fff0000) >> 16;
+      uint32_t counter = (word & 0x0fff0000) >> 16;
       uint64_t trigger_time = 0x0;
-      if (verbose) printf(" 0x%08x -- spill trailer (counter=%d)\n", *word, counter);
-      trigger_time = (uint64_t)(*word & 0xff) << 32;
-      ++word; ++pos;
-      if (verbose) printf(" 0x%08x -- spill trailer continued \n", *word);
-      trigger_time |= *word;
+      if (verbose) printf(" 0x%08x -- spill trailer (counter=%d)\n", word, counter);
+      trigger_time = (uint64_t)(word & 0xff) << 32;
+      ++pos;
+      word = read_word(buffer, pos);
+      if (verbose) printf(" 0x%08x -- spill trailer continued \n", word);
+      trigger_time |= word;
       uint32_t coarse = trigger_time & 0x7fff;
       uint32_t rollover = trigger_time >> 15;
       integrated_spill++;
-      write_trigger_data(tout, device, fifo, 15, counter, spill_counter[fifo], rollover, coarse);
-      ++word; ++pos;
+      write_trigger_data(records, device, fifo, 15, counter, spill_counter[fifo], rollover, coarse);
+      ++pos;
     }
     
     /** trigger **/
-    else if ((*word & 0xf0000000) == 0x90000000) {
+    else if ((word & 0xf0000000) == 0x90000000) {
       if (!has_words(pos, size, 2)) {
         std::cerr << " --- [ERROR] truncated trigger word in fifo " << fifo << std::endl;
         break;
       }
-      trigger_t *trigger = (trigger_t *)word;
       uint64_t trigger_time = 0x0;
-      if (verbose) printf(" 0x%08x -- trigger header\n", *word);
-      trigger_time = (uint64_t)(*word & 0xff) << 32;
-      uint32_t counter = (*word & 0xffff00) >> 16;
-      ++word; ++pos;
-      if (verbose) printf(" 0x%08x -- trigger header continued \n", *word);
-      trigger_time |= *word;
+      if (verbose) printf(" 0x%08x -- trigger header\n", word);
+      trigger_time = (uint64_t)(word & 0xff) << 32;
+      uint32_t counter = (word & 0xffff00) >> 16;
+      ++pos;
+      word = read_word(buffer, pos);
+      if (verbose) printf(" 0x%08x -- trigger header continued \n", word);
+      trigger_time |= word;
       uint32_t coarse = trigger_time & 0x7fff;
       uint32_t rollover = trigger_time >> 15;
-      write_trigger_data(tout, device, fifo, 9, counter, spill_counter[fifo], rollover, coarse);
-      ++word; ++pos;
+      write_trigger_data(records, device, fifo, 9, counter, spill_counter[fifo], rollover, coarse);
+      ++pos;
     }
 
     /** else **/
     else {
       ++unexpected_word_count;
       if (unexpected_word_printed < kUnexpectedPrintLimit) {
-        printf(" 0x%08x -- unexpected word \n", *word);
+        printf(" 0x%08x -- unexpected word \n", word);
         ++unexpected_word_printed;
         if (unexpected_word_printed == kUnexpectedPrintLimit) {
           printf(" --- further unexpected words suppressed (showing first %d) \n",
                  kUnexpectedPrintLimit);
         }
       }
-      ++word; ++pos;
+      ++pos;
     }
     
   }
 
 }
 
-void decode(char *buffer, int device, int fifo, int size, TTree *tout, bool is_filtered)
+void decode(const char *buffer, int device, int fifo, int size, records_t &records, bool is_filtered)
 {
+  (void)is_filtered;
   size /= 4;
-  auto word = (uint32_t *)buffer;
-  alcor_hit_t *hit;
   uint32_t pos = 0;
 
   // loop over buffer data
@@ -248,25 +226,27 @@ void decode(char *buffer, int device, int fifo, int size, TTree *tout, bool is_f
 
     // find spill header if not in spill already
     while (!in_spill && pos < size) {
+      uint32_t word = read_word(buffer, pos);
       
       /** spill header **/
-      if ((*word & 0xf0000000) == 0x70000000) {
+      if ((word & 0xf0000000) == 0x70000000) {
         if (!has_words(pos, size, 2)) {
           std::cerr << " --- [ERROR] truncated spill header in fifo " << fifo << std::endl;
           return;
         }
         ++spill_counter[fifo];
-        uint32_t counter = (*word & 0x0fff0000) >> 16;
+        uint32_t counter = (word & 0x0fff0000) >> 16;
         uint64_t trigger_time = 0x0;
-        if (verbose) printf(" 0x%08x -- spill header (counter=%d)\n", *word, counter);
-        trigger_time = (uint64_t)(*word & 0xff) << 32;
-        ++word; ++pos;
-        if (verbose) printf(" 0x%08x -- spill header continued \n", *word);
-        trigger_time |= *word;
+        if (verbose) printf(" 0x%08x -- spill header (counter=%d)\n", word, counter);
+        trigger_time = (uint64_t)(word & 0xff) << 32;
+        ++pos;
+        word = read_word(buffer, pos);
+        if (verbose) printf(" 0x%08x -- spill header continued \n", word);
+        trigger_time |= word;
         uint32_t coarse = trigger_time & 0x7fff;
         uint32_t rollover = trigger_time >> 15;
-        write_trigger_data(tout, device, fifo, 7, counter, spill_counter[fifo], rollover, coarse);
-        ++word; ++pos;
+        write_trigger_data(records, device, fifo, 7, counter, spill_counter[fifo], rollover, coarse);
+        ++pos;
         in_spill = true;
 
 	break;
@@ -275,44 +255,45 @@ void decode(char *buffer, int device, int fifo, int size, TTree *tout, bool is_f
       /** something else **/
       if (verbose) {
 	//	if (!in_spill)
-	//	  printf(" 0x%08x -- filler (pos=%d)\n", *word, pos % 16);
+	//	  printf(" 0x%08x -- filler (pos=%d)\n", word, pos % 16);
 	//	else 
-	  printf(" 0x%08x -- \n", *word);
+	  printf(" 0x%08x -- \n", word);
       }
-      ++word; ++pos;
+      ++pos;
     }
     
     // find spill trailer
     while (pos < size) {
+      uint32_t word = read_word(buffer, pos);
 
       /** killed fifo **/
-      if (*word == 0x666caffe) {
-        if (verbose) printf(" 0x%08x -- killed fifo \n", *word);
-        write_trigger_data(tout, device, fifo, 15, -1, spill_counter[fifo], -1, -1);
-        ++word; ++pos;
+      if (word == 0x666caffe) {
+        if (verbose) printf(" 0x%08x -- killed fifo \n", word);
+        write_trigger_data(records, device, fifo, 15, -1, spill_counter[fifo], -1, -1);
+        ++pos;
         in_spill = false;
 	rollover_counter = 0;
         break;	
       }
       
       /** spill trailer **/
-      if ((*word & 0xf0000000) == 0xf0000000) {
+      if ((word & 0xf0000000) == 0xf0000000) {
         if (!has_words(pos, size, 2)) {
           std::cerr << " --- [ERROR] truncated spill trailer in fifo " << fifo << std::endl;
           return;
         }
-        spill_t *spill = (spill_t *)word;
-        uint32_t counter = (*word & 0x0fff0000) >> 16;
+        uint32_t counter = (word & 0x0fff0000) >> 16;
         uint64_t trigger_time = 0x0;
-        if (verbose) printf(" 0x%08x -- spill trailer (counter=%d)\n", *word, counter);
-        trigger_time = (uint64_t)(*word & 0xff) << 32;
-        ++word; ++pos;
-        if (verbose) printf(" 0x%08x -- spill trailer continued \n", *word);
-        trigger_time |= *word;
+        if (verbose) printf(" 0x%08x -- spill trailer (counter=%d)\n", word, counter);
+        trigger_time = (uint64_t)(word & 0xff) << 32;
+        ++pos;
+        word = read_word(buffer, pos);
+        if (verbose) printf(" 0x%08x -- spill trailer continued \n", word);
+        trigger_time |= word;
         uint32_t coarse = trigger_time & 0x7fff;
         uint32_t rollover = trigger_time >> 15;
-        write_trigger_data(tout, device, fifo, 15, counter, spill_counter[fifo], rollover, coarse);
-        ++word; ++pos;
+        write_trigger_data(records, device, fifo, 15, counter, spill_counter[fifo], rollover, coarse);
+        ++pos;
         in_spill = false;
 	integrated_spill++;
 	rollover_counter = 0;
@@ -320,29 +301,34 @@ void decode(char *buffer, int device, int fifo, int size, TTree *tout, bool is_f
       }
 
       /** rollover **/
-      if (*word == 0x5c5c5c5c) {
-        if (verbose) printf(" 0x%08x -- rollover (counter=%d) \n", *word, rollover_counter);
+      if (word == 0x5c5c5c5c) {
+        if (verbose) printf(" 0x%08x -- rollover (counter=%d) \n", word, rollover_counter);
         ++rollover_counter;
 	++integrated_rollover;
-        ++word; ++pos;
+        ++pos;
         continue;
       }
 
       /** hit **/
-      hit = (alcor_hit_t *)word;
-      if (verbose) printf(" 0x%08x -- hit (coarse=%d, fine=%d, column=%d, pixel=%d --> channel=%d)\n", *word, hit->coarse, hit->fine, hit->column, hit->pixel, hit->column * 4 + hit->pixel);
-      write_alcor_data(tout,
+      if (verbose) printf(" 0x%08x -- hit (coarse=%d, fine=%d, column=%d, pixel=%d --> channel=%d)\n",
+                          word,
+                          hit_coarse(word),
+                          hit_fine(word),
+                          hit_column(word),
+                          hit_pixel(word),
+                          hit_column(word) * 4 + hit_pixel(word));
+      write_alcor_data(records,
                        device,
                        fifo,
                        spill_counter[fifo],
-                       hit->column,
-                       hit->pixel,
-                       hit->tdc,
+                       hit_column(word),
+                       hit_pixel(word),
+                       hit_tdc(word),
                        rollover_counter,
-                       hit->coarse,
-                       hit->fine);
+                       hit_coarse(word),
+                       hit_fine(word));
       integrated_hits++;
-      ++word; ++pos;
+      ++pos;
       
     }
   }
@@ -433,32 +419,12 @@ int main(int argc, char *argv[])
   }
   std::vector<char> buffer(staging_size);
   
-  /** open output file **/
-  std::cout << " --- opening output file: " << output_filename << std::endl;
-  std::unique_ptr<TFile> fout(TFile::Open(output_filename.c_str(), "RECREATE"));
-  if (!fout || fout->IsZombie()) {
-    std::cerr << " --- [ERROR] cannot open output file: " << output_filename << std::endl;
-    return 1;
-  }
-  auto tout = std::make_unique<TTree>("alcor", "ALCOR", 99, nullptr);
-  tout->Branch("device", &data.device, "device/I");
-  tout->Branch("fifo", &data.fifo, "fifo/I");
-  tout->Branch("type", &data.type, "type/I");
-  tout->Branch("counter", &data.counter, "counter/I");
-  tout->Branch("spill", &data.spill, "spill/I");
-  tout->Branch("column", &data.column, "column/I");
-  tout->Branch("pixel", &data.pixel, "pixel/I");
-  tout->Branch("tdc", &data.tdc, "tdc/I");
-  tout->Branch("rollover", &data.rollover, "rollover/I");
-  tout->Branch("coarse", &data.coarse, "coarse/I");
-  tout->Branch("fine", &data.fine, "fine/I");
-
   /** loop over data **/
+  records_t records;
   for (int i = 0; i < 25; ++i) {
     spill_counter[i] = -1;
   }
   buffer_header_t buffer_header;
-  uint32_t word;
   while (true) {
     fin.read((char *)(&buffer_header), sizeof(buffer_header_t));
     const std::streamsize header_bytes = fin.gcount();
@@ -497,11 +463,11 @@ int main(int argc, char *argv[])
 
     if (buffer_header.id < 24) {
       if (verbose) printf(" --- decoding ALCOR FIFO \n");
-      decode(buffer.data(), main_header.device, buffer_header.id, buffer_header.size, tout.get(), is_filtered);
+      decode(buffer.data(), main_header.device, buffer_header.id, buffer_header.size, records, is_filtered);
     }
     else if (buffer_header.id == 24) {
       if (verbose) printf(" --- decoding TRIGGER FIFO \n");
-      decode_trigger(buffer.data(), main_header.device, buffer_header.id, buffer_header.size, tout.get());
+      decode_trigger(buffer.data(), main_header.device, buffer_header.id, buffer_header.size, records);
     }
     else {
       std::cerr << " --- [WARNING] skipping unsupported buffer id: " << buffer_header.id << std::endl;
@@ -513,7 +479,7 @@ int main(int argc, char *argv[])
   std::cout << " --- integrated seconds: " << integrated << std::endl;
   std::cout << " --- integrated hits: " <<integrated_hits << std::endl;
   std::cout << " --- integrated rate: " << integrated_rate << std::endl;
-  std::cout << " --- entries: " << tout->GetEntries() << std::endl;
+  std::cout << " --- entries: " << records.size() << std::endl;
   if (unexpected_word_count > 0) {
     std::cout << " --- unexpected words: " << unexpected_word_count;
     if (unexpected_word_count > kUnexpectedPrintLimit) {
@@ -522,7 +488,32 @@ int main(int argc, char *argv[])
     std::cout << std::endl;
   }
 
-  /** write tree and close output */
+  /** open output file and write tree **/
+  std::cout << " --- opening output file: " << output_filename << std::endl;
+  std::unique_ptr<TFile> fout(TFile::Open(output_filename.c_str(), "RECREATE"));
+  if (!fout || fout->IsZombie()) {
+    std::cerr << " --- [ERROR] cannot open output file: " << output_filename << std::endl;
+    return 1;
+  }
+  auto tout = std::make_unique<TTree>("alcor", "ALCOR", 99, nullptr);
+  data_t data;
+  tout->Branch("device", &data.device, "device/I");
+  tout->Branch("fifo", &data.fifo, "fifo/I");
+  tout->Branch("type", &data.type, "type/I");
+  tout->Branch("counter", &data.counter, "counter/I");
+  tout->Branch("spill", &data.spill, "spill/I");
+  tout->Branch("column", &data.column, "column/I");
+  tout->Branch("pixel", &data.pixel, "pixel/I");
+  tout->Branch("tdc", &data.tdc, "tdc/I");
+  tout->Branch("rollover", &data.rollover, "rollover/I");
+  tout->Branch("coarse", &data.coarse, "coarse/I");
+  tout->Branch("fine", &data.fine, "fine/I");
+
+  for (const auto &record : records) {
+    data = record;
+    tout->Fill();
+  }
+
   fout->cd();
   tout->Write();
   std::cout << " --- integrated spill: " << integrated_spill << std::endl;

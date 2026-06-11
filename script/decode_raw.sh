@@ -42,6 +42,7 @@ force=false
 include_trigger_fifo=false
 keep_going=false
 selected_fifos=()
+selected_fifo_count=0
 if [ "$#" -gt 0 ]; then
   while [ "$#" -gt 0 ]; do
     case "$1" in
@@ -63,10 +64,12 @@ if [ "$#" -gt 0 ]; then
           exit 1
         fi
         selected_fifos+=("$2")
+        selected_fifo_count=$((selected_fifo_count + 1))
         shift 2
         ;;
       --fifo=*)
         selected_fifos+=("${1#*=}")
+        selected_fifo_count=$((selected_fifo_count + 1))
         shift
         ;;
       *)
@@ -77,12 +80,14 @@ if [ "$#" -gt 0 ]; then
   done
 fi
 
-for fifo in "${selected_fifos[@]}"; do
-  if ! [[ "${fifo}" =~ ^[0-9]+$ ]]; then
-    echo "invalid FIFO number: ${fifo}" >&2
-    exit 1
-  fi
-done
+if [ "${selected_fifo_count}" -gt 0 ]; then
+  for fifo in "${selected_fifos[@]}"; do
+    if ! [[ "${fifo}" =~ ^[0-9]+$ ]]; then
+      echo "invalid FIFO number: ${fifo}" >&2
+      exit 1
+    fi
+  done
+fi
 
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 qa_dir="${ALCOR_ANA_GE:-$(cd "${script_dir}/.." && pwd)}"
@@ -129,7 +134,7 @@ while IFS= read -r -d '' raw_dir; do
   echo "Output dir: ${out_dir}"
 
   fifo_list=()
-  if [ "${#selected_fifos[@]}" -gt 0 ]; then
+  if [ "${selected_fifo_count}" -gt 0 ]; then
     fifo_list=("${selected_fifos[@]}")
   else
     for ((fifo = 0; fifo <= 24; ++fifo)); do
@@ -140,7 +145,7 @@ while IFS= read -r -d '' raw_dir; do
   for fifo in "${fifo_list[@]}"; do
     dat="${raw_dir}/alcdaq.fifo_${fifo}.dat"
     if [ ! -e "${dat}" ]; then
-      if [ "${#selected_fifos[@]}" -gt 0 ]; then
+      if [ "${selected_fifo_count}" -gt 0 ]; then
         echo "missing requested FIFO ${fifo}: ${dat}" >&2
       fi
       continue
