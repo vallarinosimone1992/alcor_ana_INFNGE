@@ -5,8 +5,6 @@
 #include <vector>
 #include <boost/program_options.hpp>
 #include "TFile.h"
-#include "TH1F.h"
-#include "TGraph.h"
 #include "TTree.h"
 
 bool verbose = false;
@@ -20,11 +18,6 @@ int spill_counter[25];
 int unexpected_word_count = 0;
 int unexpected_word_printed = 0;
 const int kUnexpectedPrintLimit = 10;
-
-TGraph *gRollover = nullptr;
-TGraph *gSpill = nullptr;
-int gRolloverPoints = 0;
-int gSpillPoints = 0;
 
 struct main_header_t {
   uint32_t caffe;
@@ -148,15 +141,6 @@ void write_alcor_data(TTree *tout,
   write_data(tout, device, fifo, 1, -1, spill, column, pixel, tdc, rollover, coarse, fine);
 }
 
-void add_graph_point(TGraph *graph, int &point_counter, double x, double y)
-{
-  if (!graph) {
-    return;
-  }
-  graph->SetPoint(point_counter, x, y);
-  ++point_counter;
-}
-
 bool has_words(uint32_t pos, uint32_t size, uint32_t needed)
 {
   return pos <= size && needed <= (size - pos);
@@ -208,7 +192,6 @@ void decode_trigger(char *buffer, int device, int fifo, int size, TTree *tout)
       trigger_time |= *word;
       uint32_t coarse = trigger_time & 0x7fff;
       uint32_t rollover = trigger_time >> 15;
-      add_graph_point(gSpill, gSpillPoints, integrated_spill, trigger_time);
       integrated_spill++;
       write_trigger_data(tout, device, fifo, 15, counter, spill_counter[fifo], rollover, coarse);
       ++word; ++pos;
@@ -330,7 +313,6 @@ void decode(char *buffer, int device, int fifo, int size, TTree *tout, bool is_f
         write_trigger_data(tout, device, fifo, 15, counter, spill_counter[fifo], rollover, coarse);
         ++word; ++pos;
         in_spill = false;
-	add_graph_point(gRollover, gRolloverPoints, integrated_spill, rollover_counter);
 	integrated_spill++;
 	rollover_counter = 0;
 	break;
@@ -470,11 +452,6 @@ int main(int argc, char *argv[])
   tout->Branch("coarse", &data.coarse, "coarse/I");
   tout->Branch("fine", &data.fine, "fine/I");
 
-  /** output histograms **/
-  auto hCounters = new TH1F("hCounters", "", 3, 0, 3);
-  gRollover = new TGraph;
-  gSpill = new TGraph;
-  
   /** loop over data **/
   for (int i = 0; i < 25; ++i) {
     spill_counter[i] = -1;
@@ -546,12 +523,6 @@ int main(int argc, char *argv[])
   /** write tree and close output */
   tout->Write();
   std::cout << " --- integrated spill: " << integrated_spill << std::endl;
-  hCounters->SetBinContent(1, integrated_spill);
-  hCounters->SetBinContent(2, integrated_rollover);
-  hCounters->SetBinContent(3, integrated_hits);
-  hCounters->Write();
-  gRollover->Write("gRollover");
-  gSpill->Write("gSpill");
   fout->Close();
   
   /** close input file **/
