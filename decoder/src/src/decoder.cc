@@ -4,18 +4,20 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <cerrno>
 #include <limits>
 #include <memory>
 #include <string>
 #include <vector>
 #include <boost/program_options.hpp>
+#include "TObject.h"
 #include "TFile.h"
 #include "TTree.h"
 
 bool verbose = false;
 int integrated_rollover = 0;
 int integrated_spill = 0;
-int integrated_hits = 0;
+long long integrated_hits = 0;
 int rollover_counter = 0;//-1; // we start from -1 becaue the very first word is a rollover
 int frame = 0;
 int spill_counter[25];
@@ -64,7 +66,109 @@ struct data_t {
   int fine;
 };
 
-using records_t = std::vector<data_t>;
+class output_tree_t {
+public:
+  bool open(const std::string &output_filename)
+  {
+    output_filename_ = output_filename;
+    tmp_output_filename_ = output_filename + ".tmp";
+    std::remove(tmp_output_filename_.c_str());
+
+    file_.reset(TFile::Open(tmp_output_filename_.c_str(), "RECREATE"));
+    if (!file_ || file_->IsZombie()) {
+      std::cerr << " --- [ERROR] cannot open output file: " << tmp_output_filename_ << std::endl;
+      return false;
+    }
+
+    file_->cd();
+    tree_ = std::make_unique<TTree>("alcor", "ALCOR", 99, nullptr);
+    tree_->SetDirectory(file_.get());
+    tree_->SetAutoFlush(-64LL * 1024LL * 1024LL);
+    tree_->SetAutoSave(-256LL * 1024LL * 1024LL);
+    tree_->Branch("device", &data_.device, "device/I");
+    tree_->Branch("fifo", &data_.fifo, "fifo/I");
+    tree_->Branch("type", &data_.type, "type/I");
+    tree_->Branch("counter", &data_.counter, "counter/I");
+    tree_->Branch("spill", &data_.spill, "spill/I");
+    tree_->Branch("column", &data_.column, "column/I");
+    tree_->Branch("pixel", &data_.pixel, "pixel/I");
+    tree_->Branch("tdc", &data_.tdc, "tdc/I");
+    tree_->Branch("rollover", &data_.rollover, "rollover/I");
+    tree_->Branch("coarse", &data_.coarse, "coarse/I");
+    tree_->Branch("fine", &data_.fine, "fine/I");
+    return true;
+  }
+
+  bool fill(const data_t &data)
+  {
+    data_ = data;
+    if (tree_->Fill() < 0) {
+      std::cerr << " --- [ERROR] failed to fill output tree" << std::endl;
+      return false;
+    }
+    ++entries_;
+    return true;
+  }
+
+  size_t entries() const { return entries_; }
+
+  bool finalize()
+  {
+    file_->cd();
+    if (tree_->Write("", TObject::kOverwrite) <= 0) {
+      std::cerr << " --- [ERROR] failed to write output tree: " << output_filename_ << std::endl;
+      abort();
+      return false;
+    }
+
+    tree_->SetDirectory(nullptr);
+    tree_.reset();
+    file_->Close();
+    file_.reset();
+
+    std::remove(output_filename_.c_str());
+    if (std::rename(tmp_output_filename_.c_str(), output_filename_.c_str()) != 0) {
+      std::cerr << " --- [ERROR] cannot rename temporary output file "
+                << tmp_output_filename_ << " to " << output_filename_
+                << ": " << std::strerror(errno) << std::endl;
+      std::remove(tmp_output_filename_.c_str());
+      return false;
+    }
+    finalized_ = true;
+    return true;
+  }
+
+  void abort()
+  {
+    if (tree_) {
+      tree_->SetDirectory(nullptr);
+      tree_.reset();
+    }
+    if (file_) {
+      file_->Close();
+      file_.reset();
+    }
+    if (!tmp_output_filename_.empty()) {
+      std::remove(tmp_output_filename_.c_str());
+    }
+  }
+
+  ~output_tree_t()
+  {
+    if (!finalized_) {
+      abort();
+    }
+  }
+
+private:
+  std::string output_filename_;
+  std::string tmp_output_filename_;
+  std::unique_ptr<TFile> file_;
+  std::unique_ptr<TTree> tree_;
+  data_t data_{};
+  size_t entries_ = 0;
+  bool finalized_ = false;
+};
 
 bool in_spill = false;
 
@@ -81,7 +185,7 @@ int hit_tdc(uint32_t word) { return (word >> 24) & 0x3; }
 int hit_pixel(uint32_t word) { return (word >> 26) & 0x7; }
 int hit_column(uint32_t word) { return (word >> 29) & 0x7; }
 
-void write_data(records_t &records,
+bool write_data(output_tree_t &output,
                 int device,
                 int fifo,
                 int type,
@@ -94,10 +198,10 @@ void write_data(records_t &records,
                 int coarse,
                 int fine)
 {
-  records.push_back({device, fifo, type, counter, spill, column, pixel, tdc, rollover, coarse, fine});
+  return output.fill({device, fifo, type, counter, spill, column, pixel, tdc, rollover, coarse, fine});
 }
 
-void write_trigger_data(records_t &records,
+bool write_trigger_data(output_tree_t &output,
                         int device,
                         int fifo,
                         int type,
@@ -106,10 +210,10 @@ void write_trigger_data(records_t &records,
                         int rollover,
                         int coarse)
 {
-  write_data(records, device, fifo, type, counter, spill, -1, -1, -1, rollover, coarse, -1);
+  return write_data(output, device, fifo, type, counter, spill, -1, -1, -1, rollover, coarse, -1);
 }
 
-void write_alcor_data(records_t &records,
+bool write_alcor_data(output_tree_t &output,
                       int device,
                       int fifo,
                       int spill,
@@ -120,7 +224,7 @@ void write_alcor_data(records_t &records,
                       int coarse,
                       int fine)
 {
-  write_data(records, device, fifo, 1, -1, spill, column, pixel, tdc, rollover, coarse, fine);
+  return write_data(output, device, fifo, 1, -1, spill, column, pixel, tdc, rollover, coarse, fine);
 }
 
 bool has_words(uint32_t pos, uint32_t size, uint32_t needed)
@@ -128,7 +232,7 @@ bool has_words(uint32_t pos, uint32_t size, uint32_t needed)
   return pos <= size && needed <= (size - pos);
 }
                 
-bool decode_trigger(const char *buffer, int device, int fifo, int size, records_t &records)
+bool decode_trigger(const char *buffer, int device, int fifo, int size, output_tree_t &output)
 {
   if (verbose) printf(" --- decode_trigger: device-%d fifo-%d, size=%d \n", device, fifo, size); 
 
@@ -155,7 +259,9 @@ bool decode_trigger(const char *buffer, int device, int fifo, int size, records_
       trigger_time |= word;
       uint32_t coarse = trigger_time & 0x7fff;
       uint32_t rollover = trigger_time >> 15;
-      write_trigger_data(records, device, fifo, 7, counter, spill_counter[fifo], rollover, coarse);
+      if (!write_trigger_data(output, device, fifo, 7, counter, spill_counter[fifo], rollover, coarse)) {
+        return false;
+      }
       ++pos;
     }
     
@@ -176,7 +282,9 @@ bool decode_trigger(const char *buffer, int device, int fifo, int size, records_
       uint32_t coarse = trigger_time & 0x7fff;
       uint32_t rollover = trigger_time >> 15;
       integrated_spill++;
-      write_trigger_data(records, device, fifo, 15, counter, spill_counter[fifo], rollover, coarse);
+      if (!write_trigger_data(output, device, fifo, 15, counter, spill_counter[fifo], rollover, coarse)) {
+        return false;
+      }
       ++pos;
     }
     
@@ -196,7 +304,9 @@ bool decode_trigger(const char *buffer, int device, int fifo, int size, records_
       trigger_time |= word;
       uint32_t coarse = trigger_time & 0x7fff;
       uint32_t rollover = trigger_time >> 15;
-      write_trigger_data(records, device, fifo, 9, counter, spill_counter[fifo], rollover, coarse);
+      if (!write_trigger_data(output, device, fifo, 9, counter, spill_counter[fifo], rollover, coarse)) {
+        return false;
+      }
       ++pos;
     }
 
@@ -219,7 +329,7 @@ bool decode_trigger(const char *buffer, int device, int fifo, int size, records_
   return true;
 }
 
-bool decode(const char *buffer, int device, int fifo, int size, records_t &records, bool is_filtered)
+bool decode(const char *buffer, int device, int fifo, int size, output_tree_t &output, bool is_filtered)
 {
   (void)is_filtered;
   size /= 4;
@@ -249,7 +359,9 @@ bool decode(const char *buffer, int device, int fifo, int size, records_t &recor
         trigger_time |= word;
         uint32_t coarse = trigger_time & 0x7fff;
         uint32_t rollover = trigger_time >> 15;
-        write_trigger_data(records, device, fifo, 7, counter, spill_counter[fifo], rollover, coarse);
+        if (!write_trigger_data(output, device, fifo, 7, counter, spill_counter[fifo], rollover, coarse)) {
+          return false;
+        }
         ++pos;
         in_spill = true;
 
@@ -273,7 +385,9 @@ bool decode(const char *buffer, int device, int fifo, int size, records_t &recor
       /** killed fifo **/
       if (word == 0x666caffe) {
         if (verbose) printf(" 0x%08x -- killed fifo \n", word);
-        write_trigger_data(records, device, fifo, 15, -1, spill_counter[fifo], -1, -1);
+        if (!write_trigger_data(output, device, fifo, 15, -1, spill_counter[fifo], -1, -1)) {
+          return false;
+        }
         ++pos;
         in_spill = false;
 	rollover_counter = 0;
@@ -296,7 +410,9 @@ bool decode(const char *buffer, int device, int fifo, int size, records_t &recor
         trigger_time |= word;
         uint32_t coarse = trigger_time & 0x7fff;
         uint32_t rollover = trigger_time >> 15;
-        write_trigger_data(records, device, fifo, 15, counter, spill_counter[fifo], rollover, coarse);
+        if (!write_trigger_data(output, device, fifo, 15, counter, spill_counter[fifo], rollover, coarse)) {
+          return false;
+        }
         ++pos;
         in_spill = false;
 	integrated_spill++;
@@ -321,16 +437,18 @@ bool decode(const char *buffer, int device, int fifo, int size, records_t &recor
                           hit_column(word),
                           hit_pixel(word),
                           hit_column(word) * 4 + hit_pixel(word));
-      write_alcor_data(records,
-                       device,
-                       fifo,
-                       spill_counter[fifo],
-                       hit_column(word),
-                       hit_pixel(word),
-                       hit_tdc(word),
-                       rollover_counter,
-                       hit_coarse(word),
-                       hit_fine(word));
+      if (!write_alcor_data(output,
+                            device,
+                            fifo,
+                            spill_counter[fifo],
+                            hit_column(word),
+                            hit_pixel(word),
+                            hit_tdc(word),
+                            rollover_counter,
+                            hit_coarse(word),
+                            hit_fine(word))) {
+        return false;
+      }
       integrated_hits++;
       ++pos;
       
@@ -423,9 +541,15 @@ int main(int argc, char *argv[])
     return 1;
   }
   std::vector<char> buffer(staging_size);
+
+  /** open output file before decoding so ROOT can flush baskets incrementally **/
+  std::cout << " --- opening output file: " << output_filename << std::endl;
+  output_tree_t output;
+  if (!output.open(output_filename)) {
+    return 1;
+  }
   
   /** loop over data **/
-  records_t records;
   for (int i = 0; i < 25; ++i) {
     spill_counter[i] = -1;
   }
@@ -474,14 +598,14 @@ int main(int argc, char *argv[])
 
     if (buffer_header.id < 24) {
       if (verbose) printf(" --- decoding ALCOR FIFO \n");
-      if (!decode(buffer.data(), main_header.device, buffer_header.id, buffer_header.size, records, is_filtered)) {
+      if (!decode(buffer.data(), main_header.device, buffer_header.id, buffer_header.size, output, is_filtered)) {
         input_error = true;
         break;
       }
     }
     else if (buffer_header.id == 24) {
       if (verbose) printf(" --- decoding TRIGGER FIFO \n");
-      if (!decode_trigger(buffer.data(), main_header.device, buffer_header.id, buffer_header.size, records)) {
+      if (!decode_trigger(buffer.data(), main_header.device, buffer_header.id, buffer_header.size, output)) {
         input_error = true;
         break;
       }
@@ -493,6 +617,7 @@ int main(int argc, char *argv[])
 
   if (input_error) {
     std::cerr << " --- [ERROR] input decode failed; output file will not be written" << std::endl;
+    output.abort();
     return 1;
   }
   
@@ -501,7 +626,7 @@ int main(int argc, char *argv[])
   std::cout << " --- integrated seconds: " << integrated << std::endl;
   std::cout << " --- integrated hits: " <<integrated_hits << std::endl;
   std::cout << " --- integrated rate: " << integrated_rate << std::endl;
-  std::cout << " --- entries: " << records.size() << std::endl;
+  std::cout << " --- entries: " << output.entries() << std::endl;
   if (unexpected_word_count > 0) {
     std::cout << " --- unexpected words: " << unexpected_word_count;
     if (unexpected_word_count > kUnexpectedPrintLimit) {
@@ -510,43 +635,10 @@ int main(int argc, char *argv[])
     std::cout << std::endl;
   }
 
-  /** open output file and write tree **/
-  std::cout << " --- opening output file: " << output_filename << std::endl;
-  std::unique_ptr<TFile> fout(TFile::Open(output_filename.c_str(), "RECREATE"));
-  if (!fout || fout->IsZombie()) {
-    std::cerr << " --- [ERROR] cannot open output file: " << output_filename << std::endl;
-    return 1;
-  }
-  fout->cd();
-  auto tout = std::make_unique<TTree>("alcor", "ALCOR", 99, nullptr);
-  data_t data;
-  tout->Branch("device", &data.device, "device/I");
-  tout->Branch("fifo", &data.fifo, "fifo/I");
-  tout->Branch("type", &data.type, "type/I");
-  tout->Branch("counter", &data.counter, "counter/I");
-  tout->Branch("spill", &data.spill, "spill/I");
-  tout->Branch("column", &data.column, "column/I");
-  tout->Branch("pixel", &data.pixel, "pixel/I");
-  tout->Branch("tdc", &data.tdc, "tdc/I");
-  tout->Branch("rollover", &data.rollover, "rollover/I");
-  tout->Branch("coarse", &data.coarse, "coarse/I");
-  tout->Branch("fine", &data.fine, "fine/I");
-
-  for (const auto &record : records) {
-    data = record;
-    tout->Fill();
-  }
-
-  if (tout->Write() <= 0) {
-    std::cerr << " --- [ERROR] failed to write output tree: " << output_filename << std::endl;
-    tout.reset();
-    fout->Close();
+  if (!output.finalize()) {
     return 1;
   }
   std::cout << " --- integrated spill: " << integrated_spill << std::endl;
-  tout.reset();
-  fout->Close();
-  fout.reset();
   
   /** close input file **/
   fin.close();
