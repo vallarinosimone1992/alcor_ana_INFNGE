@@ -43,8 +43,21 @@ inline bool HasTree(const std::string &path, const char *tree_name)
   return file->Get(tree_name) != nullptr;
 }
 
+inline bool EndsWith(const std::string &value, const std::string &suffix)
+{
+  return value.size() >= suffix.size() && value.compare(value.size() - suffix.size(), suffix.size(), suffix) == 0;
+}
+
+inline bool LooksLikeRootFile(const std::string &path)
+{
+  return EndsWith(path, ".root");
+}
+
 inline std::string DetectTreeName(const std::string &path)
 {
+  if (!LooksLikeRootFile(path)) {
+    return "";
+  }
   if (HasTree(path, "alcor")) {
     return "alcor";
   }
@@ -130,6 +143,10 @@ inline std::vector<std::string> CollectFilesFromList(const std::string &list_pat
       continue;
     }
     if (!gSystem->AccessPathName(line.c_str()) && !IsDirectory(line)) {
+      if (!LooksLikeRootFile(line)) {
+        std::cout << "Skipping " << line << " (not a ROOT file)" << std::endl;
+        continue;
+      }
       if (HasTree(line, "alcor")) {
         files.push_back(line);
       } else {

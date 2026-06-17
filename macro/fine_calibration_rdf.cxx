@@ -1,5 +1,6 @@
 #include <ROOT/RDataFrame.hxx>
 #include <TCanvas.h>
+#include <TF1.h>
 #include <TFile.h>
 #include <TH1D.h>
 #include <TH2D.h>
@@ -20,12 +21,17 @@
 #include <array>
 #include <chrono>
 #include <cmath>
+#include <iomanip>
 #include <iostream>
 #include <iterator>
 #include <limits>
+#include <map>
 #include <memory>
+#include <numeric>
+#include <sstream>
 #include <string>
 #include <utility>
+#include <unordered_map>
 #include <vector>
 
 namespace {
@@ -105,6 +111,863 @@ int QuantileBin(const long long *counts, int bins, long long total, double q)
   }
   return bins - 1;
 }
+
+std::vector<int> ParseChannelsCsv(const char *csv)
+{
+  std::vector<int> channels;
+  if (!csv || csv[0] == '\0') {
+    return channels;
+  }
+  std::string text(csv);
+  for (char &ch : text) {
+    if (ch == ',' || ch == ';' || ch == ':') {
+      ch = ' ';
+    }
+  }
+  std::istringstream input(text);
+  int channel = 0;
+  while (input >> channel) {
+    if (channel < 0 || channel >= 32) {
+      continue;
+    }
+    if (std::find(channels.begin(), channels.end(), channel) == channels.end()) {
+      channels.push_back(channel);
+    }
+  }
+  std::sort(channels.begin(), channels.end());
+  return channels;
+}
+
+std::string ChannelListLabel(const std::vector<int> &channels)
+{
+  if (channels.empty()) {
+    return "all";
+  }
+  std::ostringstream out;
+  for (size_t i = 0; i < channels.size(); ++i) {
+    if (i > 0) {
+      out << ",";
+    }
+    out << channels[i];
+  }
+  return out.str();
+}
+
+std::string ParentDir(const std::string &path)
+{
+  const auto slash = path.find_last_of('/');
+  if (slash == std::string::npos) {
+    return ".";
+  }
+  if (slash == 0) {
+    return "/";
+  }
+  return path.substr(0, slash);
+}
+
+std::string OffsetSourceKey(const std::string &path)
+{
+  const std::string decoded_token = "/decoded/";
+  const auto decoded_pos = path.rfind(decoded_token);
+  if (decoded_pos != std::string::npos) {
+    return path.substr(0, decoded_pos + std::string("/decoded").size());
+  }
+  return ParentDir(path);
+}
+
+analysis_time::FineCalib BuildFineCalibFromValues(
+    const std::array<double, analysis_time::kFineCalibSize> &min_vals,
+    const std::array<double, analysis_time::kFineCalibSize> &max_vals,
+    const std::array<int, analysis_time::kFineCalibSize> &valid_vals,
+    const TH2D &hlut)
+{
+  analysis_time::FineCalib calib;
+  calib.FillDefault();
+  bool any_valid = false;
+  for (int idx = 0; idx < analysis_time::kFineCalibSize; ++idx) {
+    if (!valid_vals[idx] || max_vals[idx] <= min_vals[idx]) {
+      continue;
+    }
+    calib.min[idx] = min_vals[idx];
+    calib.cut[idx] = 0.5 * (min_vals[idx] + max_vals[idx]);
+    calib.inv_range[idx] = 1.0 / (max_vals[idx] - min_vals[idx]);
+    for (int b = 0; b < analysis_time::kFineBins; ++b) {
+      calib.lut[idx * analysis_time::kFineBins + b] = static_cast<float>(hlut.GetBinContent(idx + 1, b + 1));
+    }
+    any_valid = true;
+  }
+  calib.loaded = any_valid;
+  calib.lut_loaded = any_valid;
+  calib.use_lut = true;
+  return calib;
+}
+
+bool HasTreeBranch(TTree *tree, const char *name)
+{
+  return tree && tree->GetBranch(name) != nullptr;
+}
+
+struct OffsetHit {
+  int run_id = 0;
+  int spill = 0;
+  int channel = 0;
+  int tdc = 0;
+  double time_raw_ns = 0.0;
+  double time_ns = 0.0;
+};
+
+struct OffsetCursor {
+  std::string path;
+  int source_id = 0;
+  std::unique_ptr<TFile> file;
+  TTree *tree = nullptr;
+  Long64_t entry = 0;
+  Long64_t entries = 0;
+  bool valid = false;
+  bool has_spill = false;
+  bool has_run_id = false;
+  int current_spill = 0;
+
+  int type = 0;
+  int fifo = 0;
+  int column = 0;
+  int pixel = 0;
+  int tdc = 0;
+  int fine = 0;
+  int rollover = 0;
+  int coarse = 0;
+  int spill = 0;
+  int run_id = 0;
+  OffsetHit hit;
+};
+
+void BindOffsetCursorBranches(OffsetCursor &cursor)
+{
+  if (!cursor.tree) {
+    return;
+  }
+  cursor.tree->SetBranchAddress("type", &cursor.type);
+  cursor.tree->SetBranchAddress("fifo", &cursor.fifo);
+  cursor.tree->SetBranchAddress("column", &cursor.column);
+  cursor.tree->SetBranchAddress("pixel", &cursor.pixel);
+  cursor.tree->SetBranchAddress("tdc", &cursor.tdc);
+  cursor.tree->SetBranchAddress("fine", &cursor.fine);
+  cursor.tree->SetBranchAddress("rollover", &cursor.rollover);
+  cursor.tree->SetBranchAddress("coarse", &cursor.coarse);
+  if (cursor.has_spill) {
+    cursor.tree->SetBranchAddress("spill", &cursor.spill);
+  }
+  if (cursor.has_run_id) {
+    cursor.tree->SetBranchAddress("run_id", &cursor.run_id);
+  }
+}
+
+bool InitOffsetCursor(const std::string &path,
+                      const std::string &tree_name,
+                      int source_id,
+                      OffsetCursor &cursor)
+{
+  cursor = OffsetCursor{};
+  cursor.path = path;
+  cursor.source_id = source_id;
+  cursor.file.reset(TFile::Open(path.c_str(), "READ"));
+  if (!cursor.file || cursor.file->IsZombie()) {
+    std::cout << "Offset study: skipping " << path << " (cannot open)" << std::endl;
+    return false;
+  }
+  cursor.tree = dynamic_cast<TTree *>(cursor.file->Get(tree_name.c_str()));
+  if (!cursor.tree) {
+    std::cout << "Offset study: skipping " << path << " (missing tree " << tree_name << ")" << std::endl;
+    return false;
+  }
+  for (const auto *name : {"type", "fifo", "column", "pixel", "tdc", "fine", "rollover", "coarse"}) {
+    if (!HasTreeBranch(cursor.tree, name)) {
+      std::cout << "Offset study: skipping " << path << " (missing branch " << name << ")" << std::endl;
+      return false;
+    }
+  }
+  cursor.has_spill = HasTreeBranch(cursor.tree, "spill");
+  cursor.has_run_id = HasTreeBranch(cursor.tree, "run_id");
+  BindOffsetCursorBranches(cursor);
+  cursor.entries = cursor.tree->GetEntries();
+  return cursor.entries > 0;
+}
+
+bool AdvanceOffsetCursor(OffsetCursor &cursor, const analysis_time::FineCalib &calib, double tick_ns)
+{
+  cursor.valid = false;
+  while (cursor.entry < cursor.entries) {
+    cursor.tree->GetEntry(cursor.entry++);
+    if (!cursor.has_spill && cursor.type == 15) {
+      ++cursor.current_spill;
+      continue;
+    }
+    if (cursor.type != 1) {
+      continue;
+    }
+    if (cursor.tdc < 0 || cursor.tdc >= analysis_time::kTdcPerPixel) {
+      continue;
+    }
+    if (cursor.fine < 0 || cursor.fine >= analysis_time::kFineBins) {
+      continue;
+    }
+    const int tdc_index = analysis_time::TdcIndex(cursor.fifo, cursor.column, cursor.pixel, cursor.tdc);
+    if (tdc_index < 0 || tdc_index >= analysis_time::kFineCalibSize || calib.inv_range[tdc_index] <= 0.0) {
+      continue;
+    }
+    const Long64_t time_tick = analysis_time::TimeTick(cursor.rollover, cursor.coarse);
+    cursor.hit.run_id = cursor.has_run_id ? cursor.run_id : cursor.source_id;
+    cursor.hit.spill = cursor.has_spill ? cursor.spill : cursor.current_spill;
+    cursor.hit.channel = cursor.column * analysis_time::kPixelsPerColumn + cursor.pixel;
+    cursor.hit.tdc = cursor.tdc;
+    cursor.hit.time_raw_ns = analysis_time::TimeNsFromTick(time_tick, cursor.fine, tick_ns, true);
+    cursor.hit.time_ns = analysis_time::TimeNsFromTick(calib, time_tick, cursor.fine, tdc_index, tick_ns, true);
+    cursor.valid = true;
+    return true;
+  }
+  return false;
+}
+
+struct ChannelTdcOffsetSummary {
+  int channel = 0;
+  int tdc = 0;
+  int ref_channel = 0;
+  int ref_tdc = 0;
+  long long entries = 0;
+  double offset_ns = 0.0;
+  double mean_ns = 0.0;
+  double rms_ns = 0.0;
+  bool valid = false;
+};
+
+struct ChannelTdcOffsetStudy {
+  bool attempted = false;
+  bool available = false;
+  int ref_channel = 22;
+  int reference_mode = 0;
+  int min_channels = 3;
+  double match_window_ns = 0.0;
+  std::array<bool, 32> target_channels{};
+  std::vector<int> target_channel_list;
+  std::array<std::array<long long, analysis_time::kTdcPerPixel>, 32> edge_counts{};
+  std::map<std::pair<int, int>, std::unique_ptr<TH1D>> raw_dt_hists;
+  std::map<std::pair<int, int>, std::unique_ptr<TH1D>> dt_hists;
+  std::unique_ptr<TH1D> h_coinc_raw;
+  std::unique_ptr<TH1D> h_coinc_tdc;
+  std::unique_ptr<TH1D> h_coinc_tdc_offset;
+  std::unique_ptr<TH2D> h_offset;
+  std::unique_ptr<TH2D> h_mean;
+  std::unique_ptr<TH2D> h_rms;
+  std::unique_ptr<TH2D> h_entries;
+  std::unique_ptr<TH1D> h_leading_offset;
+  std::unique_ptr<TH1D> h_leading_entries;
+  std::unique_ptr<TTree> tree;
+  std::vector<ChannelTdcOffsetSummary> summaries;
+};
+
+bool IsTargetOffsetChannel(const ChannelTdcOffsetStudy &study, int channel)
+{
+  return channel >= 0 && channel < static_cast<int>(study.target_channels.size()) && study.target_channels[channel];
+}
+
+bool IsReferenceOffsetChannel(const ChannelTdcOffsetStudy &study, int channel)
+{
+  return study.reference_mode == 0 && channel == study.ref_channel;
+}
+
+bool KeepOffsetInputChannel(const ChannelTdcOffsetStudy &study, int channel)
+{
+  return IsTargetOffsetChannel(study, channel) || IsReferenceOffsetChannel(study, channel);
+}
+
+bool ChannelHasValidTdc(const std::array<int, analysis_time::kFineCalibSize> &valid_vals, int channel)
+{
+  for (int idx = 0; idx < analysis_time::kFineCalibSize; ++idx) {
+    if (!valid_vals[idx]) {
+      continue;
+    }
+    const int local = idx % analysis_time::kTdcPerFifo;
+    const int column = local / (analysis_time::kPixelsPerColumn * analysis_time::kTdcPerPixel);
+    const int rem = local % (analysis_time::kPixelsPerColumn * analysis_time::kTdcPerPixel);
+    const int pixel = rem / analysis_time::kTdcPerPixel;
+    const int ch = column * analysis_time::kPixelsPerColumn + pixel;
+    if (ch == channel) {
+      return true;
+    }
+  }
+  return false;
+}
+
+int ChooseOffsetReferenceChannel(const std::array<int, analysis_time::kFineCalibSize> &valid_vals,
+                                 int requested_channel)
+{
+  if (requested_channel >= 0) {
+    return requested_channel;
+  }
+  if (ChannelHasValidTdc(valid_vals, 22)) {
+    return 22;
+  }
+  for (int ch = 0; ch < 32; ++ch) {
+    if (ChannelHasValidTdc(valid_vals, ch)) {
+      return ch;
+    }
+  }
+  return -1;
+}
+
+TH1D *OffsetDtHist(ChannelTdcOffsetStudy &study, int channel, int tdc)
+{
+  const auto key = std::make_pair(channel, tdc);
+  auto it = study.dt_hists.find(key);
+  if (it != study.dt_hists.end()) {
+    return it->second.get();
+  }
+  const int bins = std::max(100, static_cast<int>(std::ceil(4.0 * study.match_window_ns)));
+  const std::string ref_tag = study.reference_mode == 1 ? "eventMedian" : "refCh" + std::to_string(study.ref_channel);
+  const std::string ref_title = study.reference_mode == 1
+                                    ? "event median"
+                                    : "ref ch " + std::to_string(study.ref_channel) + " TDC " + std::to_string(tdc);
+  std::string name = "hOffsetDt_ch" + std::to_string(channel) + "_tdc" + std::to_string(tdc) + "_" + ref_tag;
+  std::string title = "Offset #Deltat ch " + std::to_string(channel) + " TDC " + std::to_string(tdc) +
+                      " - " + ref_title + ";#Deltat [ns];entries";
+  auto hist = std::make_unique<TH1D>(name.c_str(), title.c_str(), bins, -study.match_window_ns, study.match_window_ns);
+  hist->SetDirectory(nullptr);
+  TH1D *ptr = hist.get();
+  study.dt_hists[key] = std::move(hist);
+  return ptr;
+}
+
+TH1D *OffsetRawDtHist(ChannelTdcOffsetStudy &study, int channel, int tdc)
+{
+  const auto key = std::make_pair(channel, tdc);
+  auto it = study.raw_dt_hists.find(key);
+  if (it != study.raw_dt_hists.end()) {
+    return it->second.get();
+  }
+  const int bins = std::max(100, static_cast<int>(std::ceil(4.0 * study.match_window_ns)));
+  const std::string ref_tag = "refCh" + std::to_string(study.ref_channel);
+  const std::string ref_title = "ref ch " + std::to_string(study.ref_channel) + " TDC " + std::to_string(tdc);
+  std::string name = "hOffsetRawDt_ch" + std::to_string(channel) + "_tdc" + std::to_string(tdc) + "_" + ref_tag;
+  std::string title = "Uncalibrated offset #Deltat ch " + std::to_string(channel) + " TDC " + std::to_string(tdc) +
+                      " - " + ref_title + ";#Deltat [ns];entries";
+  auto hist = std::make_unique<TH1D>(name.c_str(), title.c_str(), bins, -study.match_window_ns, study.match_window_ns);
+  hist->SetDirectory(nullptr);
+  TH1D *ptr = hist.get();
+  study.raw_dt_hists[key] = std::move(hist);
+  return ptr;
+}
+
+void ProcessChannelReferenceOffsetSpill(const std::vector<OffsetHit> &spill_hits, ChannelTdcOffsetStudy &study)
+{
+  if (study.ref_channel < 0 || spill_hits.empty()) {
+    return;
+  }
+  std::array<std::array<std::vector<OffsetHit>, analysis_time::kTdcPerPixel>, 32> times;
+  for (const auto &hit : spill_hits) {
+    if (hit.channel < 0 || hit.channel >= static_cast<int>(times.size()) ||
+        hit.tdc < 0 || hit.tdc >= analysis_time::kTdcPerPixel) {
+      continue;
+    }
+    if (!KeepOffsetInputChannel(study, hit.channel)) {
+      continue;
+    }
+    times[hit.channel][hit.tdc].push_back(hit);
+    ++study.edge_counts[hit.channel][hit.tdc];
+  }
+
+  for (int tdc = 0; tdc < analysis_time::kTdcPerPixel; ++tdc) {
+    auto &ref_times = times[study.ref_channel][tdc];
+    if (ref_times.empty()) {
+      continue;
+    }
+    std::sort(ref_times.begin(), ref_times.end(), [](const OffsetHit &a, const OffsetHit &b) {
+      return a.time_ns < b.time_ns;
+    });
+    for (int ch = 0; ch < static_cast<int>(times.size()); ++ch) {
+      if (ch == study.ref_channel) {
+        continue;
+      }
+      if (!IsTargetOffsetChannel(study, ch)) {
+        continue;
+      }
+      auto &target_times = times[ch][tdc];
+      if (target_times.empty()) {
+        continue;
+      }
+      std::sort(target_times.begin(), target_times.end(), [](const OffsetHit &a, const OffsetHit &b) {
+        return a.time_ns < b.time_ns;
+      });
+      auto *hist = OffsetDtHist(study, ch, tdc);
+      auto *raw_hist = OffsetRawDtHist(study, ch, tdc);
+      for (const auto &target : target_times) {
+        auto it = std::lower_bound(ref_times.begin(),
+                                   ref_times.end(),
+                                   target.time_ns,
+                                   [](const OffsetHit &ref, double time) { return ref.time_ns < time; });
+        double best_dt = std::numeric_limits<double>::infinity();
+        const OffsetHit *best_ref = nullptr;
+        if (it != ref_times.end()) {
+          best_dt = target.time_ns - it->time_ns;
+          best_ref = &(*it);
+        }
+        if (it != ref_times.begin()) {
+          const auto &previous = *(it - 1);
+          const double dt_prev = target.time_ns - previous.time_ns;
+          if (std::abs(dt_prev) < std::abs(best_dt)) {
+            best_dt = dt_prev;
+            best_ref = &previous;
+          }
+        }
+        if (best_ref && std::abs(best_dt) <= study.match_window_ns) {
+          hist->Fill(best_dt);
+          raw_hist->Fill(target.time_raw_ns - best_ref->time_raw_ns);
+        }
+      }
+    }
+  }
+}
+
+double MedianValue(std::vector<double> values)
+{
+  if (values.empty()) {
+    return std::numeric_limits<double>::quiet_NaN();
+  }
+  std::sort(values.begin(), values.end());
+  const size_t mid = values.size() / 2;
+  if ((values.size() % 2) == 1) {
+    return values[mid];
+  }
+  return 0.5 * (values[mid - 1] + values[mid]);
+}
+
+struct OffsetEventEntry {
+  int channel = 0;
+  double time_ns = 0.0;
+};
+
+void ProcessOffsetEventCluster(std::vector<OffsetEventEntry> cluster, int tdc, ChannelTdcOffsetStudy &study)
+{
+  if (cluster.empty()) {
+    return;
+  }
+  std::vector<double> all_times;
+  all_times.reserve(cluster.size());
+  for (const auto &entry : cluster) {
+    all_times.push_back(entry.time_ns);
+  }
+  const double preliminary_median = MedianValue(all_times);
+  if (!std::isfinite(preliminary_median)) {
+    return;
+  }
+
+  std::array<bool, 32> seen{};
+  std::array<OffsetEventEntry, 32> best_by_channel{};
+  for (const auto &entry : cluster) {
+    if (entry.channel < 0 || entry.channel >= static_cast<int>(seen.size())) {
+      continue;
+    }
+    if (!seen[entry.channel] ||
+        std::abs(entry.time_ns - preliminary_median) < std::abs(best_by_channel[entry.channel].time_ns - preliminary_median)) {
+      seen[entry.channel] = true;
+      best_by_channel[entry.channel] = entry;
+    }
+  }
+
+  std::vector<OffsetEventEntry> unique_entries;
+  unique_entries.reserve(cluster.size());
+  std::vector<double> unique_times;
+  for (int ch = 0; ch < static_cast<int>(seen.size()); ++ch) {
+    if (!seen[ch]) {
+      continue;
+    }
+    unique_entries.push_back(best_by_channel[ch]);
+    unique_times.push_back(best_by_channel[ch].time_ns);
+  }
+  if (static_cast<int>(unique_entries.size()) < std::max(1, study.min_channels)) {
+    return;
+  }
+
+  for (const auto &entry : unique_entries) {
+    std::vector<double> reference_times;
+    reference_times.reserve(unique_times.size());
+    for (const auto &other : unique_entries) {
+      if (other.channel == entry.channel) {
+        continue;
+      }
+      reference_times.push_back(other.time_ns);
+    }
+    const double reference = reference_times.empty() ? MedianValue(unique_times) : MedianValue(reference_times);
+    if (!std::isfinite(reference)) {
+      continue;
+    }
+    OffsetDtHist(study, entry.channel, tdc)->Fill(entry.time_ns - reference);
+  }
+}
+
+void ProcessEventMedianOffsetSpill(const std::vector<OffsetHit> &spill_hits, ChannelTdcOffsetStudy &study)
+{
+  if (spill_hits.empty()) {
+    return;
+  }
+  std::array<std::vector<OffsetEventEntry>, analysis_time::kTdcPerPixel> by_tdc;
+  for (const auto &hit : spill_hits) {
+    if (hit.channel < 0 || hit.channel >= 32 || hit.tdc < 0 || hit.tdc >= analysis_time::kTdcPerPixel) {
+      continue;
+    }
+    if (!IsTargetOffsetChannel(study, hit.channel)) {
+      continue;
+    }
+    by_tdc[hit.tdc].push_back({hit.channel, hit.time_ns});
+    ++study.edge_counts[hit.channel][hit.tdc];
+  }
+
+  for (int tdc = 0; tdc < analysis_time::kTdcPerPixel; ++tdc) {
+    auto &entries = by_tdc[tdc];
+    if (entries.empty()) {
+      continue;
+    }
+    std::sort(entries.begin(), entries.end(), [](const OffsetEventEntry &a, const OffsetEventEntry &b) {
+      return a.time_ns < b.time_ns;
+    });
+    std::vector<OffsetEventEntry> cluster;
+    cluster.reserve(32);
+    double cluster_seed = entries.front().time_ns;
+    for (const auto &entry : entries) {
+      if (!cluster.empty() && std::abs(entry.time_ns - cluster_seed) > study.match_window_ns) {
+        ProcessOffsetEventCluster(cluster, tdc, study);
+        cluster.clear();
+        cluster_seed = entry.time_ns;
+      }
+      cluster.push_back(entry);
+    }
+    ProcessOffsetEventCluster(cluster, tdc, study);
+  }
+}
+
+void FinalizeOffsetStudy(ChannelTdcOffsetStudy &study)
+{
+  const std::string ref_title = study.reference_mode == 1
+                                    ? "event median reference"
+                                    : "reference channel " + std::to_string(study.ref_channel);
+  study.h_offset = std::make_unique<TH2D>("hChannelTdcOffset",
+                                          ("Channel/TDC offset relative to " + ref_title + ";channel;TDC").c_str(),
+                                          32,
+                                          -0.5,
+                                          31.5,
+                                          analysis_time::kTdcPerPixel,
+                                          -0.5,
+                                          analysis_time::kTdcPerPixel - 0.5);
+  study.h_mean = std::make_unique<TH2D>("hChannelTdcOffsetMean",
+                                        ("Channel/TDC #Deltat mean relative to " + ref_title + ";channel;TDC").c_str(),
+                                        32,
+                                        -0.5,
+                                        31.5,
+                                        analysis_time::kTdcPerPixel,
+                                        -0.5,
+                                          analysis_time::kTdcPerPixel - 0.5);
+  study.h_rms = std::make_unique<TH2D>("hChannelTdcOffsetRms",
+                                       "Channel/TDC #Deltat RMS relative to reference;channel;TDC",
+                                       32,
+                                       -0.5,
+                                       31.5,
+                                       analysis_time::kTdcPerPixel,
+                                       -0.5,
+                                       analysis_time::kTdcPerPixel - 0.5);
+  study.h_entries = std::make_unique<TH2D>("hChannelTdcOffsetEntries",
+                                           "Channel/TDC offset matched entries;channel;TDC",
+                                           32,
+                                           -0.5,
+                                           31.5,
+                                           analysis_time::kTdcPerPixel,
+                                           -0.5,
+                                           analysis_time::kTdcPerPixel - 0.5);
+  study.h_leading_offset = std::make_unique<TH1D>("hChannelLeadingOffset",
+                                                  "Weighted leading-TDC offset summary;channel;offset [ns]",
+                                                  32,
+                                                  -0.5,
+                                                  31.5);
+  study.h_leading_entries = std::make_unique<TH1D>("hChannelLeadingOffsetEntries",
+                                                   "Weighted leading-TDC offset matched entries;channel;entries",
+                                                   32,
+                                                   -0.5,
+                                                   31.5);
+  const int coincidence_bins = std::max(100, static_cast<int>(std::ceil(4.0 * study.match_window_ns)));
+  const std::string coincidence_title =
+      "Coincidence #Deltat to reference ch " + std::to_string(study.ref_channel) +
+      " on calibration run;#Deltat = t_{ch} - t_{22} [ns];entries";
+  study.h_coinc_raw = std::make_unique<TH1D>("hChannelOffsetCoincidenceRawCh22",
+                                             (coincidence_title + " (uncalibrated fine time)").c_str(),
+                                             coincidence_bins,
+                                             -study.match_window_ns,
+                                             study.match_window_ns);
+  study.h_coinc_tdc = std::make_unique<TH1D>("hChannelOffsetCoincidenceTdcCh22",
+                                             (coincidence_title + " (TDC calibrated)").c_str(),
+                                             coincidence_bins,
+                                             -study.match_window_ns,
+                                             study.match_window_ns);
+  study.h_coinc_tdc_offset = std::make_unique<TH1D>("hChannelOffsetCoincidenceTdcOffsetCh22",
+                                                    (coincidence_title + " (TDC + channel/TDC offset)").c_str(),
+                                                    coincidence_bins,
+                                                    -study.match_window_ns,
+                                                    study.match_window_ns);
+  const std::array<TH1 *, 9> offset_summary_hists = {
+      static_cast<TH1 *>(study.h_offset.get()),
+      static_cast<TH1 *>(study.h_mean.get()),
+      static_cast<TH1 *>(study.h_rms.get()),
+      static_cast<TH1 *>(study.h_entries.get()),
+      static_cast<TH1 *>(study.h_leading_offset.get()),
+      static_cast<TH1 *>(study.h_leading_entries.get()),
+      static_cast<TH1 *>(study.h_coinc_raw.get()),
+      static_cast<TH1 *>(study.h_coinc_tdc.get()),
+      static_cast<TH1 *>(study.h_coinc_tdc_offset.get())};
+  for (auto *obj : offset_summary_hists) {
+    if (obj) {
+      obj->SetDirectory(nullptr);
+    }
+  }
+
+  study.summaries.clear();
+  for (auto &kv : study.dt_hists) {
+    TH1D *hist = kv.second.get();
+    if (!hist || hist->GetEntries() <= 0.0) {
+      continue;
+    }
+    ChannelTdcOffsetSummary summary;
+    summary.channel = kv.first.first;
+    summary.tdc = kv.first.second;
+    summary.ref_channel = study.ref_channel;
+    summary.ref_tdc = summary.tdc;
+    summary.entries = static_cast<long long>(hist->GetEntries());
+    summary.mean_ns = hist->GetMean();
+    summary.rms_ns = hist->GetRMS();
+    double q = 0.5;
+    double median = 0.0;
+    hist->GetQuantiles(1, &median, &q);
+    summary.offset_ns = median;
+    summary.valid = summary.entries >= 10;
+    study.summaries.push_back(summary);
+
+    const int xbin = summary.channel + 1;
+    const int ybin = summary.tdc + 1;
+    study.h_offset->SetBinContent(xbin, ybin, summary.offset_ns);
+    study.h_mean->SetBinContent(xbin, ybin, summary.mean_ns);
+    study.h_rms->SetBinContent(xbin, ybin, summary.rms_ns);
+    study.h_entries->SetBinContent(xbin, ybin, static_cast<double>(summary.entries));
+    if (summary.valid) {
+      study.available = true;
+    }
+    auto raw_it = study.raw_dt_hists.find(kv.first);
+    if (raw_it != study.raw_dt_hists.end() && raw_it->second) {
+      study.h_coinc_raw->Add(raw_it->second.get());
+    }
+    study.h_coinc_tdc->Add(hist);
+    for (int bin = 1; bin <= hist->GetNbinsX(); ++bin) {
+      const double entries_in_bin = hist->GetBinContent(bin);
+      if (entries_in_bin <= 0.0) {
+        continue;
+      }
+      study.h_coinc_tdc_offset->Fill(hist->GetBinCenter(bin) - summary.offset_ns, entries_in_bin);
+    }
+  }
+  if (study.h_coinc_tdc && study.h_coinc_tdc_offset) {
+    study.h_coinc_tdc_offset->SetEntries(study.h_coinc_tdc->GetEntries());
+  }
+
+  if (study.reference_mode == 0 && IsTargetOffsetChannel(study, study.ref_channel)) {
+    for (int tdc = 0; tdc < analysis_time::kTdcPerPixel; ++tdc) {
+      const long long count = study.edge_counts[study.ref_channel][tdc];
+      if (count <= 0) {
+        continue;
+      }
+      const int xbin = study.ref_channel + 1;
+      const int ybin = tdc + 1;
+      study.h_offset->SetBinContent(xbin, ybin, 0.0);
+      study.h_mean->SetBinContent(xbin, ybin, 0.0);
+      study.h_rms->SetBinContent(xbin, ybin, 0.0);
+      study.h_entries->SetBinContent(xbin, ybin, static_cast<double>(count));
+    }
+  }
+
+  for (int ch = 0; ch < 32; ++ch) {
+    double weighted = 0.0;
+    double weight = 0.0;
+    for (int tdc : {0, 2}) {
+      const double entries = study.h_entries->GetBinContent(ch + 1, tdc + 1);
+      if (entries <= 0.0) {
+        continue;
+      }
+      weighted += entries * study.h_offset->GetBinContent(ch + 1, tdc + 1);
+      weight += entries;
+    }
+    if (weight > 0.0) {
+      study.h_leading_offset->SetBinContent(ch + 1, weighted / weight);
+      study.h_leading_entries->SetBinContent(ch + 1, weight);
+    }
+  }
+
+  study.tree = std::make_unique<TTree>("channel_tdc_offsets", "Per-channel per-TDC relative timing offsets");
+  study.tree->SetDirectory(nullptr);
+  int channel = 0;
+  int tdc = 0;
+  int ref_channel = study.ref_channel;
+  int ref_tdc = 0;
+  int reference_mode = study.reference_mode;
+  int valid = 0;
+  long long entries = 0;
+  double offset_ns = 0.0;
+  double mean_ns = 0.0;
+  double rms_ns = 0.0;
+  study.tree->Branch("channel", &channel, "channel/I");
+  study.tree->Branch("tdc", &tdc, "tdc/I");
+  study.tree->Branch("ref_channel", &ref_channel, "ref_channel/I");
+  study.tree->Branch("ref_tdc", &ref_tdc, "ref_tdc/I");
+  study.tree->Branch("reference_mode", &reference_mode, "reference_mode/I");
+  study.tree->Branch("entries", &entries, "entries/L");
+  study.tree->Branch("offset_ns", &offset_ns, "offset_ns/D");
+  study.tree->Branch("mean_ns", &mean_ns, "mean_ns/D");
+  study.tree->Branch("rms_ns", &rms_ns, "rms_ns/D");
+  study.tree->Branch("valid", &valid, "valid/I");
+
+  for (const auto &summary : study.summaries) {
+    channel = summary.channel;
+    tdc = summary.tdc;
+    ref_channel = summary.ref_channel;
+    ref_tdc = summary.ref_tdc;
+    reference_mode = study.reference_mode;
+    entries = summary.entries;
+    offset_ns = summary.offset_ns;
+    mean_ns = summary.mean_ns;
+    rms_ns = summary.rms_ns;
+    valid = summary.valid ? 1 : 0;
+    study.tree->Fill();
+  }
+}
+
+ChannelTdcOffsetStudy StudyChannelTdcOffsets(
+    const analysis_io::InputSpec &input_spec,
+    const analysis_time::FineCalib &calib,
+    const std::array<int, analysis_time::kFineCalibSize> &valid_vals,
+    double clock_mhz,
+    int requested_ref_channel,
+    double match_window_ns,
+    int min_channels,
+    const std::vector<int> &requested_channels)
+{
+  ChannelTdcOffsetStudy study;
+  study.attempted = true;
+  study.match_window_ns = match_window_ns > 0.0 ? match_window_ns : 200.0;
+  study.reference_mode = requested_ref_channel >= 0 ? 0 : 1;
+  study.min_channels = std::max(1, min_channels);
+  if (requested_channels.empty()) {
+    for (int ch = 0; ch < static_cast<int>(study.target_channels.size()); ++ch) {
+      study.target_channels[ch] = true;
+      study.target_channel_list.push_back(ch);
+    }
+  } else {
+    for (int ch : requested_channels) {
+      if (ch < 0 || ch >= static_cast<int>(study.target_channels.size()) || study.target_channels[ch]) {
+        continue;
+      }
+      study.target_channels[ch] = true;
+      study.target_channel_list.push_back(ch);
+    }
+  }
+  if (study.reference_mode == 0) {
+    study.ref_channel = ChooseOffsetReferenceChannel(valid_vals, requested_ref_channel);
+    if (study.ref_channel < 0) {
+      std::cout << "Offset study: no valid channel found for reference selection." << std::endl;
+      return study;
+    }
+  } else {
+    study.ref_channel = -1;
+  }
+  if (!calib.loaded || !calib.lut_loaded) {
+    std::cout << "Offset study: skipped because no fine-TDC LUT is available." << std::endl;
+    return study;
+  }
+
+  std::unordered_map<std::string, int> source_ids;
+  std::vector<OffsetCursor> cursors;
+  cursors.reserve(input_spec.files.size());
+  for (const auto &path : input_spec.files) {
+    const std::string source = OffsetSourceKey(path);
+    auto source_it = source_ids.find(source);
+    if (source_it == source_ids.end()) {
+      const int next_id = static_cast<int>(source_ids.size());
+      source_it = source_ids.emplace(source, next_id).first;
+    }
+    OffsetCursor cursor;
+    if (!InitOffsetCursor(path, input_spec.tree_name, source_it->second, cursor)) {
+      continue;
+    }
+    if (AdvanceOffsetCursor(cursor, calib, analysis_time::TickNs(clock_mhz))) {
+      cursors.push_back(std::move(cursor));
+      // ROOT stores branch addresses as raw pointers; moving the cursor changes those addresses.
+      BindOffsetCursorBranches(cursors.back());
+    }
+  }
+  if (cursors.empty()) {
+    std::cout << "Offset study: no readable timing hits found." << std::endl;
+    FinalizeOffsetStudy(study);
+    return study;
+  }
+
+  if (study.reference_mode == 1) {
+    std::cout << "Offset study: event median reference, min channels " << study.min_channels
+              << ", cluster window +/-" << study.match_window_ns << " ns" << std::endl;
+  } else {
+    std::cout << "Offset study: reference channel " << study.ref_channel
+              << ", match window +/-" << study.match_window_ns << " ns" << std::endl;
+  }
+  std::cout << "Offset study target channels: " << ChannelListLabel(study.target_channel_list) << std::endl;
+
+  std::vector<OffsetHit> spill_hits;
+  while (true) {
+    bool any_valid = false;
+    uint64_t min_key = std::numeric_limits<uint64_t>::max();
+    for (const auto &cursor : cursors) {
+      if (!cursor.valid) {
+        continue;
+      }
+      any_valid = true;
+      min_key = std::min(min_key, RunSpillKey(cursor.hit.run_id, cursor.hit.spill));
+    }
+    if (!any_valid) {
+      break;
+    }
+    spill_hits.clear();
+    for (auto &cursor : cursors) {
+      while (cursor.valid && RunSpillKey(cursor.hit.run_id, cursor.hit.spill) == min_key) {
+        spill_hits.push_back(cursor.hit);
+        AdvanceOffsetCursor(cursor, calib, analysis_time::TickNs(clock_mhz));
+      }
+    }
+    if (study.reference_mode == 1) {
+      ProcessEventMedianOffsetSpill(spill_hits, study);
+    } else {
+      ProcessChannelReferenceOffsetSpill(spill_hits, study);
+    }
+  }
+
+  FinalizeOffsetStudy(study);
+  if (study.available) {
+    std::cout << "Offset study results (median dt = channel - reference):" << std::endl;
+    for (const auto &summary : study.summaries) {
+      if (!summary.valid) {
+        continue;
+      }
+      const std::string ref_label =
+          study.reference_mode == 1 ? " ref event-median" : " ref ch " + std::to_string(summary.ref_channel);
+      std::cout << "  ch " << summary.channel << " tdc " << summary.tdc
+                << ref_label << " offset=" << summary.offset_ns
+                << " ns mean=" << summary.mean_ns << " rms=" << summary.rms_ns
+                << " entries=" << summary.entries << std::endl;
+    }
+  } else {
+    std::cout << "Offset study: no channel/TDC pair had enough matched entries." << std::endl;
+  }
+  return study;
+}
 }  // namespace
 
 void fine_calibration_rdf(const char *input = "../data/calibration",
@@ -115,14 +978,22 @@ void fine_calibration_rdf(const char *input = "../data/calibration",
                           const char *out_pdf = "",
                           double max_duration_ns = 0.0,
                           bool match_coincidence = false,
-                          double clock_mhz = 320.0)
+                          double clock_mhz = 320.0,
+                          bool study_channel_offsets = true,
+                          int offset_reference_channel = 22,
+                          double offset_match_window_ns = 100.0,
+                          int offset_min_channels = 3,
+                          const char *offset_channels_csv = "")
 {
   if (WantsHelp(input) || WantsHelp(out_root)) {
     std::cout << "fine_calibration_rdf usage:\n";
-    std::cout << "  fine_calibration_rdf(\"/path/to/decoded_or_parent\", \"fine_calibration.root\", 0.01, 0.99, 200, \"fine_calibration.pdf\", 0.0, false, 320.0)\n";
+    std::cout << "  fine_calibration_rdf(\"/path/to/decoded_or_parent\", \"fine_calibration.root\", 0.01, 0.99, 200, \"fine_calibration.pdf\", 0.0, false, 320.0, true, 22, 100.0, 3, \"17,19,22\")\n";
     std::cout << "  required branches: type,fifo,column,pixel,tdc,fine\n";
     std::cout << "  match_coincidence=true uses leading edges with valid ToT (needs rollover/coarse, optional spill/run_id)\n";
     std::cout << "  output histograms: hFineMin, hFineMax (bins=" << analysis_time::kFineCalibSize << ")\n";
+    std::cout << "  study_channel_offsets=true also writes channel_tdc_offsets and hChannelTdcOffset using calibrated TDC times\n";
+    std::cout << "  offset_reference_channel defaults to reference time on ch22; -1 uses an event-median reference\n";
+    std::cout << "  offset_channels_csv limits the offset study to selected channels; empty means all channels\n";
     return;
   }
 
@@ -633,6 +1504,20 @@ void fine_calibration_rdf(const char *input = "../data/calibration",
     }
   }
 
+  ChannelTdcOffsetStudy offset_study;
+  if (study_channel_offsets) {
+    auto derived_fine_calib = BuildFineCalibFromValues(min_vals, max_vals, valid_vals, *hlut);
+    const auto offset_channels = ParseChannelsCsv(offset_channels_csv);
+    offset_study = StudyChannelTdcOffsets(input_spec,
+                                          derived_fine_calib,
+                                          valid_vals,
+                                          clock_mhz,
+                                          offset_reference_channel,
+                                          offset_match_window_ns,
+                                          offset_min_channels,
+                                          offset_channels);
+  }
+
   auto tree = std::make_unique<TTree>("fine_calib", "Fine calibration values");
   tree->SetDirectory(nullptr);
   int tdc_index = 0;
@@ -691,6 +1576,61 @@ void fine_calibration_rdf(const char *input = "../data/calibration",
   for (auto &item : tdc_profiles) {
     if (item.profile) {
       item.profile->Write();
+    }
+  }
+  if (offset_study.attempted) {
+    TParameter<int>("channel_offset_study_enabled", study_channel_offsets ? 1 : 0).Write();
+    TParameter<int>("channel_offset_ref_channel", offset_study.ref_channel).Write();
+    TParameter<int>("channel_offset_reference_mode", offset_study.reference_mode).Write();
+    TParameter<double>("channel_offset_match_window_ns", offset_study.match_window_ns).Write();
+    TParameter<int>("channel_offset_min_channels", offset_study.min_channels).Write();
+    TParameter<int>("channel_offset_available", offset_study.available ? 1 : 0).Write();
+    TParameter<int>("channel_offset_n_target_channels",
+                    static_cast<int>(offset_study.target_channel_list.size()))
+        .Write();
+    for (size_t i = 0; i < offset_study.target_channel_list.size(); ++i) {
+      TParameter<int>(("channel_offset_target_" + std::to_string(i)).c_str(), offset_study.target_channel_list[i])
+          .Write();
+    }
+    if (offset_study.h_offset) {
+      offset_study.h_offset->Write();
+    }
+    if (offset_study.h_mean) {
+      offset_study.h_mean->Write();
+    }
+    if (offset_study.h_rms) {
+      offset_study.h_rms->Write();
+    }
+    if (offset_study.h_entries) {
+      offset_study.h_entries->Write();
+    }
+    if (offset_study.h_leading_offset) {
+      offset_study.h_leading_offset->Write();
+    }
+    if (offset_study.h_leading_entries) {
+      offset_study.h_leading_entries->Write();
+    }
+    if (offset_study.h_coinc_raw) {
+      offset_study.h_coinc_raw->Write();
+    }
+    if (offset_study.h_coinc_tdc) {
+      offset_study.h_coinc_tdc->Write();
+    }
+    if (offset_study.h_coinc_tdc_offset) {
+      offset_study.h_coinc_tdc_offset->Write();
+    }
+    if (offset_study.tree) {
+      offset_study.tree->Write();
+    }
+    for (auto &kv : offset_study.raw_dt_hists) {
+      if (kv.second) {
+        kv.second->Write();
+      }
+    }
+    for (auto &kv : offset_study.dt_hists) {
+      if (kv.second) {
+        kv.second->Write();
+      }
     }
   }
   for (int idx = 0; idx < size; ++idx) {
@@ -864,6 +1804,62 @@ void fine_calibration_rdf(const char *input = "../data/calibration",
       channel_before_after_legends.push_back(std::move(drawn.second));
     }
     c_channel_before_after.Print(pdf_path.c_str());
+
+    if (offset_study.attempted && offset_study.h_offset && offset_study.h_entries) {
+      TCanvas c_offset("c_channel_tdc_offsets", "Channel/TDC timing offsets", 1600, 900);
+      c_offset.Divide(2, 2);
+      c_offset.cd(1);
+      gPad->SetRightMargin(0.15);
+      offset_study.h_offset->SetMarkerSize(0.8);
+      offset_study.h_offset->Draw("colz text");
+      c_offset.cd(2);
+      gPad->SetRightMargin(0.15);
+      gPad->SetLogz(true);
+      offset_study.h_entries->Draw("colz");
+      c_offset.cd(3);
+      if (offset_study.h_leading_offset) {
+        offset_study.h_leading_offset->Draw("hist");
+      }
+      c_offset.cd(4);
+      if (offset_study.h_leading_entries) {
+        gPad->SetLogy(true);
+        offset_study.h_leading_entries->Draw("hist");
+      }
+      c_offset.Print(pdf_path.c_str());
+
+      if (offset_study.h_coinc_raw && offset_study.h_coinc_tdc && offset_study.h_coinc_tdc_offset &&
+          (offset_study.h_coinc_raw->GetEntries() > 0.0 || offset_study.h_coinc_tdc->GetEntries() > 0.0 ||
+           offset_study.h_coinc_tdc_offset->GetEntries() > 0.0)) {
+        TCanvas c_offset_coinc("c_channel_tdc_offset_coincidences",
+                               "Coincidences before/after TDC and offset corrections",
+                               1600,
+                               900);
+        c_offset_coinc.SetLogy(true);
+        auto stack = std::make_unique<THStack>("stack_channel_tdc_offset_coincidences",
+                                               "Calibration-run coincidences to ch22;#Deltat = t_{ch} - t_{22} [ns];entries");
+        auto legend = std::make_unique<TLegend>(0.60, 0.70, 0.90, 0.90);
+        legend->SetBorderSize(0);
+        legend->SetFillStyle(0);
+        auto add_coinc_hist = [&](TH1D *hist, int color, const std::string &label) {
+          if (!hist || hist->GetEntries() <= 0.0) {
+            return;
+          }
+          hist->SetStats(false);
+          hist->SetLineColor(color);
+          hist->SetLineWidth(2);
+          stack->Add(hist, "hist");
+          std::ostringstream entry;
+          entry << label << " RMS=" << std::fixed << std::setprecision(3) << hist->GetRMS() << " ns";
+          legend->AddEntry(hist, entry.str().c_str(), "l");
+        };
+        add_coinc_hist(offset_study.h_coinc_raw.get(), kGray + 2, "raw");
+        add_coinc_hist(offset_study.h_coinc_tdc.get(), kBlue + 1, "TDC");
+        add_coinc_hist(offset_study.h_coinc_tdc_offset.get(), kRed + 1, "TDC+offset");
+        stack->Draw("nostack hist");
+        legend->Draw();
+        c_offset_coinc.Print(pdf_path.c_str());
+      }
+    }
 
     if (!tdc_profiles.empty()) {
       auto build_stack = [&](int channel, const std::string &name, const std::string &title, TLegend &legend) {

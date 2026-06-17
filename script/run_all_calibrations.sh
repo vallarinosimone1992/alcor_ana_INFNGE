@@ -14,7 +14,7 @@ Options:
       --tw-input PATH     input for timewalk/ToT calibration (repeatable)
       --tw-mode MODE      trigger or intensity (default: trigger)
       --channels LIST     channels for --tw-mode intensity
-      --trigger CH        trigger/reference channel for --tw-mode trigger
+      --trigger CH        laser trigger/reference channel for --tw-mode trigger (default: 22)
       --sensors CSV       sensor channels for --tw-mode trigger
   -l, --logbook FILE      JSON logbook (default: config/logbook.json)
   -d, --duration NS       max ToT duration passed to both steps (default: 30)

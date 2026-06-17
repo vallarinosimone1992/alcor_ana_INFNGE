@@ -215,6 +215,90 @@ struct ChannelCalib {
   }
 };
 
+struct ChannelTdcOffsetCalib {
+  bool loaded = false;
+  int reference_channel = -1;
+  int reference_mode = 0;
+  double match_window_ns = 0.0;
+  int min_channels = 0;
+  std::array<std::array<double, kTdcPerPixel>, 32> offsets{};
+  std::array<std::array<double, kTdcPerPixel>, 32> entries{};
+  std::array<std::array<bool, kTdcPerPixel>, 32> valid{};
+
+  void Clear()
+  {
+    loaded = false;
+    reference_channel = -1;
+    reference_mode = 0;
+    match_window_ns = 0.0;
+    min_channels = 0;
+    for (auto &row : offsets) {
+      row.fill(0.0);
+    }
+    for (auto &row : entries) {
+      row.fill(0.0);
+    }
+    for (auto &row : valid) {
+      row.fill(false);
+    }
+  }
+
+  bool LoadFromFile(const std::string &path)
+  {
+    Clear();
+    if (path.empty()) {
+      return false;
+    }
+    std::unique_ptr<TFile> file(TFile::Open(path.c_str(), "READ"));
+    if (!file || file->IsZombie()) {
+      return false;
+    }
+    auto *hoff = dynamic_cast<TH2 *>(file->Get("hChannelTdcOffset"));
+    if (!hoff) {
+      return false;
+    }
+    auto *hentries = dynamic_cast<TH2 *>(file->Get("hChannelTdcOffsetEntries"));
+    if (auto *p_ref = dynamic_cast<TParameter<int> *>(file->Get("channel_offset_ref_channel"))) {
+      reference_channel = p_ref->GetVal();
+    }
+    if (auto *p_mode = dynamic_cast<TParameter<int> *>(file->Get("channel_offset_reference_mode"))) {
+      reference_mode = p_mode->GetVal();
+    }
+    if (auto *p_window = dynamic_cast<TParameter<double> *>(file->Get("channel_offset_match_window_ns"))) {
+      match_window_ns = p_window->GetVal();
+    }
+    if (auto *p_min = dynamic_cast<TParameter<int> *>(file->Get("channel_offset_min_channels"))) {
+      min_channels = p_min->GetVal();
+    }
+
+    bool any_valid = false;
+    for (int ch = 0; ch < static_cast<int>(offsets.size()); ++ch) {
+      for (int tdc = 0; tdc < kTdcPerPixel; ++tdc) {
+        const double entry_count = hentries ? hentries->GetBinContent(ch + 1, tdc + 1) : 0.0;
+        entries[ch][tdc] = entry_count;
+        offsets[ch][tdc] = hoff->GetBinContent(ch + 1, tdc + 1);
+        if (entry_count > 0.0) {
+          valid[ch][tdc] = true;
+          any_valid = true;
+        }
+      }
+    }
+    loaded = any_valid;
+    return loaded;
+  }
+
+  double CorrectionNs(int channel, int tdc) const
+  {
+    if (!loaded || channel < 0 || channel >= static_cast<int>(offsets.size()) || tdc < 0 || tdc >= kTdcPerPixel) {
+      return 0.0;
+    }
+    if (!valid[channel][tdc]) {
+      return 0.0;
+    }
+    return offsets[channel][tdc];
+  }
+};
+
 inline void PrintFineCalibConstants(const FineCalib &calib)
 {
   if (!calib.loaded) {
@@ -261,6 +345,34 @@ inline void PrintChannelCalibSummary(const ChannelCalib &calib)
     std::cout << "Channel calib ch " << ch << " bins=" << entry.bins << " range=[" << entry.xmin << ", "
               << entry.xmax << "] first=" << first << " last=" << last << " offset=" << calib.offsets[ch]
               << std::endl;
+  }
+}
+
+inline void PrintChannelTdcOffsetSummary(const ChannelTdcOffsetCalib &calib)
+{
+  if (!calib.loaded) {
+    std::cout << "Channel/TDC offset calibration: (none)" << std::endl;
+    return;
+  }
+  std::cout << "Channel/TDC offset calibration loaded";
+  if (calib.reference_mode == 1) {
+    std::cout << " (event median reference";
+    if (calib.min_channels > 0) {
+      std::cout << ", min_channels=" << calib.min_channels;
+    }
+    std::cout << ")";
+  } else if (calib.reference_channel >= 0) {
+    std::cout << " (reference channel " << calib.reference_channel << ")";
+  }
+  std::cout << std::endl;
+  for (int ch = 0; ch < static_cast<int>(calib.offsets.size()); ++ch) {
+    for (int tdc = 0; tdc < kTdcPerPixel; ++tdc) {
+      if (!calib.valid[ch][tdc]) {
+        continue;
+      }
+      std::cout << "  offset ch " << ch << " tdc " << tdc << " = " << calib.offsets[ch][tdc]
+                << " ns entries=" << calib.entries[ch][tdc] << std::endl;
+    }
   }
 }
 

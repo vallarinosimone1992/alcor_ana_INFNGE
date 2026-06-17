@@ -227,6 +227,12 @@ void plot_channels_rdf(const char *decoded_dir = "../raw_data/latest/kc705-196/d
   }
   fine_calib.use_lut = use_lut;
   analysis_time::PrintFineCalibConstants(fine_calib);
+  auto tdc_offset_calib_ptr = std::make_unique<analysis_time::ChannelTdcOffsetCalib>();
+  auto &tdc_offset_calib = *tdc_offset_calib_ptr;
+  if (fine_calib_path && fine_calib_path[0] != '\0') {
+    tdc_offset_calib.LoadFromFile(fine_calib_path);
+  }
+  analysis_time::PrintChannelTdcOffsetSummary(tdc_offset_calib);
   auto chan_calib_ptr = std::make_unique<analysis_time::ChannelCalib>();
   auto &chan_calib = *chan_calib_ptr;
   if (chan_calib_path && chan_calib_path[0] != '\0') {
@@ -413,6 +419,7 @@ struct PlotGroup {
     int tdc_index = analysis_time::TdcIndex(fifos_vec[i], columns_vec[i], pixels_vec[i], tdc_vec[i]);
     double time_ns_raw =
         analysis_time::TimeNsFromTick(fine_calib, times_vec[i], fine_vec[i], tdc_index, tick_ns, use_fine_flag);
+    const double time_ns = time_ns_raw - tdc_offset_calib.CorrectionNs(ch, tdc_vec[i]);
     hits_by_channel[idx_it->second].push_back({times_vec[i],
                                                fine_vec[i],
                                                tdc_vec[i],
@@ -421,7 +428,7 @@ struct PlotGroup {
                                                pixels_vec[i],
                                                spill_val,
                                                time_ns_raw,
-                                               time_ns_raw,
+                                               time_ns,
                                                false});
   }
 
@@ -518,7 +525,7 @@ struct PlotGroup {
         if (tot <= 0.0 || tot > duration_max_ns) {
           continue;
         }
-        hits[j].time_ns = hits[j].time_ns_raw - chan_calib.CorrectionNs(channel, tot);
+        hits[j].time_ns -= chan_calib.CorrectionNs(channel, tot);
       }
     }
   }
@@ -768,6 +775,7 @@ struct PlotGroup {
         int tdc_index = analysis_time::TdcIndex(fifo, columns_vals[i], pixels_vals[i], tdcs_vals[i]);
         double time_ns =
             analysis_time::TimeNsFromTick(fine_calib, ticks_vals[i], fines_vals[i], tdc_index, tick_ns, use_fine_flag);
+        time_ns -= tdc_offset_calib.CorrectionNs(ch, tdcs_vals[i]);
         if (!has_start_by_fifo[fifo]) {
           continue;
         }

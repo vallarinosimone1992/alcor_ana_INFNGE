@@ -1,5 +1,4 @@
 #include <TCanvas.h>
-#include <TChain.h>
 #include <TColor.h>
 #include <TF1.h>
 #include <TFile.h>
@@ -17,6 +16,7 @@
 #include <TProfile.h>
 #include <TStyle.h>
 #include <TSystem.h>
+#include <TTree.h>
 
 #include "analysis_io.h"
 #include "analysis_time.h"
@@ -24,6 +24,7 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <cctype>
 #include <cstdlib>
 #include <cstdint>
 #include <fstream>
@@ -108,7 +109,37 @@ struct SpillRange {
 enum class TimewalkFitModel {
   Pol1 = 0,
   LinExpPlateau = 1,
+  Pol1Plateau = 2,
 };
+
+enum class TimeReferenceMode {
+  EventMedian = 0,
+  Trigger = 1,
+};
+
+std::string TimeReferenceModeName(TimeReferenceMode mode)
+{
+  switch (mode) {
+    case TimeReferenceMode::EventMedian:
+      return "event-median";
+    case TimeReferenceMode::Trigger:
+      return "trigger";
+  }
+  return "unknown";
+}
+
+TimeReferenceMode ParseTimeReferenceMode(const std::string &value)
+{
+  if (value.empty() || value == "event-median" || value == "event_median" || value == "median" ||
+      value == "event") {
+    return TimeReferenceMode::EventMedian;
+  }
+  if (value == "trigger" || value == "ch22" || value == "reference-channel" || value == "reference_channel") {
+    return TimeReferenceMode::Trigger;
+  }
+  std::cerr << "Unknown reference mode '" << value << "', using event-median" << std::endl;
+  return TimeReferenceMode::EventMedian;
+}
 
 std::string TimewalkFitModelName(TimewalkFitModel model)
 {
@@ -117,6 +148,8 @@ std::string TimewalkFitModelName(TimewalkFitModel model)
       return "pol1";
     case TimewalkFitModel::LinExpPlateau:
       return "lin-exp-plateau";
+    case TimewalkFitModel::Pol1Plateau:
+      return "pol1-plateau";
   }
   return "unknown";
 }
@@ -129,8 +162,12 @@ TimewalkFitModel ParseTimewalkFitModel(const std::string &value)
   if (value == "lin-exp-plateau" || value == "lin_exp_plateau" || value == "piecewise") {
     return TimewalkFitModel::LinExpPlateau;
   }
-  std::cerr << "Unknown timewalk fit model '" << value << "', using lin-exp-plateau" << std::endl;
-  return TimewalkFitModel::LinExpPlateau;
+  if (value == "pol1-plateau" || value == "pol1_plateau" || value == "linear-plateau" ||
+      value == "linear_plateau" || value == "piecewise-linear" || value == "piecewise_linear") {
+    return TimewalkFitModel::Pol1Plateau;
+  }
+  std::cerr << "Unknown timewalk fit model '" << value << "', using pol1-plateau" << std::endl;
+  return TimewalkFitModel::Pol1Plateau;
 }
 
 bool WantsHelp(const char *arg)
@@ -147,14 +184,21 @@ void PrintHelp()
   std::cout << "laser_intensity_scan_rdf usage:\n"
             << "  laser_intensity_scan_rdf(\"runlist.tsv\", \"fine.root\", \"channel.root\","
             << " \"out.pdf\", \"out.root\", \"out.txt\", 22, \"17,19\", 100, 30, 320, true,"
-            << " true, 0, true, 50000, 1000000, 50000, false, \"17:7:18.5,19:3:15\","
-            << " \"lin-exp-plateau\", \"\", \"\", \"\", \"\", -1, \"all\", 0, 0.01)\n\n"
+            << " true, 0, true, 50000, 1000000, 50000, false, \"17:0:30,19:0:30\","
+            << " \"pol1-plateau\", \"\", \"\", \"\", \"\", -1, \"all\", 0, 0.01,"
+            << " \"17:0,19:0,22:0\", \"event-median\", 3)\n\n"
+            << "Default reference mode uses the per-event laser median excluding the channel being corrected.\n"
+            << "Legacy trigger reference can be selected with reference_mode=\"trigger\" and trigger_channel=22.\n"
+            << "Timewalk corrections are fitted from t_sensor - t_reference versus sensor ToT.\n"
             << "Runlist TSV columns: run_label, input_path, intensity, channels, thresholds, spill, vbias, note\n"
             << "input_path can be a decoded dir, run dir, or parent dir accepted by analysis_io::ResolveInputSpec.\n"
             << "Optional dt/ToT cuts use CH:DT0:SLOPE[:TOT_MIN:TOT_MAX] and keep dt >= DT0 + SLOPE*ToT.\n"
             << "Optional trigger ToT window uses MIN:MAX, e.g. 1:3.\n"
             << "Optional spill range uses MIN:MAX, inclusive.\n"
             << "Optional channel ToT windows use CH:MIN:MAX, e.g. 17:18:25.\n"
+            << "Optional leading TDC selection uses TDC or CH:TDC CSV, e.g. 0 or 17:0,19:2,22:0.\n"
+            << "  Only leading TDC 0 or 2 is accepted; the trailing partner is kept for ToT.\n"
+            << "Timewalk fit models: pol1, pol1-plateau, lin-exp-plateau.\n"
             << "Optional edge diagnostic spill uses -1 for the first selected spill.\n"
             << "Optional edge diagnostic channels use all, analysis, or a CSV list.\n"
             << "Optional edge diagnostic fraction is the initial spill fraction to plot, default 0.01.\n";
@@ -200,6 +244,143 @@ std::vector<std::string> Split(const std::string &line, char sep)
     out.push_back(item);
   }
   return out;
+}
+
+std::string TrimCopy(const std::string &value)
+{
+  size_t first = 0;
+  while (first < value.size() && std::isspace(static_cast<unsigned char>(value[first]))) {
+    ++first;
+  }
+  size_t last = value.size();
+  while (last > first && std::isspace(static_cast<unsigned char>(value[last - 1]))) {
+    --last;
+  }
+  return value.substr(first, last - first);
+}
+
+struct TdcSelection {
+  bool default_enabled = false;
+  int default_leading_tdc = -1;
+  std::map<int, int> leading_tdc_by_channel;
+
+  bool Empty() const
+  {
+    return !default_enabled && leading_tdc_by_channel.empty();
+  }
+
+  int LeadingTdcForChannel(int channel) const
+  {
+    auto it = leading_tdc_by_channel.find(channel);
+    if (it != leading_tdc_by_channel.end()) {
+      return it->second;
+    }
+    return default_enabled ? default_leading_tdc : -1;
+  }
+
+  bool KeepLeadingHit(int channel, int tdc) const
+  {
+    const int selected = LeadingTdcForChannel(channel);
+    return selected < 0 || tdc == selected;
+  }
+
+  bool KeepRawHitForTot(int channel, int tdc) const
+  {
+    const int selected = LeadingTdcForChannel(channel);
+    if (selected < 0) {
+      return true;
+    }
+    return tdc == selected || tdc == (selected ^ 0x1);
+  }
+
+  std::string Description(const std::vector<int> &channels) const
+  {
+    if (Empty()) {
+      return "";
+    }
+    std::ostringstream out;
+    bool first = true;
+    for (int ch : channels) {
+      const int tdc = LeadingTdcForChannel(ch);
+      if (tdc < 0) {
+        continue;
+      }
+      if (!first) {
+        out << ",";
+      }
+      out << ch << ":" << tdc;
+      first = false;
+    }
+    return out.str();
+  }
+};
+
+bool ParseLeadingTdcValue(const std::string &token, int &tdc)
+{
+  try {
+    tdc = std::stoi(TrimCopy(token));
+  } catch (const std::exception &) {
+    return false;
+  }
+  return tdc == 0 || tdc == 2;
+}
+
+TdcSelection ParseTdcSelectionCsv(const std::string &csv)
+{
+  TdcSelection selection;
+  if (csv.empty()) {
+    return selection;
+  }
+
+  for (const auto &raw_token : Split(csv, ',')) {
+    const std::string token = TrimCopy(raw_token);
+    if (token.empty()) {
+      continue;
+    }
+    auto fields = Split(token, ':');
+    if (fields.size() == 1) {
+      int tdc = -1;
+      if (!ParseLeadingTdcValue(fields[0], tdc)) {
+        std::cerr << "Skipping invalid TDC selection: " << token
+                  << " (use leading TDC 0 or 2)" << std::endl;
+        continue;
+      }
+      selection.default_enabled = true;
+      selection.default_leading_tdc = tdc;
+      continue;
+    }
+    if (fields.size() != 2) {
+      std::cerr << "Skipping invalid TDC selection: " << token << std::endl;
+      continue;
+    }
+
+    int tdc = -1;
+    if (!ParseLeadingTdcValue(fields[1], tdc)) {
+      std::cerr << "Skipping invalid TDC selection: " << token
+                << " (use leading TDC 0 or 2; trailing partner is kept for ToT)" << std::endl;
+      continue;
+    }
+
+    const std::string channel_token = TrimCopy(fields[0]);
+    if (channel_token == "*" || channel_token == "all" || channel_token == "default") {
+      selection.default_enabled = true;
+      selection.default_leading_tdc = tdc;
+      continue;
+    }
+
+    try {
+      const int channel = std::stoi(channel_token);
+      if (channel < 0 || channel >= kNumAlcorChannels) {
+        std::cerr << "Skipping invalid TDC selection channel: " << token << std::endl;
+        continue;
+      }
+      selection.leading_tdc_by_channel[channel] = tdc;
+    } catch (const std::exception &) {
+      std::cerr << "Skipping invalid TDC selection channel: " << token << std::endl;
+    }
+  }
+
+  return selection;
 }
 
 std::vector<int> ParseChannelsCsv(const std::string &csv)
@@ -420,6 +601,41 @@ double ParseDoubleOrNan(const std::string &value)
   return parsed;
 }
 
+double ParseIntensityOrNan(const std::string &value, bool &used_average)
+{
+  used_average = false;
+  const double scalar = ParseDoubleOrNan(value);
+  if (std::isfinite(scalar)) {
+    return scalar;
+  }
+
+  std::vector<double> numbers;
+  const char *cursor = value.c_str();
+  while (*cursor != '\0') {
+    if (!std::isdigit(static_cast<unsigned char>(*cursor)) && *cursor != '.') {
+      ++cursor;
+      continue;
+    }
+    char *end = nullptr;
+    const double parsed = std::strtod(cursor, &end);
+    if (end && end != cursor && std::isfinite(parsed)) {
+      numbers.push_back(parsed);
+      cursor = end;
+      continue;
+    }
+    ++cursor;
+  }
+
+  if (numbers.empty()) {
+    return std::numeric_limits<double>::quiet_NaN();
+  }
+  if (numbers.size() == 1) {
+    return numbers.front();
+  }
+  used_average = true;
+  return std::accumulate(numbers.begin(), numbers.end(), 0.0) / static_cast<double>(numbers.size());
+}
+
 struct RunConfig {
   std::string label;
   std::string input_path;
@@ -453,7 +669,8 @@ std::vector<RunConfig> LoadRunList(const std::string &path)
     RunConfig run;
     run.label = cols[0];
     run.input_path = cols[1];
-    run.intensity = ParseDoubleOrNan(cols[2]);
+    bool averaged_intensity = false;
+    run.intensity = ParseIntensityOrNan(cols[2], averaged_intensity);
     if (cols.size() > 3) {
       run.channels = cols[3];
     }
@@ -472,6 +689,10 @@ std::vector<RunConfig> LoadRunList(const std::string &path)
     if (!std::isfinite(run.intensity)) {
       std::cerr << "Skipping row with invalid intensity: " << line << std::endl;
       continue;
+    }
+    if (averaged_intensity) {
+      std::cerr << "Using average numeric intensity " << run.intensity
+                << " for non-scalar intensity field '" << cols[2] << "' in run " << run.label << std::endl;
     }
     runs.push_back(std::move(run));
   }
@@ -493,6 +714,33 @@ struct Hit {
   bool leading = false;
 };
 
+struct TreeCursor {
+  std::string path;
+  std::unique_ptr<TFile> file;
+  TTree *tree = nullptr;
+  Long64_t entry = 0;
+  Long64_t entries = 0;
+  int current_spill = 0;
+  bool has_channel = false;
+  bool has_time_tick = false;
+  bool has_spill = false;
+  bool has_pending = false;
+  bool eof = false;
+  Hit pending;
+
+  int fifo = 0;
+  int type = 0;
+  int spill = 0;
+  int column = 0;
+  int pixel = 0;
+  int tdc = 0;
+  int rollover = 0;
+  int coarse = 0;
+  int fine = 0;
+  int channel = 0;
+  Long64_t time_tick = 0;
+};
+
 struct EdgeHit {
   int channel = -1;
   int spill = 0;
@@ -506,6 +754,151 @@ struct StoredSensorHit {
   double time_ns = 0.0;
   double tot_ns = 0.0;
 };
+
+bool HasTreeBranch(TTree *tree, const char *name)
+{
+  return tree && tree->GetBranch(name) != nullptr;
+}
+
+void BindTreeCursorBranches(TreeCursor &cursor)
+{
+  if (!cursor.tree) {
+    return;
+  }
+  cursor.tree->SetBranchAddress("type", &cursor.type);
+  cursor.tree->SetBranchAddress("fifo", &cursor.fifo);
+  cursor.tree->SetBranchAddress("column", &cursor.column);
+  cursor.tree->SetBranchAddress("pixel", &cursor.pixel);
+  cursor.tree->SetBranchAddress("tdc", &cursor.tdc);
+  cursor.tree->SetBranchAddress("rollover", &cursor.rollover);
+  cursor.tree->SetBranchAddress("coarse", &cursor.coarse);
+  cursor.tree->SetBranchAddress("fine", &cursor.fine);
+  if (cursor.has_spill) {
+    cursor.tree->SetBranchAddress("spill", &cursor.spill);
+  }
+  if (cursor.has_channel) {
+    cursor.tree->SetBranchAddress("channel", &cursor.channel);
+  }
+  if (cursor.has_time_tick) {
+    cursor.tree->SetBranchAddress("time_tick", &cursor.time_tick);
+  }
+}
+
+bool OpenTreeCursor(const std::string &path, const std::string &tree_name, TreeCursor &cursor)
+{
+  cursor = TreeCursor{};
+  cursor.path = path;
+  cursor.file.reset(TFile::Open(path.c_str(), "READ"));
+  if (!cursor.file || cursor.file->IsZombie()) {
+    std::cerr << "Failed to open decoded ROOT file: " << path << std::endl;
+    return false;
+  }
+  cursor.tree = dynamic_cast<TTree *>(cursor.file->Get(tree_name.c_str()));
+  if (!cursor.tree) {
+    std::cerr << "Missing tree '" << tree_name << "' in " << path << std::endl;
+    return false;
+  }
+
+  std::vector<std::string> missing;
+  for (const auto &name : {"type", "fifo", "column", "pixel", "tdc", "rollover", "coarse", "fine"}) {
+    if (!HasTreeBranch(cursor.tree, name)) {
+      missing.emplace_back(name);
+    }
+  }
+  if (!missing.empty()) {
+    std::cerr << "Missing required branches in " << path << ": ";
+    for (size_t i = 0; i < missing.size(); ++i) {
+      if (i) {
+        std::cerr << ", ";
+      }
+      std::cerr << missing[i];
+    }
+    std::cerr << std::endl;
+    return false;
+  }
+
+  cursor.has_channel = HasTreeBranch(cursor.tree, "channel");
+  cursor.has_time_tick = HasTreeBranch(cursor.tree, "time_tick");
+  cursor.has_spill = HasTreeBranch(cursor.tree, "spill");
+
+  cursor.tree->SetBranchStatus("*", 0);
+  auto enable = [&cursor](const char *name) {
+    if (HasTreeBranch(cursor.tree, name)) {
+      cursor.tree->SetBranchStatus(name, 1);
+    }
+  };
+  for (const auto &name : {"type", "fifo", "column", "pixel", "tdc", "rollover", "coarse", "fine",
+                           "spill", "channel", "time_tick"}) {
+    enable(name);
+  }
+
+  BindTreeCursorBranches(cursor);
+
+  cursor.entries = cursor.tree->GetEntries();
+  return true;
+}
+
+bool AdvanceCursor(TreeCursor &cursor,
+                   const std::unordered_set<int> &selected_channels,
+                   const std::unordered_set<int> &edge_channels,
+                   const TdcSelection &tdc_selection,
+                   const analysis_time::FineCalib &fine_calib,
+                   const analysis_time::ChannelTdcOffsetCalib &tdc_offset_calib,
+                   double tick_ns,
+                   bool use_fine,
+                   int fine_cut,
+                   const SpillRange &spill_range)
+{
+  cursor.has_pending = false;
+  while (cursor.entry < cursor.entries) {
+    cursor.tree->GetEntry(cursor.entry++);
+    if (!cursor.has_spill && cursor.type == 15) {
+      ++cursor.current_spill;
+      continue;
+    }
+    if (cursor.type != 1 || !IsValidTdcId(cursor.tdc)) {
+      continue;
+    }
+
+    const int channel = cursor.has_channel ? cursor.channel : cursor.column * 4 + cursor.pixel;
+    const bool selected = selected_channels.find(channel) != selected_channels.end();
+    const bool edge_selected = edge_channels.find(channel) != edge_channels.end();
+    if (selected && !tdc_selection.KeepRawHitForTot(channel, cursor.tdc)) {
+      continue;
+    }
+    if (!selected && !edge_selected) {
+      continue;
+    }
+    const int hit_spill = cursor.has_spill ? cursor.spill : cursor.current_spill;
+    if (!spill_range.Pass(hit_spill)) {
+      continue;
+    }
+
+    const int tdc_index = analysis_time::TdcIndex(cursor.fifo, cursor.column, cursor.pixel, cursor.tdc);
+    if (!analysis_time::PassFineCut(fine_calib, cursor.fine, tdc_index, fine_cut)) {
+      continue;
+    }
+
+    Hit hit;
+    hit.channel = channel;
+    hit.spill = hit_spill;
+    hit.fifo = cursor.fifo;
+    hit.column = cursor.column;
+    hit.pixel = cursor.pixel;
+    hit.tdc = cursor.tdc;
+    hit.fine = cursor.fine;
+    hit.time_tick = cursor.has_time_tick ? cursor.time_tick : analysis_time::TimeTick(cursor.rollover, cursor.coarse);
+    hit.time_ns_raw = analysis_time::TimeNsFromTick(fine_calib, hit.time_tick, cursor.fine, tdc_index, tick_ns, use_fine);
+    hit.time_ns = hit.time_ns_raw - tdc_offset_calib.CorrectionNs(channel, cursor.tdc);
+    hit.leading = IsLeadingTdc(cursor.tdc);
+    cursor.pending = hit;
+    cursor.has_pending = true;
+    return true;
+  }
+
+  cursor.eof = true;
+  return false;
+}
 
 struct DurationKey {
   int spill = 0;
@@ -580,6 +973,39 @@ struct Stats {
   double err_rms = std::numeric_limits<double>::quiet_NaN();
 };
 
+struct OnlineStats {
+  long long n = 0;
+  double mean = 0.0;
+  double m2 = 0.0;
+
+  void Add(double value)
+  {
+    if (!std::isfinite(value)) {
+      return;
+    }
+    ++n;
+    const double delta = value - mean;
+    mean += delta / static_cast<double>(n);
+    const double delta2 = value - mean;
+    m2 += delta * delta2;
+  }
+
+  Stats Get() const
+  {
+    Stats stats;
+    stats.n = n;
+    if (n <= 0) {
+      return stats;
+    }
+    stats.mean = mean;
+    const double var = m2 / static_cast<double>(n);
+    stats.rms = std::sqrt(std::max(0.0, var));
+    stats.err_mean = stats.rms / std::sqrt(static_cast<double>(n));
+    stats.err_rms = n > 1 ? stats.rms / std::sqrt(2.0 * static_cast<double>(n - 1)) : 0.0;
+    return stats;
+  }
+};
+
 Stats ComputeStats(const std::vector<double> &values)
 {
   Stats stats;
@@ -605,6 +1031,93 @@ Stats ComputeStats(const std::vector<double> &values)
   return stats;
 }
 
+struct SpillBounds {
+  bool valid = false;
+  int min = 0;
+  int max = 0;
+
+  void Add(int spill)
+  {
+    if (!valid) {
+      valid = true;
+      min = spill;
+      max = spill;
+      return;
+    }
+    min = std::min(min, spill);
+    max = std::max(max, spill);
+  }
+};
+
+SpillBounds FindSelectedSpillBounds(const analysis_io::InputSpec &input,
+                                    const std::unordered_set<int> &selected_channels,
+                                    const SpillRange &spill_range)
+{
+  SpillBounds bounds;
+  for (const auto &path : input.files) {
+    std::unique_ptr<TFile> file(TFile::Open(path.c_str(), "READ"));
+    if (!file || file->IsZombie()) {
+      std::cerr << "Failed to open decoded ROOT file for spill scan: " << path << std::endl;
+      continue;
+    }
+    TTree *tree = dynamic_cast<TTree *>(file->Get(input.tree_name.c_str()));
+    if (!tree) {
+      std::cerr << "Missing tree '" << input.tree_name << "' in " << path << std::endl;
+      continue;
+    }
+    if (!HasTreeBranch(tree, "type") || !HasTreeBranch(tree, "column") || !HasTreeBranch(tree, "pixel")) {
+      std::cerr << "Skipping spill scan for " << path << " (missing type/column/pixel)" << std::endl;
+      continue;
+    }
+
+    int type = 0;
+    int spill = 0;
+    int column = 0;
+    int pixel = 0;
+    int channel = 0;
+    int current_spill = 0;
+    const bool has_spill = HasTreeBranch(tree, "spill");
+    const bool has_channel = HasTreeBranch(tree, "channel");
+
+    tree->SetBranchStatus("*", 0);
+    tree->SetBranchStatus("type", 1);
+    tree->SetBranchStatus("column", 1);
+    tree->SetBranchStatus("pixel", 1);
+    tree->SetBranchAddress("type", &type);
+    tree->SetBranchAddress("column", &column);
+    tree->SetBranchAddress("pixel", &pixel);
+    if (has_spill) {
+      tree->SetBranchStatus("spill", 1);
+      tree->SetBranchAddress("spill", &spill);
+    }
+    if (has_channel) {
+      tree->SetBranchStatus("channel", 1);
+      tree->SetBranchAddress("channel", &channel);
+    }
+
+    const Long64_t entries = tree->GetEntries();
+    for (Long64_t i = 0; i < entries; ++i) {
+      tree->GetEntry(i);
+      if (!has_spill && type == 15) {
+        ++current_spill;
+        continue;
+      }
+      if (type != 1) {
+        continue;
+      }
+      const int ch = has_channel ? channel : column * 4 + pixel;
+      if (selected_channels.find(ch) == selected_channels.end()) {
+        continue;
+      }
+      const int hit_spill = has_spill ? spill : current_spill;
+      if (spill_range.Pass(hit_spill)) {
+        bounds.Add(hit_spill);
+      }
+    }
+  }
+  return bounds;
+}
+
 struct ChannelSummary {
   Stats dt;
   Stats tot;
@@ -618,24 +1131,33 @@ struct TimewalkCorrection {
   double p2 = 0.0;
   double p3 = 1.0;
   double p4 = 0.0;
+  double baseline = 0.0;
   FitRange fit_range;
+
+  double EvalNs(double tot) const
+  {
+    if (!std::isfinite(tot)) {
+      return 0.0;
+    }
+    if (model == TimewalkFitModel::LinExpPlateau) {
+      if (tot <= p2 || p3 <= 0.0) {
+        return p0 + p1 * tot;
+      }
+      return p4 + (p0 + p1 * p2 - p4) * std::exp(-(tot - p2) / p3);
+    }
+    if (model == TimewalkFitModel::Pol1Plateau) {
+      return p0 + p1 * std::min(tot, p2);
+    }
+    return p0 + p1 * tot;
+  }
 
   double CorrectionNs(double tot) const
   {
     if (!valid || !std::isfinite(tot)) {
       return 0.0;
     }
-    double value = 0.0;
-    if (model == TimewalkFitModel::LinExpPlateau) {
-      if (tot <= p2 || p3 <= 0.0) {
-        value = p0 + p1 * tot;
-      } else {
-        value = p4 + (p0 + p1 * p2 - p4) * std::exp(-(tot - p2) / p3);
-      }
-    } else {
-      value = p0 + p1 * tot;
-    }
-    if (!std::isfinite(value) || value <= 0.0) {
+    const double value = EvalNs(tot) - baseline;
+    if (!std::isfinite(value)) {
       return 0.0;
     }
     return value;
@@ -647,8 +1169,6 @@ struct RunResult {
   std::map<int, ChannelSummary> channels;
   std::vector<std::unique_ptr<TH1D>> histograms;
   std::vector<std::unique_ptr<TH2D>> histograms2d;
-  std::vector<StoredSensorHit> trigger_hits;
-  std::vector<StoredSensorHit> sensor_hits;
   long long hits_read = 0;
   long long leading_hits = 0;
   long long trigger22_raw_candidates = 0;
@@ -682,6 +1202,54 @@ TH2D *MakeHist2D(std::vector<std::unique_ptr<TH2D>> &owner,
                  double ymax)
 {
   auto hist = std::make_unique<TH2D>(name.c_str(), title.c_str(), xbins, xmin, xmax, ybins, ymin, ymax);
+  hist->SetDirectory(nullptr);
+  TH2D *ptr = hist.get();
+  owner.push_back(std::move(hist));
+  return ptr;
+}
+
+std::vector<double> MakeLogBins(int bins, double xmin, double xmax)
+{
+  bins = std::max(1, bins);
+  xmin = std::max(xmin, 1e-6);
+  xmax = std::max(xmax, xmin * 10.0);
+  std::vector<double> edges(static_cast<size_t>(bins) + 1);
+  const double log_min = std::log10(xmin);
+  const double log_max = std::log10(xmax);
+  for (int i = 0; i <= bins; ++i) {
+    const double fraction = static_cast<double>(i) / static_cast<double>(bins);
+    edges[static_cast<size_t>(i)] = std::pow(10.0, log_min + fraction * (log_max - log_min));
+  }
+  return edges;
+}
+
+TH1D *MakeLogHist(std::vector<std::unique_ptr<TH1D>> &owner,
+                  const std::string &name,
+                  const std::string &title,
+                  int bins,
+                  double xmin,
+                  double xmax)
+{
+  const auto edges = MakeLogBins(bins, xmin, xmax);
+  auto hist = std::make_unique<TH1D>(name.c_str(), title.c_str(), bins, edges.data());
+  hist->SetDirectory(nullptr);
+  TH1D *ptr = hist.get();
+  owner.push_back(std::move(hist));
+  return ptr;
+}
+
+TH2D *MakeLogXHist2D(std::vector<std::unique_ptr<TH2D>> &owner,
+                     const std::string &name,
+                     const std::string &title,
+                     int xbins,
+                     double xmin,
+                     double xmax,
+                     int ybins,
+                     double ymin,
+                     double ymax)
+{
+  const auto xedges = MakeLogBins(xbins, xmin, xmax);
+  auto hist = std::make_unique<TH2D>(name.c_str(), title.c_str(), xbins, xedges.data(), ybins, ymin, ymax);
   hist->SetDirectory(nullptr);
   TH2D *ptr = hist.get();
   owner.push_back(std::move(hist));
@@ -1015,7 +1583,18 @@ std::unique_ptr<TF1> FitTimewalkProfile(TProfile *profile,
   const double xmax = fit_range.enabled ? fit_range.xmax : profile->GetXaxis()->GetBinUpEdge(last_bin);
   std::unique_ptr<TF1> fit;
   std::string fit_options = "QNR";
-  if (fit_model == TimewalkFitModel::LinExpPlateau) {
+  if (fit_model == TimewalkFitModel::Pol1Plateau) {
+    fit = std::make_unique<TF1>((std::string(profile->GetName()) + "_pol1_plateau").c_str(),
+                                "x<[2] ? [0]+[1]*x : [0]+[1]*[2]",
+                                xmin,
+                                xmax);
+    auto seed = EstimateLinExpPlateauSeed(profile, xmin, xmax);
+    fit->SetParameters(seed.p0, seed.p1, seed.x0);
+    fit->SetParNames("p0", "p1", "x0");
+    fit->SetParLimits(2, xmin + 0.1, xmax - 0.1);
+    // The profile has tiny statistical errors in highly populated bins; equal-bin weights better follow the shape.
+    fit_options = "QNRW";
+  } else if (fit_model == TimewalkFitModel::LinExpPlateau) {
     fit = std::make_unique<TF1>((std::string(profile->GetName()) + "_lin_exp_plateau").c_str(),
                                 "x<[2] ? [0]+[1]*x : [4]+([0]+[1]*[2]-[4])*exp(-(x-[2])/[3])",
                                 xmin,
@@ -1166,14 +1745,26 @@ std::map<int, TimewalkCorrection> BuildTimewalkCorrections(const std::vector<Run
     correction.valid = true;
     correction.p0 = fit->GetParameter(0);
     correction.p1 = fit->GetParameter(1);
-    if (fit_model == TimewalkFitModel::LinExpPlateau && fit->GetNpar() >= 5) {
+    if (fit_model == TimewalkFitModel::Pol1Plateau && fit->GetNpar() >= 3) {
+      correction.p2 = fit->GetParameter(2);
+      correction.p3 = 0.0;
+      correction.p4 = correction.EvalNs(correction.p2);
+      correction.baseline = correction.p4;
+    } else if (fit_model == TimewalkFitModel::LinExpPlateau && fit->GetNpar() >= 5) {
       correction.p2 = fit->GetParameter(2);
       correction.p3 = fit->GetParameter(3);
       correction.p4 = fit->GetParameter(4);
+      correction.baseline = correction.p4;
+    } else {
+      const double baseline_tot = correction.fit_range.enabled ? correction.fit_range.xmax : accumulated->GetXaxis()->GetXmax();
+      correction.baseline = correction.EvalNs(baseline_tot);
     }
     corrections[ch] = correction;
     std::cout << "Timewalk correction ch" << ch << " model=" << TimewalkFitModelName(fit_model) << ": ";
-    if (fit_model == TimewalkFitModel::LinExpPlateau) {
+    if (fit_model == TimewalkFitModel::Pol1Plateau) {
+      std::cout << "linear p0=" << correction.p0 << " p1=" << correction.p1 << ", x0=" << correction.p2
+                << ", plateau=" << correction.p4;
+    } else if (fit_model == TimewalkFitModel::LinExpPlateau) {
       std::cout << "linear p0=" << correction.p0 << " p1=" << correction.p1 << ", x0=" << correction.p2
                 << ", tau=" << correction.p3 << ", plateau=" << correction.p4;
     } else {
@@ -1182,18 +1773,9 @@ std::map<int, TimewalkCorrection> BuildTimewalkCorrections(const std::vector<Run
     if (correction.fit_range.enabled) {
       std::cout << " fitted in ToT [" << correction.fit_range.xmin << ", " << correction.fit_range.xmax << "] ns";
     }
-    std::cout << "; applied correction is max(f(ToT), 0)" << std::endl;
+    std::cout << "; applied correction is f(ToT)-baseline=" << correction.baseline << " ns" << std::endl;
   }
   return corrections;
-}
-
-double CorrectedSensorTime(const StoredSensorHit &hit, const std::map<int, TimewalkCorrection> &corrections)
-{
-  auto it = corrections.find(hit.channel);
-  if (it == corrections.end()) {
-    return hit.time_ns;
-  }
-  return hit.time_ns - it->second.CorrectionNs(hit.tot_ns);
 }
 
 bool FindMatchedReference(double sensor_time,
@@ -1244,28 +1826,63 @@ bool FindMatchedReference(double sensor_time,
   return dt >= 0.0 && dt <= match_window_ns;
 }
 
-bool ComputeMatchedDt(double sensor_time,
-                      const std::vector<StoredSensorHit> &references,
-                      double match_window_ns,
-                      bool signed_dt,
-                      double &dt)
-{
-  size_t reference_index = 0;
-  return FindMatchedReference(sensor_time, references, match_window_ns, signed_dt, reference_index, dt);
-}
-
 struct MatchedCorrectedHit {
   double time_ns = 0.0;
   double tot_ns = 0.0;
   double dt_to_trigger_ns = 0.0;
 };
 
+struct EventMedianCandidate {
+  size_t index = 0;
+  int channel = -1;
+  int tdc = -1;
+  double time_ns = 0.0;
+};
+
+struct EventMedianMatch {
+  size_t index = 0;
+  double dt_ns = 0.0;
+  int event_id = 0;
+};
+
+void CleanTriggerCandidates(std::vector<size_t> &indices,
+                            const std::vector<Hit> &hits,
+                            double trigger_deadtime_ns,
+                            double trigger_period_ns,
+                            double trigger_period_tolerance_ns);
+
+std::vector<EventMedianMatch> BuildEventMedianMatches(const std::vector<Hit> &hits,
+                                                      const std::unordered_set<int> &selected_channels,
+                                                      const TdcSelection &tdc_selection,
+                                                      bool require_valid_tot,
+                                                      const std::map<int, TotWindow> &channel_tot_windows,
+                                                      int min_channels,
+                                                      double match_window_ns);
+
 void BuildCorrectedTimewalkAndCoincidencePlots(std::vector<RunResult> &results,
                                                const std::vector<int> &sensor_channels,
+                                               int trigger_channel,
                                                const std::map<int, TimewalkCorrection> &corrections,
                                                double match_window_ns,
+                                               double trigger_deadtime_ns,
+                                               double trigger_period_ns,
+                                               double trigger_period_tolerance_ns,
                                                double max_duration_ns,
+                                               double clock_mhz,
+                                               const analysis_time::FineCalib &fine_calib,
+                                               const analysis_time::ChannelTdcOffsetCalib &tdc_offset_calib,
+                                               const analysis_time::ChannelCalib &chan_calib,
+                                               TimeReferenceMode reference_mode,
+                                               int event_reference_min_channels,
+                                               bool use_fine,
+                                               int fine_cut,
+                                               bool require_valid_tot,
                                                bool signed_dt,
+                                               const std::map<int, DtTotCut> &dt_tot_cuts,
+                                               const TotWindow &trigger_tot_window,
+                                               const SpillRange &spill_range,
+                                               const std::map<int, TotWindow> &channel_tot_windows,
+                                               const TdcSelection &tdc_selection,
                                                std::vector<std::unique_ptr<TH2D>> &corrected_accumulated_histograms)
 {
   if (sensor_channels.empty()) {
@@ -1275,9 +1892,11 @@ void BuildCorrectedTimewalkAndCoincidencePlots(std::vector<RunResult> &results,
   const double tot_max = std::max(1.0, max_duration_ns);
   std::map<int, TH2D *> h_dt_corr_vs_tot_accum;
   for (int ch : sensor_channels) {
+    const std::string reference_label =
+        reference_mode == TimeReferenceMode::EventMedian ? "event median" : "clean trigger";
     std::ostringstream title;
-    title << "Accumulated corrected #Deltat vs ToT ch" << ch << " to clean trigger"
-          << ";ToT [ns];t_{ch,corr} - t_{trigger} [ns];entries";
+    title << "Accumulated corrected #Deltat vs ToT ch" << ch << " to " << reference_label
+          << ";ToT [ns];#Deltat corrected [ns];entries";
     h_dt_corr_vs_tot_accum[ch] = MakeHist2D(corrected_accumulated_histograms,
                                             "h_dt_corr_vs_tot_accum_ch" + std::to_string(ch),
                                             title.str(),
@@ -1286,79 +1905,240 @@ void BuildCorrectedTimewalkAndCoincidencePlots(std::vector<RunResult> &results,
                                             tot_max,
                                             400,
                                             kCorrectedTimewalkDtMinNs,
-                                            kCorrectedTimewalkDtMaxNs);
+	                                            kCorrectedTimewalkDtMaxNs);
   }
 
   for (auto &result : results) {
     const std::string safe_label = SafeName(result.config.label);
-    std::map<int, std::vector<StoredSensorHit>> triggers_by_spill;
-    for (const auto &trigger : result.trigger_hits) {
-      triggers_by_spill[trigger.spill].push_back(trigger);
-    }
-    for (auto &kv : triggers_by_spill) {
-      std::sort(kv.second.begin(), kv.second.end(), [](const StoredSensorHit &a, const StoredSensorHit &b) {
-        return a.time_ns < b.time_ns;
-      });
-    }
-
-    std::map<int, std::map<int, std::vector<StoredSensorHit>>> sensors_by_channel_spill;
-    for (const auto &hit : result.sensor_hits) {
-      StoredSensorHit corrected = hit;
-      corrected.time_ns = CorrectedSensorTime(hit, corrections);
-      sensors_by_channel_spill[hit.channel][hit.spill].push_back(corrected);
-    }
-    for (auto &by_channel : sensors_by_channel_spill) {
-      for (auto &by_spill : by_channel.second) {
-        std::sort(by_spill.second.begin(), by_spill.second.end(), [](const StoredSensorHit &a, const StoredSensorHit &b) {
-          return a.time_ns < b.time_ns;
-        });
-      }
+    TH1D *corrected_coincidence_hist = nullptr;
+    int ch_a = -1;
+    int ch_b = -1;
+    if (sensor_channels.size() >= 2) {
+      ch_a = sensor_channels[0];
+      ch_b = sensor_channels[1];
+      std::ostringstream title;
+      title << result.config.label << " I=" << result.config.intensity << " corrected coincidence ch" << ch_a
+            << "-ch" << ch_b << ";t_{" << ch_a << ",corr} - t_{" << ch_b << ",corr} [ns];entries";
+      corrected_coincidence_hist =
+          MakeHist(result.histograms,
+                   "h_dt_corr_ch" + std::to_string(ch_a) + "_ch" + std::to_string(ch_b) + "_" + safe_label,
+                   title.str(),
+                   240,
+                   kCorrectedCoincidenceDtMinNs,
+                   kCorrectedCoincidenceDtMaxNs);
     }
 
-    std::map<int, std::map<size_t, std::map<int, std::vector<MatchedCorrectedHit>>>> matched_by_spill_trigger_channel;
-    for (int ch : sensor_channels) {
-      auto channel_it = sensors_by_channel_spill.find(ch);
-      if (channel_it == sensors_by_channel_spill.end()) {
-        continue;
-      }
-      for (const auto &spill_entry : channel_it->second) {
-        auto trigger_it = triggers_by_spill.find(spill_entry.first);
-        if (trigger_it == triggers_by_spill.end() || trigger_it->second.empty()) {
-          continue;
-        }
-        const auto &triggers = trigger_it->second;
-        for (const auto &hit : spill_entry.second) {
-          size_t trigger_index = 0;
-          double dt = std::numeric_limits<double>::quiet_NaN();
-          if (!FindMatchedReference(hit.time_ns, triggers, match_window_ns, signed_dt, trigger_index, dt)) {
-            continue;
-          }
-          matched_by_spill_trigger_channel[hit.spill][trigger_index][ch].push_back(
-              {hit.time_ns, hit.tot_ns, dt});
-          if (dt >= kCorrectedTimewalkDtMinNs && dt <= kCorrectedTimewalkDtMaxNs) {
-            h_dt_corr_vs_tot_accum[ch]->Fill(hit.tot_ns, dt);
-          }
-        }
-      }
-    }
-
-    if (sensor_channels.size() < 2) {
+    auto input = analysis_io::ResolveInputSpec(result.config.input_path);
+    if (input.files.empty()) {
       continue;
     }
-    const int ch_a = sensor_channels[0];
-    const int ch_b = sensor_channels[1];
-    std::ostringstream title;
-    title << result.config.label << " I=" << result.config.intensity << " corrected coincidence ch" << ch_a
-          << "-ch" << ch_b << ";t_{" << ch_a << ",corr} - t_{" << ch_b << ",corr} [ns];entries";
-    TH1D *hist = MakeHist(result.histograms,
-                          "h_dt_corr_ch" + std::to_string(ch_a) + "_ch" + std::to_string(ch_b) + "_" + safe_label,
-                          title.str(),
-                          240,
-                          kCorrectedCoincidenceDtMinNs,
-                          kCorrectedCoincidenceDtMaxNs);
 
-    for (const auto &spill_entry : matched_by_spill_trigger_channel) {
-      for (const auto &trigger_entry : spill_entry.second) {
+    std::unordered_set<int> selected_channels(sensor_channels.begin(), sensor_channels.end());
+    if (reference_mode == TimeReferenceMode::Trigger) {
+      selected_channels.insert(trigger_channel);
+    }
+    const std::unordered_set<int> no_edge_channels;
+    const double tick_ns = analysis_time::TickNs(clock_mhz);
+
+    auto process_spill = [&](std::vector<Hit> &hits) {
+      if (hits.empty()) {
+        return;
+      }
+      ComputeTot(hits, max_duration_ns);
+
+      for (auto &hit : hits) {
+        if (selected_channels.find(hit.channel) == selected_channels.end() || !hit.leading ||
+            !tdc_selection.KeepLeadingHit(hit.channel, hit.tdc)) {
+          continue;
+        }
+        if (chan_calib.loaded && hit.tot_ns > 0.0) {
+          hit.time_ns -= chan_calib.CorrectionNs(hit.channel, hit.tot_ns);
+        }
+      }
+
+      if (reference_mode == TimeReferenceMode::EventMedian) {
+        for (auto &hit : hits) {
+          if (selected_channels.find(hit.channel) == selected_channels.end() || !hit.leading ||
+              !tdc_selection.KeepLeadingHit(hit.channel, hit.tdc) || hit.tot_ns <= 0.0) {
+            continue;
+          }
+          auto correction_it = corrections.find(hit.channel);
+          if (correction_it != corrections.end()) {
+            hit.time_ns -= correction_it->second.CorrectionNs(hit.tot_ns);
+          }
+        }
+
+        auto matches = BuildEventMedianMatches(hits,
+                                               selected_channels,
+                                               tdc_selection,
+                                               require_valid_tot,
+                                               channel_tot_windows,
+                                               event_reference_min_channels,
+                                               match_window_ns);
+        std::map<int, std::map<int, std::vector<MatchedCorrectedHit>>> matched_by_event_channel;
+        for (const auto &match : matches) {
+          const auto &hit = hits[match.index];
+          if (hit.tot_ns <= 0.0) {
+            continue;
+          }
+          const TotWindow channel_tot_window = ChannelTotWindowForChannel(channel_tot_windows, hit.channel);
+          if (!channel_tot_window.Pass(hit.tot_ns)) {
+            continue;
+          }
+          if (match.dt_ns >= kCorrectedTimewalkDtMinNs && match.dt_ns <= kCorrectedTimewalkDtMaxNs &&
+              h_dt_corr_vs_tot_accum.count(hit.channel) > 0) {
+            h_dt_corr_vs_tot_accum[hit.channel]->Fill(hit.tot_ns, match.dt_ns);
+          }
+          matched_by_event_channel[match.event_id][hit.channel].push_back({hit.time_ns, hit.tot_ns, match.dt_ns});
+        }
+
+        if (!corrected_coincidence_hist || ch_a < 0 || ch_b < 0) {
+          return;
+        }
+        for (const auto &event_entry : matched_by_event_channel) {
+          const auto &by_channel = event_entry.second;
+          auto hits_a_it = by_channel.find(ch_a);
+          auto hits_b_it = by_channel.find(ch_b);
+          if (hits_a_it == by_channel.end() || hits_b_it == by_channel.end() || hits_a_it->second.empty() ||
+              hits_b_it->second.empty()) {
+            continue;
+          }
+          const auto best_hit = [](const std::vector<MatchedCorrectedHit> &hit_list) {
+            return std::min_element(hit_list.begin(), hit_list.end(), [](const MatchedCorrectedHit &a,
+                                                                         const MatchedCorrectedHit &b) {
+              return std::abs(a.dt_to_trigger_ns) < std::abs(b.dt_to_trigger_ns);
+            });
+          };
+          const auto best_a = best_hit(hits_a_it->second);
+          const auto best_b = best_hit(hits_b_it->second);
+          if (best_a == hits_a_it->second.end() || best_b == hits_b_it->second.end()) {
+            continue;
+          }
+          const double dt_ab = best_a->time_ns - best_b->time_ns;
+          if (dt_ab >= kCorrectedCoincidenceDtMinNs && dt_ab <= kCorrectedCoincidenceDtMaxNs) {
+            corrected_coincidence_hist->Fill(dt_ab);
+          }
+        }
+        return;
+      }
+
+      std::vector<size_t> trigger_indices;
+      std::map<int, std::vector<size_t>> sensor_by_channel;
+      for (size_t i = 0; i < hits.size(); ++i) {
+        const Hit &hit = hits[i];
+        if (selected_channels.find(hit.channel) == selected_channels.end() || !hit.leading ||
+            !tdc_selection.KeepLeadingHit(hit.channel, hit.tdc)) {
+          continue;
+        }
+        if (require_valid_tot && hit.tot_ns <= 0.0) {
+          continue;
+        }
+        const TotWindow channel_tot_window = ChannelTotWindowForChannel(channel_tot_windows, hit.channel);
+        if (!channel_tot_window.Pass(hit.tot_ns)) {
+          continue;
+        }
+        if (hit.channel == trigger_channel) {
+          if (trigger_tot_window.Pass(hit.tot_ns)) {
+            trigger_indices.push_back(i);
+          }
+        } else {
+          sensor_by_channel[hit.channel].push_back(i);
+        }
+      }
+
+      CleanTriggerCandidates(trigger_indices, hits, trigger_deadtime_ns, trigger_period_ns, trigger_period_tolerance_ns);
+
+      std::vector<StoredSensorHit> triggers;
+      triggers.reserve(trigger_indices.size());
+      for (size_t idx : trigger_indices) {
+        if (hits[idx].tot_ns > 0.0) {
+          triggers.push_back({trigger_channel, hits[idx].spill, hits[idx].time_ns, hits[idx].tot_ns});
+        }
+      }
+      if (triggers.empty()) {
+        return;
+      }
+
+      std::map<size_t, std::map<int, std::vector<MatchedCorrectedHit>>> matched_by_trigger_channel;
+      for (int ch : sensor_channels) {
+        auto channel_it = sensor_by_channel.find(ch);
+        if (channel_it == sensor_by_channel.end()) {
+          continue;
+        }
+        auto &sensor_indices = channel_it->second;
+        std::sort(sensor_indices.begin(),
+                  sensor_indices.end(),
+                  [&](size_t a, size_t b) { return hits[a].time_ns < hits[b].time_ns; });
+
+        for (size_t sensor_idx : sensor_indices) {
+          const double sensor_time = hits[sensor_idx].time_ns;
+          auto upper = std::upper_bound(trigger_indices.begin(),
+                                        trigger_indices.end(),
+                                        sensor_time,
+                                        [&](double value, size_t idx) { return value < hits[idx].time_ns; });
+
+          double raw_dt = std::numeric_limits<double>::quiet_NaN();
+          if (signed_dt) {
+            bool found = false;
+            double best_abs_dt = std::numeric_limits<double>::max();
+            if (upper != trigger_indices.end()) {
+              const double candidate_dt = sensor_time - hits[*upper].time_ns;
+              best_abs_dt = std::abs(candidate_dt);
+              raw_dt = candidate_dt;
+              found = true;
+            }
+            if (upper != trigger_indices.begin()) {
+              const double candidate_dt = sensor_time - hits[*std::prev(upper)].time_ns;
+              const double abs_dt = std::abs(candidate_dt);
+              if (!found || abs_dt < best_abs_dt) {
+                best_abs_dt = abs_dt;
+                raw_dt = candidate_dt;
+                found = true;
+              }
+            }
+            if (!found || best_abs_dt > match_window_ns) {
+              continue;
+            }
+          } else {
+            if (upper == trigger_indices.begin()) {
+              continue;
+            }
+            const size_t best_idx = *std::prev(upper);
+            raw_dt = sensor_time - hits[best_idx].time_ns;
+            if (raw_dt < 0.0 || raw_dt > match_window_ns) {
+              continue;
+            }
+          }
+
+          const double sensor_tot = hits[sensor_idx].tot_ns;
+          if (sensor_tot <= 0.0) {
+            continue;
+          }
+          const DtTotCut cut = DtTotCutForChannel(dt_tot_cuts, ch);
+          if (!cut.Pass(sensor_tot, raw_dt)) {
+            continue;
+          }
+
+          auto correction_it = corrections.find(ch);
+          const double correction_ns =
+              correction_it != corrections.end() ? correction_it->second.CorrectionNs(sensor_tot) : 0.0;
+          StoredSensorHit corrected{ch, hits[sensor_idx].spill, hits[sensor_idx].time_ns - correction_ns, sensor_tot};
+          size_t trigger_index = 0;
+          double dt = std::numeric_limits<double>::quiet_NaN();
+          if (!FindMatchedReference(corrected.time_ns, triggers, match_window_ns, signed_dt, trigger_index, dt)) {
+            continue;
+          }
+          matched_by_trigger_channel[trigger_index][ch].push_back({corrected.time_ns, corrected.tot_ns, dt});
+          if (dt >= kCorrectedTimewalkDtMinNs && dt <= kCorrectedTimewalkDtMaxNs) {
+            h_dt_corr_vs_tot_accum[ch]->Fill(corrected.tot_ns, dt);
+          }
+        }
+      }
+
+      if (!corrected_coincidence_hist || ch_a < 0 || ch_b < 0) {
+        return;
+      }
+      for (const auto &trigger_entry : matched_by_trigger_channel) {
         const auto &by_channel = trigger_entry.second;
         auto hits_a_it = by_channel.find(ch_a);
         auto hits_b_it = by_channel.find(ch_b);
@@ -1366,9 +2146,9 @@ void BuildCorrectedTimewalkAndCoincidencePlots(std::vector<RunResult> &results,
             hits_b_it->second.empty()) {
           continue;
         }
-        const auto best_hit = [](const std::vector<MatchedCorrectedHit> &hits) {
-          return std::min_element(hits.begin(), hits.end(), [](const MatchedCorrectedHit &a,
-                                                               const MatchedCorrectedHit &b) {
+        const auto best_hit = [](const std::vector<MatchedCorrectedHit> &hit_list) {
+          return std::min_element(hit_list.begin(), hit_list.end(), [](const MatchedCorrectedHit &a,
+                                                                       const MatchedCorrectedHit &b) {
             return std::abs(a.dt_to_trigger_ns) < std::abs(b.dt_to_trigger_ns);
           });
         };
@@ -1379,9 +2159,66 @@ void BuildCorrectedTimewalkAndCoincidencePlots(std::vector<RunResult> &results,
         }
         const double dt_ab = best_a->time_ns - best_b->time_ns;
         if (dt_ab >= kCorrectedCoincidenceDtMinNs && dt_ab <= kCorrectedCoincidenceDtMaxNs) {
-          hist->Fill(dt_ab);
+          corrected_coincidence_hist->Fill(dt_ab);
         }
       }
+    };
+
+    std::vector<TreeCursor> cursors;
+    cursors.reserve(input.files.size());
+    for (const auto &file : input.files) {
+      TreeCursor cursor;
+      if (!OpenTreeCursor(file, input.tree_name, cursor)) {
+        continue;
+      }
+      AdvanceCursor(cursor,
+                    selected_channels,
+                    no_edge_channels,
+                    tdc_selection,
+                    fine_calib,
+                    tdc_offset_calib,
+                    tick_ns,
+                    use_fine,
+                    fine_cut,
+                    spill_range);
+      cursors.push_back(std::move(cursor));
+      // ROOT stores branch addresses as raw pointers; moving the cursor changes those addresses.
+      BindTreeCursorBranches(cursors.back());
+    }
+
+    while (true) {
+      bool found = false;
+      int min_pending_spill = 0;
+      for (const auto &cursor : cursors) {
+        if (!cursor.has_pending) {
+          continue;
+        }
+        if (!found || cursor.pending.spill < min_pending_spill) {
+          min_pending_spill = cursor.pending.spill;
+          found = true;
+        }
+      }
+      if (!found) {
+        break;
+      }
+
+      std::vector<Hit> spill_hits;
+      for (auto &cursor : cursors) {
+        while (cursor.has_pending && cursor.pending.spill == min_pending_spill) {
+          spill_hits.push_back(cursor.pending);
+          AdvanceCursor(cursor,
+                        selected_channels,
+                        no_edge_channels,
+                        tdc_selection,
+                        fine_calib,
+                        tdc_offset_calib,
+                        tick_ns,
+                        use_fine,
+                        fine_cut,
+                        spill_range);
+        }
+      }
+      process_spill(spill_hits);
     }
   }
 }
@@ -1469,11 +2306,138 @@ void DrawDtTotCutLine(const DtTotCut &cut, TH2D *hist)
   line->Draw("same");
 }
 
+double MedianOf(std::vector<double> values)
+{
+  if (values.empty()) {
+    return std::numeric_limits<double>::quiet_NaN();
+  }
+  std::sort(values.begin(), values.end());
+  const size_t mid = values.size() / 2;
+  if ((values.size() % 2) == 1) {
+    return values[mid];
+  }
+  return 0.5 * (values[mid - 1] + values[mid]);
+}
+
+void ProcessEventMedianCluster(const std::vector<EventMedianCandidate> &cluster,
+                               int min_channels,
+                               int event_id,
+                               std::vector<EventMedianMatch> &matches)
+{
+  if (cluster.empty()) {
+    return;
+  }
+  std::vector<double> all_times;
+  all_times.reserve(cluster.size());
+  for (const auto &entry : cluster) {
+    all_times.push_back(entry.time_ns);
+  }
+  const double preliminary_median = MedianOf(all_times);
+  if (!std::isfinite(preliminary_median)) {
+    return;
+  }
+
+  std::array<bool, kNumAlcorChannels> seen{};
+  std::array<EventMedianCandidate, kNumAlcorChannels> best_by_channel{};
+  for (const auto &entry : cluster) {
+    if (entry.channel < 0 || entry.channel >= kNumAlcorChannels) {
+      continue;
+    }
+    if (!seen[entry.channel] ||
+        std::abs(entry.time_ns - preliminary_median) <
+            std::abs(best_by_channel[entry.channel].time_ns - preliminary_median)) {
+      seen[entry.channel] = true;
+      best_by_channel[entry.channel] = entry;
+    }
+  }
+
+  std::vector<EventMedianCandidate> unique_entries;
+  std::vector<double> unique_times;
+  unique_entries.reserve(cluster.size());
+  unique_times.reserve(cluster.size());
+  for (int ch = 0; ch < kNumAlcorChannels; ++ch) {
+    if (!seen[ch]) {
+      continue;
+    }
+    unique_entries.push_back(best_by_channel[ch]);
+    unique_times.push_back(best_by_channel[ch].time_ns);
+  }
+  if (static_cast<int>(unique_entries.size()) < std::max(1, min_channels)) {
+    return;
+  }
+
+  for (const auto &entry : unique_entries) {
+    std::vector<double> reference_times;
+    reference_times.reserve(unique_entries.size());
+    for (const auto &other : unique_entries) {
+      if (other.channel == entry.channel) {
+        continue;
+      }
+      reference_times.push_back(other.time_ns);
+    }
+    const double reference = reference_times.empty() ? MedianOf(unique_times) : MedianOf(reference_times);
+    if (std::isfinite(reference)) {
+      matches.push_back({entry.index, entry.time_ns - reference, event_id});
+    }
+  }
+}
+
+std::vector<EventMedianMatch> BuildEventMedianMatches(const std::vector<Hit> &hits,
+                                                      const std::unordered_set<int> &selected_channels,
+                                                      const TdcSelection &tdc_selection,
+                                                      bool require_valid_tot,
+                                                      const std::map<int, TotWindow> &channel_tot_windows,
+                                                      int min_channels,
+                                                      double match_window_ns)
+{
+  (void)require_valid_tot;
+  (void)channel_tot_windows;
+  std::array<std::vector<EventMedianCandidate>, analysis_time::kTdcPerPixel> by_tdc;
+  for (size_t i = 0; i < hits.size(); ++i) {
+    const auto &hit = hits[i];
+    if (selected_channels.find(hit.channel) == selected_channels.end() || !hit.leading ||
+        !tdc_selection.KeepLeadingHit(hit.channel, hit.tdc)) {
+      continue;
+    }
+    if (hit.tdc < 0 || hit.tdc >= analysis_time::kTdcPerPixel) {
+      continue;
+    }
+    by_tdc[hit.tdc].push_back({i, hit.channel, hit.tdc, hit.time_ns});
+  }
+
+  std::vector<EventMedianMatch> matches;
+  int event_id = 0;
+  for (auto &entries : by_tdc) {
+    if (entries.empty()) {
+      continue;
+    }
+    std::sort(entries.begin(), entries.end(), [](const EventMedianCandidate &a, const EventMedianCandidate &b) {
+      return a.time_ns < b.time_ns;
+    });
+    std::vector<EventMedianCandidate> cluster;
+    cluster.reserve(kNumAlcorChannels);
+    double cluster_seed = entries.front().time_ns;
+    for (const auto &entry : entries) {
+      if (!cluster.empty() && std::abs(entry.time_ns - cluster_seed) > match_window_ns) {
+        ProcessEventMedianCluster(cluster, min_channels, event_id++, matches);
+        cluster.clear();
+        cluster_seed = entry.time_ns;
+      }
+      cluster.push_back(entry);
+    }
+    ProcessEventMedianCluster(cluster, min_channels, event_id++, matches);
+  }
+  return matches;
+}
+
 RunResult AnalyzeRun(const RunConfig &run,
                      const std::vector<int> &sensor_channels,
                      int trigger_channel,
                      const analysis_time::FineCalib &fine_calib,
+                     const analysis_time::ChannelTdcOffsetCalib &tdc_offset_calib,
                      const analysis_time::ChannelCalib &chan_calib,
+                     TimeReferenceMode reference_mode,
+                     int event_reference_min_channels,
                      double match_window_ns,
                      double trigger_deadtime_ns,
                      double trigger_period_ns,
@@ -1488,6 +2452,7 @@ RunResult AnalyzeRun(const RunConfig &run,
                      const TotWindow &trigger_tot_window,
                      const SpillRange &spill_range,
                      const std::map<int, TotWindow> &channel_tot_windows,
+                     const TdcSelection &tdc_selection,
                      int edge_spill,
                      const std::vector<int> &edge_channels,
                      double edge_phase_period_ns,
@@ -1497,7 +2462,9 @@ RunResult AnalyzeRun(const RunConfig &run,
   result.config = run;
 
   std::unordered_set<int> selected_channels(sensor_channels.begin(), sensor_channels.end());
-  selected_channels.insert(trigger_channel);
+  if (reference_mode == TimeReferenceMode::Trigger) {
+    selected_channels.insert(trigger_channel);
+  }
   std::unordered_set<int> edge_channel_set(edge_channels.begin(), edge_channels.end());
   int selected_edge_spill = edge_spill;
 
@@ -1516,9 +2483,14 @@ RunResult AnalyzeRun(const RunConfig &run,
   std::map<int, TH2D *> h_raw_dt_vs_spill;
   std::map<int, TH2D *> h_rejected_dt_vs_spill;
   for (int ch : sensor_channels) {
+    const std::string reference_label =
+        reference_mode == TimeReferenceMode::EventMedian ? "event median" : "clean trigger ch" + std::to_string(trigger_channel);
     std::ostringstream title;
     title << run.label << " I=" << run.intensity << " ch" << ch
-          << (signed_dt ? " - nearest clean trigger ch" : " - previous clean trigger ch") << trigger_channel
+          << (reference_mode == TimeReferenceMode::EventMedian
+                  ? " - event median"
+                  : (signed_dt ? " - nearest clean trigger ch" : " - previous clean trigger ch") +
+                        std::to_string(trigger_channel))
           << ";t_{ch} - t_{trigger} [ns];entries";
     h_dt[ch] = MakeHist(result.histograms,
                         "h_dt_" + safe_label + "_ch" + std::to_string(ch),
@@ -1528,11 +2500,11 @@ RunResult AnalyzeRun(const RunConfig &run,
                         match_window_ns);
 
     std::ostringstream corr_title;
-    corr_title << run.label << " I=" << run.intensity << " ch" << ch << " #Deltat vs ToT to trigger ch"
-               << trigger_channel << ";ToT [ns];t_{ch} - t_{trigger} [ns];entries";
+    corr_title << run.label << " I=" << run.intensity << " ch" << ch << " #Deltat vs ToT to "
+               << reference_label << ";ToT [ns];#Deltat [ns];entries";
     std::ostringstream raw_corr_title;
-    raw_corr_title << run.label << " I=" << run.intensity << " ch" << ch << " raw #Deltat vs ToT to trigger ch"
-                   << trigger_channel << ";ToT [ns];t_{ch} - t_{trigger} [ns];entries";
+    raw_corr_title << run.label << " I=" << run.intensity << " ch" << ch << " raw #Deltat vs ToT to "
+                   << reference_label << ";ToT [ns];#Deltat [ns];entries";
     std::ostringstream rejected_corr_title;
     rejected_corr_title << run.label << " I=" << run.intensity << " ch" << ch
                         << " rejected by #Deltat-ToT cut;ToT [ns];t_{ch} - t_{trigger} [ns];entries";
@@ -1565,7 +2537,9 @@ RunResult AnalyzeRun(const RunConfig &run,
                                           timewalk_dt_max);
   }
   std::vector<int> tot_channels = sensor_channels;
-  tot_channels.push_back(trigger_channel);
+  if (reference_mode == TimeReferenceMode::Trigger) {
+    tot_channels.push_back(trigger_channel);
+  }
   std::sort(tot_channels.begin(), tot_channels.end());
   tot_channels.erase(std::unique(tot_channels.begin(), tot_channels.end()), tot_channels.end());
   for (int ch : tot_channels) {
@@ -1585,124 +2559,9 @@ RunResult AnalyzeRun(const RunConfig &run,
     return result;
   }
 
-  TChain chain(input.tree_name.c_str());
-  for (const auto &file : input.files) {
-    chain.Add(file.c_str());
-  }
-
-  int device = 0;
-  int fifo = 0;
-  int type = 0;
-  int counter = 0;
-  int spill = 0;
-  int column = 0;
-  int pixel = 0;
-  int tdc = 0;
-  int rollover = 0;
-  int coarse = 0;
-  int fine = 0;
-
-  const bool has_device = chain.GetBranch("device") != nullptr;
-  const bool has_counter = chain.GetBranch("counter") != nullptr;
-  const bool has_spill = chain.GetBranch("spill") != nullptr;
-  if (has_device) {
-    chain.SetBranchAddress("device", &device);
-  }
-  chain.SetBranchAddress("fifo", &fifo);
-  chain.SetBranchAddress("type", &type);
-  if (has_counter) {
-    chain.SetBranchAddress("counter", &counter);
-  }
-  if (has_spill) {
-    chain.SetBranchAddress("spill", &spill);
-  }
-  chain.SetBranchAddress("column", &column);
-  chain.SetBranchAddress("pixel", &pixel);
-  chain.SetBranchAddress("tdc", &tdc);
-  chain.SetBranchAddress("rollover", &rollover);
-  chain.SetBranchAddress("coarse", &coarse);
-  chain.SetBranchAddress("fine", &fine);
-
-  std::vector<Hit> hits;
-  std::vector<EdgeHit> edge_hits;
-  hits.reserve(static_cast<size_t>(std::min<Long64_t>(chain.GetEntries(), 1000000)));
-  const double tick_ns = analysis_time::TickNs(clock_mhz);
-  const Long64_t entries = chain.GetEntries();
-  for (Long64_t i = 0; i < entries; ++i) {
-    chain.GetEntry(i);
-    if (type != 1) {
-      continue;
-    }
-    const int channel = column * 4 + pixel;
-    if (!IsValidTdcId(tdc)) {
-      continue;
-    }
-    const int tdc_index = analysis_time::TdcIndex(fifo, column, pixel, tdc);
-    if (!analysis_time::PassFineCut(fine_calib, fine, tdc_index, fine_cut)) {
-      continue;
-    }
-    const int hit_spill = has_spill ? spill : 0;
-    if (!spill_range.Pass(hit_spill)) {
-      continue;
-    }
-    if (!edge_channel_set.empty()) {
-      const bool is_edge_channel = edge_channel_set.find(channel) != edge_channel_set.end();
-      if (selected_edge_spill < 0 && is_edge_channel) {
-        selected_edge_spill = hit_spill;
-      }
-      if (is_edge_channel && hit_spill == selected_edge_spill) {
-        edge_hits.push_back({channel,
-                             hit_spill,
-                             IsLeadingTdc(tdc),
-                             analysis_time::TimeNsFromTick(
-                                 fine_calib, analysis_time::TimeTick(rollover, coarse), fine, tdc_index, tick_ns, use_fine)});
-      }
-    }
-    Hit hit;
-    if (selected_channels.find(channel) == selected_channels.end()) {
-      continue;
-    }
-    hit.channel = channel;
-    hit.spill = hit_spill;
-    hit.fifo = fifo;
-    hit.column = column;
-    hit.pixel = pixel;
-    hit.tdc = tdc;
-    hit.fine = fine;
-    hit.time_tick = analysis_time::TimeTick(rollover, coarse);
-    hit.time_ns_raw =
-        analysis_time::TimeNsFromTick(fine_calib, hit.time_tick, fine, tdc_index, tick_ns, use_fine);
-    hit.time_ns = hit.time_ns_raw;
-    hit.leading = IsLeadingTdc(tdc);
-    hits.push_back(hit);
-  }
-
-  result.hits_read = static_cast<long long>(hits.size());
-  if (selected_edge_spill >= 0) {
-    BuildSingleSpillEdgePlots(result,
-                              edge_hits,
-                              edge_channels,
-                              selected_edge_spill,
-                              trigger_channel,
-                              trigger_period_ns,
-                              edge_phase_period_ns,
-                              edge_spill_fraction);
-  }
-  ComputeTot(hits, max_duration_ns);
-
-  int min_spill = std::numeric_limits<int>::max();
-  int max_spill = std::numeric_limits<int>::min();
-  for (const auto &hit : hits) {
-    if (!hit.leading || hit.tot_ns <= 0.0) {
-      continue;
-    }
-    min_spill = std::min(min_spill, hit.spill);
-    max_spill = std::max(max_spill, hit.spill);
-  }
-  if (min_spill == std::numeric_limits<int>::max()) {
-    min_spill = 0;
-    max_spill = 0;
-  }
+  const SpillBounds spill_bounds = FindSelectedSpillBounds(input, selected_channels, spill_range);
+  const int min_spill = spill_bounds.valid ? spill_bounds.min : 0;
+  const int max_spill = spill_bounds.valid ? spill_bounds.max : 0;
   const int spill_span = std::max(1, max_spill - min_spill + 1);
   const int spill_bins = std::min(2000, spill_span);
   const double spill_xmin = static_cast<double>(min_spill) - 0.5;
@@ -1784,129 +2643,214 @@ RunResult AnalyzeRun(const RunConfig &run,
                                            spill_xmax,
                                            400,
                                            timewalk_dt_min,
-                                           timewalk_dt_max);
+	                                           timewalk_dt_max);
   }
 
-  for (auto &hit : hits) {
-    if (!hit.leading) {
-      continue;
-    }
-    ++result.leading_hits;
-    if (chan_calib.loaded && hit.tot_ns > 0.0) {
-      hit.time_ns = hit.time_ns_raw - chan_calib.CorrectionNs(hit.channel, hit.tot_ns);
-    }
-  }
+  std::map<int, OnlineStats> dt_stats;
+  std::map<int, OnlineStats> tot_stats;
+  OnlineStats clean_trigger_period_stats;
+  std::vector<EdgeHit> edge_hits;
+  const double tick_ns = analysis_time::TickNs(clock_mhz);
 
-  std::map<int, std::vector<size_t>> trigger_by_spill;
-  std::map<int, std::map<int, std::vector<size_t>>> sensor_by_channel_spill;
-  std::map<int, std::vector<double>> tot_values;
-  for (size_t i = 0; i < hits.size(); ++i) {
-    const Hit &hit = hits[i];
-    if (!hit.leading) {
-      continue;
+  auto process_spill = [&](std::vector<Hit> &hits) {
+    if (hits.empty()) {
+      return;
     }
-    if (require_valid_tot && hit.tot_ns <= 0.0) {
-      continue;
+
+    ComputeTot(hits, max_duration_ns);
+
+    if (!edge_channel_set.empty()) {
+      for (const auto &hit : hits) {
+        const bool is_edge_channel = edge_channel_set.find(hit.channel) != edge_channel_set.end();
+        if (!is_edge_channel) {
+          continue;
+        }
+        if (selected_edge_spill < 0) {
+          selected_edge_spill = hit.spill;
+        }
+        if (hit.spill == selected_edge_spill) {
+          edge_hits.push_back({hit.channel, hit.spill, hit.leading, hit.time_ns});
+        }
+      }
     }
-    const bool is_trigger = hit.channel == trigger_channel;
-    if (is_trigger) {
-      ++result.trigger22_raw_candidates;
-    }
-    const TotWindow channel_tot_window = ChannelTotWindowForChannel(channel_tot_windows, hit.channel);
-    if (!channel_tot_window.Pass(hit.tot_ns)) {
-      continue;
-    }
-    if (is_trigger) {
-      if (!trigger_tot_window.Pass(hit.tot_ns)) {
+
+    for (auto &hit : hits) {
+      if (selected_channels.find(hit.channel) == selected_channels.end()) {
         continue;
       }
-      ++result.trigger22_tot_window_candidates;
-      trigger_by_spill[hit.spill].push_back(i);
-      continue;
+      ++result.hits_read;
+      if (!hit.leading) {
+        continue;
+      }
+      if (!tdc_selection.KeepLeadingHit(hit.channel, hit.tdc)) {
+        continue;
+      }
+      ++result.leading_hits;
+      if (chan_calib.loaded && hit.tot_ns > 0.0) {
+        hit.time_ns -= chan_calib.CorrectionNs(hit.channel, hit.tot_ns);
+      }
     }
-    if (selected_channels.find(hit.channel) != selected_channels.end()) {
-      sensor_by_channel_spill[hit.channel][hit.spill].push_back(i);
+
+    if (reference_mode == TimeReferenceMode::EventMedian) {
+      for (const auto &hit : hits) {
+        if (selected_channels.find(hit.channel) == selected_channels.end() || !hit.leading ||
+            !tdc_selection.KeepLeadingHit(hit.channel, hit.tdc)) {
+          continue;
+        }
+        if (hit.tot_ns > 0.0) {
+          tot_stats[hit.channel].Add(hit.tot_ns);
+          h_tot[hit.channel]->Fill(hit.tot_ns);
+          if (h_tot_vs_spill.count(hit.channel) > 0) {
+            h_tot_vs_spill[hit.channel]->Fill(hit.spill, hit.tot_ns);
+          }
+        }
+      }
+
+      auto matches = BuildEventMedianMatches(hits,
+                                             selected_channels,
+                                             tdc_selection,
+                                             require_valid_tot,
+                                             channel_tot_windows,
+                                             event_reference_min_channels,
+                                             match_window_ns);
+      for (const auto &match : matches) {
+        const auto &hit = hits[match.index];
+        const int ch = hit.channel;
+        const double sensor_tot = hit.tot_ns;
+        const bool has_valid_sensor_tot = sensor_tot > 0.0;
+        if (require_valid_tot && !has_valid_sensor_tot) {
+          continue;
+        }
+        const TotWindow channel_tot_window = ChannelTotWindowForChannel(channel_tot_windows, ch);
+        if (!channel_tot_window.Pass(sensor_tot)) {
+          continue;
+        }
+        const double dt = match.dt_ns;
+        const bool in_timewalk_range = dt >= timewalk_dt_min && dt <= timewalk_dt_max;
+        if (has_valid_sensor_tot && h_raw_dt_vs_tot.count(ch) > 0 && in_timewalk_range) {
+          h_raw_dt_vs_tot[ch]->Fill(sensor_tot, dt);
+        }
+        if (h_raw_dt_vs_spill.count(ch) > 0 && in_timewalk_range) {
+          h_raw_dt_vs_spill[ch]->Fill(hit.spill, dt);
+        }
+
+        const DtTotCut cut = DtTotCutForChannel(dt_tot_cuts, ch);
+        const bool pass_dt_tot_cut = !has_valid_sensor_tot || cut.Pass(sensor_tot, dt);
+        if (!pass_dt_tot_cut) {
+          if (has_valid_sensor_tot && h_rejected_dt_vs_tot.count(ch) > 0 && in_timewalk_range) {
+            h_rejected_dt_vs_tot[ch]->Fill(sensor_tot, dt);
+          }
+          if (h_rejected_dt_vs_spill.count(ch) > 0 && in_timewalk_range) {
+            h_rejected_dt_vs_spill[ch]->Fill(hit.spill, dt);
+          }
+          if (has_valid_sensor_tot && h_tot_vs_spill_rejected.count(ch) > 0) {
+            h_tot_vs_spill_rejected[ch]->Fill(hit.spill, sensor_tot);
+          }
+          continue;
+        }
+
+        dt_stats[ch].Add(dt);
+        h_dt[ch]->Fill(dt);
+        if (has_valid_sensor_tot && h_dt_vs_tot.count(ch) > 0 && in_timewalk_range) {
+          h_dt_vs_tot[ch]->Fill(sensor_tot, dt);
+        }
+        if (h_dt_vs_spill.count(ch) > 0 && in_timewalk_range) {
+          h_dt_vs_spill[ch]->Fill(hit.spill, dt);
+        }
+        if (has_valid_sensor_tot && h_tot_vs_spill_selected.count(ch) > 0) {
+          h_tot_vs_spill_selected[ch]->Fill(hit.spill, sensor_tot);
+        }
+      }
+      return;
+    }
+
+    std::vector<size_t> trigger_indices;
+    std::map<int, std::vector<size_t>> sensor_by_channel;
+    for (size_t i = 0; i < hits.size(); ++i) {
+      const Hit &hit = hits[i];
+      if (selected_channels.find(hit.channel) == selected_channels.end() || !hit.leading ||
+          !tdc_selection.KeepLeadingHit(hit.channel, hit.tdc)) {
+        continue;
+      }
+      if (require_valid_tot && hit.tot_ns <= 0.0) {
+        continue;
+      }
+      const bool is_trigger = hit.channel == trigger_channel;
+      if (is_trigger) {
+        ++result.trigger22_raw_candidates;
+      }
+      const TotWindow channel_tot_window = ChannelTotWindowForChannel(channel_tot_windows, hit.channel);
+      if (!channel_tot_window.Pass(hit.tot_ns)) {
+        continue;
+      }
+      if (is_trigger) {
+        if (!trigger_tot_window.Pass(hit.tot_ns)) {
+          continue;
+        }
+        ++result.trigger22_tot_window_candidates;
+        trigger_indices.push_back(i);
+        continue;
+      }
+
+      sensor_by_channel[hit.channel].push_back(i);
       if (hit.tot_ns > 0.0) {
-        tot_values[hit.channel].push_back(hit.tot_ns);
+        tot_stats[hit.channel].Add(hit.tot_ns);
         h_tot[hit.channel]->Fill(hit.tot_ns);
         if (h_tot_vs_spill.count(hit.channel) > 0) {
           h_tot_vs_spill[hit.channel]->Fill(hit.spill, hit.tot_ns);
         }
       }
     }
-  }
 
-  for (auto &kv : trigger_by_spill) {
-    auto &indices = kv.second;
     // The cleanup is intentionally applied only to the laser trigger channel.
     // SiPM channels are not cleaned here; they are only matched to the cleaned trigger sequence below.
-    CleanTriggerCandidates(indices, hits, trigger_deadtime_ns, trigger_period_ns, trigger_period_tolerance_ns);
-    result.trigger22_clean_candidates += static_cast<long long>(indices.size());
-  }
+    CleanTriggerCandidates(trigger_indices, hits, trigger_deadtime_ns, trigger_period_ns, trigger_period_tolerance_ns);
+    result.trigger22_clean_candidates += static_cast<long long>(trigger_indices.size());
 
-  std::vector<double> clean_trigger_spacings;
-  for (const auto &kv : trigger_by_spill) {
-    const auto &indices = kv.second;
-    for (size_t i = 1; i < indices.size(); ++i) {
-      const double spacing = hits[indices[i]].time_ns - hits[indices[i - 1]].time_ns;
-      if (spacing > 0.0) {
-        clean_trigger_spacings.push_back(spacing);
-      }
+    for (size_t i = 1; i < trigger_indices.size(); ++i) {
+      const double spacing = hits[trigger_indices[i]].time_ns - hits[trigger_indices[i - 1]].time_ns;
+      clean_trigger_period_stats.Add(spacing);
     }
-  }
-  result.trigger22_clean_period = ComputeStats(clean_trigger_spacings);
 
-  for (auto &by_channel : sensor_by_channel_spill) {
-    for (auto &by_spill : by_channel.second) {
-      auto &indices = by_spill.second;
-      std::sort(indices.begin(), indices.end(), [&](size_t a, size_t b) { return hits[a].time_ns < hits[b].time_ns; });
-    }
-  }
-
-  std::map<int, std::vector<double>> dt_values;
-  std::vector<double> trigger_tot_values;
-  for (const auto &kv : trigger_by_spill) {
-    for (size_t idx : kv.second) {
+    for (size_t idx : trigger_indices) {
       if (hits[idx].tot_ns > 0.0) {
-        trigger_tot_values.push_back(hits[idx].tot_ns);
+        tot_stats[trigger_channel].Add(hits[idx].tot_ns);
         h_tot[trigger_channel]->Fill(hits[idx].tot_ns);
         if (h_tot_vs_spill.count(trigger_channel) > 0) {
           h_tot_vs_spill[trigger_channel]->Fill(hits[idx].spill, hits[idx].tot_ns);
         }
-        result.trigger_hits.push_back({trigger_channel, hits[idx].spill, hits[idx].time_ns, hits[idx].tot_ns});
       }
     }
-  }
-  tot_values[trigger_channel] = trigger_tot_values;
 
-  for (int ch : sensor_channels) {
-    auto channel_it = sensor_by_channel_spill.find(ch);
-    if (channel_it == sensor_by_channel_spill.end()) {
-      continue;
+    for (auto &by_channel : sensor_by_channel) {
+      auto &indices = by_channel.second;
+      std::sort(indices.begin(), indices.end(), [&](size_t a, size_t b) { return hits[a].time_ns < hits[b].time_ns; });
     }
-    for (const auto &spill_entry : channel_it->second) {
-      auto trigger_it = trigger_by_spill.find(spill_entry.first);
-      if (trigger_it == trigger_by_spill.end() || trigger_it->second.empty()) {
+
+    for (int ch : sensor_channels) {
+      auto channel_it = sensor_by_channel.find(ch);
+      if (channel_it == sensor_by_channel.end() || trigger_indices.empty()) {
         continue;
       }
-      const auto &triggers = trigger_it->second;
-      for (size_t sensor_idx : spill_entry.second) {
+      const auto &sensor_indices = channel_it->second;
+      for (size_t sensor_idx : sensor_indices) {
         const double sensor_time = hits[sensor_idx].time_ns;
-        auto upper = std::upper_bound(triggers.begin(), triggers.end(), sensor_time, [&](double value, size_t idx) {
-          return value < hits[idx].time_ns;
-        });
+        auto upper = std::upper_bound(trigger_indices.begin(),
+                                      trigger_indices.end(),
+                                      sensor_time,
+                                      [&](double value, size_t idx) { return value < hits[idx].time_ns; });
 
         double dt = std::numeric_limits<double>::quiet_NaN();
         if (signed_dt) {
           bool found = false;
           double best_abs_dt = std::numeric_limits<double>::max();
-          if (upper != triggers.end()) {
+          if (upper != trigger_indices.end()) {
             const double candidate_dt = sensor_time - hits[*upper].time_ns;
             best_abs_dt = std::abs(candidate_dt);
             dt = candidate_dt;
             found = true;
           }
-          if (upper != triggers.begin()) {
+          if (upper != trigger_indices.begin()) {
             const double candidate_dt = sensor_time - hits[*std::prev(upper)].time_ns;
             const double abs_dt = std::abs(candidate_dt);
             if (!found || abs_dt < best_abs_dt) {
@@ -1919,7 +2863,7 @@ RunResult AnalyzeRun(const RunConfig &run,
             continue;
           }
         } else {
-          if (upper == triggers.begin()) {
+          if (upper == trigger_indices.begin()) {
             continue;
           }
           const size_t best_idx = *std::prev(upper);
@@ -1954,7 +2898,7 @@ RunResult AnalyzeRun(const RunConfig &run,
           continue;
         }
 
-        dt_values[ch].push_back(dt);
+        dt_stats[ch].Add(dt);
         h_dt[ch]->Fill(dt);
         if (has_valid_sensor_tot && h_dt_vs_tot.count(ch) > 0 && in_timewalk_range) {
           h_dt_vs_tot[ch]->Fill(sensor_tot, dt);
@@ -1965,18 +2909,84 @@ RunResult AnalyzeRun(const RunConfig &run,
         if (has_valid_sensor_tot && h_tot_vs_spill_selected.count(ch) > 0) {
           h_tot_vs_spill_selected[ch]->Fill(hits[sensor_idx].spill, sensor_tot);
         }
-        if (has_valid_sensor_tot) {
-          result.sensor_hits.push_back({ch, hits[sensor_idx].spill, hits[sensor_idx].time_ns, sensor_tot});
-        }
       }
     }
+  };
+
+  std::vector<TreeCursor> cursors;
+  cursors.reserve(input.files.size());
+  for (const auto &file : input.files) {
+    TreeCursor cursor;
+    if (!OpenTreeCursor(file, input.tree_name, cursor)) {
+      continue;
+    }
+    AdvanceCursor(cursor,
+                  selected_channels,
+                  edge_channel_set,
+                  tdc_selection,
+                  fine_calib,
+                  tdc_offset_calib,
+                  tick_ns,
+                  use_fine,
+                  fine_cut,
+                  spill_range);
+    cursors.push_back(std::move(cursor));
+    // ROOT stores branch addresses as raw pointers; moving the cursor changes those addresses.
+    BindTreeCursorBranches(cursors.back());
   }
 
-  for (int ch : sensor_channels) {
-    result.channels[ch].dt = ComputeStats(dt_values[ch]);
-    result.channels[ch].tot = ComputeStats(tot_values[ch]);
+  while (true) {
+    bool found = false;
+    int min_pending_spill = 0;
+    for (const auto &cursor : cursors) {
+      if (!cursor.has_pending) {
+        continue;
+      }
+      if (!found || cursor.pending.spill < min_pending_spill) {
+        min_pending_spill = cursor.pending.spill;
+        found = true;
+      }
+    }
+    if (!found) {
+      break;
+    }
+
+    std::vector<Hit> spill_hits;
+    for (auto &cursor : cursors) {
+      while (cursor.has_pending && cursor.pending.spill == min_pending_spill) {
+        spill_hits.push_back(cursor.pending);
+        AdvanceCursor(cursor,
+                      selected_channels,
+                      edge_channel_set,
+                      tdc_selection,
+                      fine_calib,
+                      tdc_offset_calib,
+                      tick_ns,
+                      use_fine,
+                      fine_cut,
+                      spill_range);
+      }
+    }
+    process_spill(spill_hits);
   }
-  result.channels[trigger_channel].tot = ComputeStats(tot_values[trigger_channel]);
+
+  if (selected_edge_spill >= 0) {
+    BuildSingleSpillEdgePlots(result,
+                              edge_hits,
+                              edge_channels,
+                              selected_edge_spill,
+                              trigger_channel,
+                              trigger_period_ns,
+                              edge_phase_period_ns,
+                              edge_spill_fraction);
+  }
+
+  result.trigger22_clean_period = clean_trigger_period_stats.Get();
+  for (int ch : sensor_channels) {
+    result.channels[ch].dt = dt_stats[ch].Get();
+    result.channels[ch].tot = tot_stats[ch].Get();
+  }
+  result.channels[trigger_channel].tot = tot_stats[trigger_channel].Get();
   return result;
 }
 
@@ -2568,10 +3578,13 @@ void WriteTextSummary(const std::string &path,
 	                      const TotWindow &trigger_tot_window,
 	                      const SpillRange &spill_range,
 	                      const std::map<int, TotWindow> &channel_tot_windows,
+	                      const TdcSelection &tdc_selection,
 	                      int edge_spill,
 	                      const std::string &edge_channels_csv,
 	                      double edge_phase_period_ns,
 	                      double edge_spill_fraction,
+	                      TimeReferenceMode reference_mode,
+	                      int event_reference_min_channels,
 	                      bool signed_dt)
 {
   std::ofstream out(path);
@@ -2582,8 +3595,14 @@ void WriteTextSummary(const std::string &path,
   out << "# runlist: " << runlist_path << "\n";
   out << "# fine_calib: " << fine_calib_path << "\n";
 	  out << "# channel_calib: " << chan_calib_path << "\n";
-	  out << "# dt is t_channel - t_trigger for channels matched to trigger ch" << trigger_channel << "\n";
-	  out << "# dt trigger matching: " << (signed_dt ? "nearest signed trigger" : "previous trigger, dt >= 0") << "\n";
+	  out << "# reference_mode: " << TimeReferenceModeName(reference_mode) << "\n";
+	  if (reference_mode == TimeReferenceMode::EventMedian) {
+	    out << "# dt is t_channel - median(event excluding channel), min_channels="
+	        << event_reference_min_channels << "\n";
+	  } else {
+	    out << "# dt is t_channel - t_trigger for channels matched to trigger ch" << trigger_channel << "\n";
+	    out << "# dt trigger matching: " << (signed_dt ? "nearest signed trigger" : "previous trigger, dt >= 0") << "\n";
+	  }
 	  out << "# ToT statistics use valid leading/trailing hits after optional spill and channel-ToT selections, before dt matching\n";
 	  out << "# optional dt/ToT cut keeps events with dt >= DT0 + SLOPE*ToT; rejected events are written as h_rejected_*\n";
 	  if (trigger_tot_window.enabled) {
@@ -2600,6 +3619,14 @@ void WriteTextSummary(const std::string &path,
 	    }
 	    out << "# channel_tot_window_ch" << kv.first << ": [" << kv.second.min << "," << kv.second.max
 	        << "] ns, applied before trigger/sensor grouping\n";
+	  }
+	  if (!tdc_selection.Empty()) {
+	    std::vector<int> channels = sensor_channels;
+	    channels.push_back(trigger_channel);
+	    std::sort(channels.begin(), channels.end());
+	    channels.erase(std::unique(channels.begin(), channels.end()), channels.end());
+	    out << "# leading_tdc_selection: " << tdc_selection.Description(channels)
+	        << " (trailing partner kept for ToT)\n";
 	  }
 	  out << "# h_dt_vs_tot histograms correlate matched dt with ToT for each sensor channel, using |dt|/dt < "
 	      << kTimewalkDtLimitNs << " ns range\n";
@@ -2637,12 +3664,16 @@ void WriteTextSummary(const std::string &path,
     }
     const auto &correction = correction_it->second;
     out << "# timewalk_correction_ch" << ch << ": model=" << TimewalkFitModelName(correction.model);
-    if (correction.model == TimewalkFitModel::LinExpPlateau) {
-      out << " correction_ns=max(linear/exponential-plateau, 0)"
+    if (correction.model == TimewalkFitModel::Pol1Plateau) {
+      out << " correction_ns=(linear-to-plateau)-baseline"
+          << " p0=" << correction.p0 << " p1=" << correction.p1 << " x0=" << correction.p2
+          << " plateau=" << correction.p4;
+    } else if (correction.model == TimewalkFitModel::LinExpPlateau) {
+      out << " correction_ns=(linear/exponential-plateau)-baseline"
           << " p0=" << correction.p0 << " p1=" << correction.p1 << " x0=" << correction.p2
           << " tau=" << correction.p3 << " plateau=" << correction.p4;
     } else {
-      out << " correction_ns=max(" << correction.p0 << " + " << correction.p1 << "*ToT, 0)";
+      out << " correction_ns=(" << correction.p0 << " + " << correction.p1 << "*ToT)-baseline";
     }
     if (correction.fit_range.enabled) {
       out << " fit_range_ns=[" << correction.fit_range.xmin << "," << correction.fit_range.xmax << "]";
@@ -2696,8 +3727,8 @@ void laser_intensity_scan_rdf(const char *runlist_path = "help",
                               double trigger_period_ns = 1000000.0,
                               double trigger_period_tolerance_ns = 50000.0,
                               bool signed_dt = false,
-                              const char *timewalk_fit_ranges_csv = "17:7:18.5,19:3:15",
-                              const char *timewalk_fit_model_name = "lin-exp-plateau",
+                              const char *timewalk_fit_ranges_csv = "17:0:30,19:0:30",
+                              const char *timewalk_fit_model_name = "pol1-plateau",
                               const char *dt_tot_cuts_csv = "",
                               const char *trigger_tot_window_csv = "",
                               const char *spill_range_csv = "",
@@ -2705,7 +3736,10 @@ void laser_intensity_scan_rdf(const char *runlist_path = "help",
                               int edge_spill = -1,
                               const char *edge_channels_csv = "all",
                               double edge_phase_period_ns = 0.0,
-                              double edge_spill_fraction = 0.01)
+                              double edge_spill_fraction = 0.01,
+                              const char *tdc_selection_csv = "",
+                              const char *reference_mode_name = "event-median",
+                              int event_reference_min_channels = 3)
 {
   if (WantsHelp(runlist_path)) {
     PrintHelp();
@@ -2744,8 +3778,11 @@ void laser_intensity_scan_rdf(const char *runlist_path = "help",
   auto trigger_tot_window = ParseTotWindow(trigger_tot_window_csv ? trigger_tot_window_csv : "");
   auto spill_range = ParseSpillRange(spill_range_csv ? spill_range_csv : "");
   auto channel_tot_windows = ParseChannelTotWindowsCsv(channel_tot_windows_csv ? channel_tot_windows_csv : "");
+  auto tdc_selection = ParseTdcSelectionCsv(tdc_selection_csv ? tdc_selection_csv : "");
+  const TimeReferenceMode reference_mode = ParseTimeReferenceMode(reference_mode_name ? reference_mode_name : "");
+  event_reference_min_channels = std::max(1, event_reference_min_channels);
   const auto timewalk_fit_model =
-      ParseTimewalkFitModel(timewalk_fit_model_name ? timewalk_fit_model_name : "lin-exp-plateau");
+      ParseTimewalkFitModel(timewalk_fit_model_name ? timewalk_fit_model_name : "pol1-plateau");
 
   analysis_time::FineCalib fine_calib;
   if (fine_calib_path && fine_calib_path[0] != '\0') {
@@ -2754,6 +3791,10 @@ void laser_intensity_scan_rdf(const char *runlist_path = "help",
     }
   }
   fine_calib.use_lut = use_lut;
+  analysis_time::ChannelTdcOffsetCalib tdc_offset_calib;
+  if (fine_calib_path && fine_calib_path[0] != '\0') {
+    tdc_offset_calib.LoadFromFile(fine_calib_path);
+  }
   analysis_time::ChannelCalib chan_calib;
   if (chan_calib_path && chan_calib_path[0] != '\0') {
     if (!chan_calib.LoadFromFile(chan_calib_path)) {
@@ -2769,8 +3810,16 @@ void laser_intensity_scan_rdf(const char *runlist_path = "help",
 
   std::cout << "Run list: " << runlist_path << std::endl;
   std::cout << "Runs: " << runs.size() << std::endl;
-  std::cout << "Trigger channel: " << trigger_channel << std::endl;
+  std::cout << "Laser trigger/reference channel: " << trigger_channel << std::endl;
   std::cout << "Sensor channels: " << sensor_channels_csv << std::endl;
+  std::cout << "Time reference mode: " << TimeReferenceModeName(reference_mode) << std::endl;
+  if (reference_mode == TimeReferenceMode::EventMedian) {
+    std::cout << "Event-median min channels: " << event_reference_min_channels << std::endl;
+    std::cout << "Timewalk observable: dt(sensor - event median excluding sensor) vs sensor ToT" << std::endl;
+  } else {
+    std::cout << "Timewalk observable: dt(sensor - laser ch" << trigger_channel
+              << ") vs sensor ToT" << std::endl;
+  }
   std::cout << "Match window (ns): " << match_window_ns << std::endl;
   std::cout << "Trigger dead-time cleaning (ns): " << trigger_deadtime_ns << std::endl;
   std::cout << "Trigger expected period (ns): " << trigger_period_ns << std::endl;
@@ -2782,6 +3831,8 @@ void laser_intensity_scan_rdf(const char *runlist_path = "help",
   std::cout << "Trigger ToT window: " << (trigger_tot_window_csv ? trigger_tot_window_csv : "") << std::endl;
   std::cout << "Spill range: " << (spill_range_csv ? spill_range_csv : "") << std::endl;
   std::cout << "Channel ToT windows: " << (channel_tot_windows_csv ? channel_tot_windows_csv : "") << std::endl;
+  std::cout << "Leading TDC selection: " << (tdc_selection_csv ? tdc_selection_csv : "")
+            << (tdc_selection.Empty() ? "" : " (trailing partner kept for ToT)") << std::endl;
   std::cout << "Single-spill edge diagnostic spill: " << edge_spill << std::endl;
   std::cout << "Single-spill edge diagnostic channels: " << (edge_channels_csv ? edge_channels_csv : "all")
             << std::endl;
@@ -2792,6 +3843,7 @@ void laser_intensity_scan_rdf(const char *runlist_path = "help",
   std::cout << "Clock (MHz): " << clock_mhz << std::endl;
   std::cout << "Use fine: " << use_fine << ", use LUT: " << use_lut << ", require valid ToT: " << require_valid_tot
             << std::endl;
+  analysis_time::PrintChannelTdcOffsetSummary(tdc_offset_calib);
 
   std::vector<RunResult> results;
   results.reserve(runs.size());
@@ -2801,7 +3853,10 @@ void laser_intensity_scan_rdf(const char *runlist_path = "help",
                                  sensor_channels,
                                  trigger_channel,
                                  fine_calib,
+                                 tdc_offset_calib,
                                  chan_calib,
+                                 reference_mode,
+                                 event_reference_min_channels,
                                  match_window_ns,
                                  trigger_deadtime_ns,
                                  trigger_period_ns,
@@ -2816,6 +3871,7 @@ void laser_intensity_scan_rdf(const char *runlist_path = "help",
                                  trigger_tot_window,
                                  spill_range,
                                  channel_tot_windows,
+                                 tdc_selection,
                                  edge_spill,
                                  edge_channels,
                                  edge_phase_period_ns,
@@ -2827,10 +3883,28 @@ void laser_intensity_scan_rdf(const char *runlist_path = "help",
   std::vector<std::unique_ptr<TH2D>> corrected_accumulated_timewalk_histograms;
   BuildCorrectedTimewalkAndCoincidencePlots(results,
                                             sensor_channels,
+                                            trigger_channel,
                                             timewalk_corrections,
                                             match_window_ns,
+                                            trigger_deadtime_ns,
+                                            trigger_period_ns,
+                                            trigger_period_tolerance_ns,
                                             max_duration_ns,
+                                            clock_mhz,
+                                            fine_calib,
+                                            tdc_offset_calib,
+                                            chan_calib,
+                                            reference_mode,
+                                            event_reference_min_channels,
+                                            use_fine,
+                                            fine_cut,
+                                            require_valid_tot,
                                             signed_dt,
+                                            dt_tot_cuts,
+                                            trigger_tot_window,
+                                            spill_range,
+                                            channel_tot_windows,
+                                            tdc_selection,
                                             corrected_accumulated_timewalk_histograms);
 
   std::vector<std::unique_ptr<TGraphErrors>> graphs;
@@ -2909,16 +3983,21 @@ void laser_intensity_scan_rdf(const char *runlist_path = "help",
 	        trigger_tot_window,
 	        spill_range,
 	        channel_tot_windows,
+	        tdc_selection,
 	        edge_spill,
 	        edge_channels_csv ? edge_channels_csv : "all",
 	        edge_phase_period_ns > 0.0 ? edge_phase_period_ns : trigger_period_ns,
 	        edge_spill_fraction,
+	        reference_mode,
+	        event_reference_min_channels,
 	        signed_dt);
   }
 
   if (out_root && out_root[0] != '\0') {
     TFile fout(out_root, "RECREATE");
     TParameter<int>("trigger_channel", trigger_channel).Write();
+    TParameter<int>("reference_mode", static_cast<int>(reference_mode)).Write();
+    TParameter<int>("event_reference_min_channels", event_reference_min_channels).Write();
     TParameter<double>("match_window_ns", match_window_ns).Write();
     TParameter<double>("trigger_deadtime_ns", trigger_deadtime_ns).Write();
     TParameter<double>("trigger_period_ns", trigger_period_ns).Write();
@@ -2932,6 +4011,11 @@ void laser_intensity_scan_rdf(const char *runlist_path = "help",
     TParameter<int>("spill_range_enabled", spill_range.enabled ? 1 : 0).Write();
     TParameter<int>("spill_range_min", spill_range.min).Write();
     TParameter<int>("spill_range_max", spill_range.max).Write();
+    TParameter<int>("leading_tdc_default_enabled", tdc_selection.default_enabled ? 1 : 0).Write();
+    TParameter<int>("leading_tdc_default", tdc_selection.default_leading_tdc).Write();
+    for (const auto &kv : tdc_selection.leading_tdc_by_channel) {
+      TParameter<int>(("leading_tdc_ch" + std::to_string(kv.first)).c_str(), kv.second).Write();
+    }
     TParameter<int>("edge_spill_requested", edge_spill).Write();
     TParameter<double>("edge_phase_period_ns", edge_phase_period_ns > 0.0 ? edge_phase_period_ns : trigger_period_ns)
         .Write();
@@ -2956,6 +4040,7 @@ void laser_intensity_scan_rdf(const char *runlist_path = "help",
 	      TParameter<double>(("timewalk_corr_p2_ch" + std::to_string(ch)).c_str(), correction.p2).Write();
 	      TParameter<double>(("timewalk_corr_p3_ch" + std::to_string(ch)).c_str(), correction.p3).Write();
 	      TParameter<double>(("timewalk_corr_p4_ch" + std::to_string(ch)).c_str(), correction.p4).Write();
+	      TParameter<double>(("timewalk_corr_baseline_ch" + std::to_string(ch)).c_str(), correction.baseline).Write();
       if (correction.fit_range.enabled) {
         TParameter<double>(("timewalk_corr_fit_xmin_ch" + std::to_string(ch)).c_str(), correction.fit_range.xmin)
             .Write();

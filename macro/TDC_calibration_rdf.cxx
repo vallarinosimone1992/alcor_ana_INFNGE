@@ -8,7 +8,12 @@ void TDC_calibration_rdf(const char *input = "../data/TDC_calibration",
                          const char *out_pdf = "TDC_calibration.pdf",
                          double max_duration_ns = 0.0,
                          bool match_coincidence = false,
-                         double clock_mhz = 320.0)
+                         double clock_mhz = 320.0,
+                         bool study_channel_offsets = true,
+                         int offset_reference_channel = 22,
+                         double offset_match_window_ns = 100.0,
+                         int offset_min_channels = 3,
+                         const char *offset_channels_csv = "")
 {
   std::string input_value = input ? input : "";
   std::string output_value = out_root ? out_root : "";
@@ -16,8 +21,11 @@ void TDC_calibration_rdf(const char *input = "../data/TDC_calibration",
       output_value == "-h" || output_value == "--help" || output_value == "help") {
     std::cout << "TDC_calibration_rdf usage:\n";
     std::cout << "  TDC_calibration_rdf(\"/path/to/decoded_or_list\", \"TDC_calibration.root\","
-              << " 0.01, 0.99, 200, \"TDC_calibration.pdf\", 0.0, false, 320.0)\n";
+              << " 0.01, 0.99, 200, \"TDC_calibration.pdf\", 0.0, false, 320.0, true, 22, 100.0, 3, \"17,19,22\")\n";
     std::cout << "  output histograms: hFineMin, hFineMax, hFineLut\n";
+    std::cout << "  optional channel/TDC offset study uses calibrated TDC times and writes hChannelTdcOffset\n";
+    std::cout << "  offset_reference_channel defaults to reference time on ch22; -1 uses an event-median reference\n";
+    std::cout << "  offset_channels_csv limits the offset study to selected channels; empty means all channels\n";
     return;
   }
   fine_calibration_rdf(input,
@@ -28,5 +36,10 @@ void TDC_calibration_rdf(const char *input = "../data/TDC_calibration",
                        out_pdf,
                        max_duration_ns,
                        match_coincidence,
-                       clock_mhz);
+                       clock_mhz,
+                       study_channel_offsets,
+                       offset_reference_channel,
+                       offset_match_window_ns,
+                       offset_min_channels,
+                       offset_channels_csv);
 }

@@ -25,6 +25,15 @@ Options:
                           use all leading edges (default)
   -d, --duration NS       max ToT for --match-coincidence (default: 0 = disabled)
   -m, --clock MHz         clock frequency (default: 320)
+      --offset-study      study relative channel/TDC offsets using calibrated TDC times (default)
+      --no-offset-study   skip relative channel/TDC offset study
+      --offset-reference event-median|CH
+                          reference time for offsets (default: channel 22; event-median uses event medians)
+      --offset-window NS  matching window for offset study (default: 100)
+      --offset-min-channels N
+                          minimum channels per laser event in event-median mode (default: 3)
+      --offset-channels logbook|CSV|all
+                          channels to study for offsets (default: logbook)
       --dry-run           print commands without executing them
   -h, --help              show this help
 USAGE
@@ -46,6 +55,11 @@ min_entries=200
 match_coincidence=0
 duration_ns=0
 clock_mhz=320
+offset_study=1
+offset_reference="22"
+offset_window_ns=100
+offset_min_channels=3
+offset_channels="logbook"
 dry_run=0
 
 need_arg() {
@@ -54,6 +68,32 @@ need_arg() {
     usage >&2
     exit 1
   fi
+}
+
+channels_to_csv() {
+  local value="$1"
+  python3 - "${value}" <<'PY'
+import re
+import sys
+
+value = sys.argv[1]
+out = []
+seen = set()
+for token in re.split(r"[,\s_]+", value.strip()):
+    if not token:
+        continue
+    try:
+        channel = int(token)
+    except ValueError:
+        raise SystemExit(f"invalid channel token: {token}")
+    if channel < 0 or channel >= 32:
+        raise SystemExit(f"channel out of range: {channel}")
+    if channel in seen:
+        continue
+    seen.add(channel)
+    out.append(str(channel))
+print(",".join(out))
+PY
 }
 
 while [ "$#" -gt 0 ]; do
@@ -155,6 +195,50 @@ while [ "$#" -gt 0 ]; do
       clock_mhz=${1#*=}
       shift
       ;;
+    --offset-study|--study-offsets|--channel-offsets)
+      offset_study=1
+      shift
+      ;;
+    --no-offset-study|--no-study-offsets|--no-channel-offsets)
+      offset_study=0
+      shift
+      ;;
+    --offset-reference|--offset-ref|--reference-channel)
+      need_arg "$@"
+      offset_reference=${2:-}
+      shift 2
+      ;;
+    --offset-reference=*|--offset-ref=*|--reference-channel=*)
+      offset_reference=${1#*=}
+      shift
+      ;;
+    --offset-window|--offset-match-window)
+      need_arg "$@"
+      offset_window_ns=${2:-}
+      shift 2
+      ;;
+    --offset-window=*|--offset-match-window=*)
+      offset_window_ns=${1#*=}
+      shift
+      ;;
+    --offset-min-channels|--offset-minimum-channels)
+      need_arg "$@"
+      offset_min_channels=${2:-}
+      shift 2
+      ;;
+    --offset-min-channels=*|--offset-minimum-channels=*)
+      offset_min_channels=${1#*=}
+      shift
+      ;;
+    --offset-channels|--offset-channel-list|--channels-for-offset)
+      need_arg "$@"
+      offset_channels=${2:-}
+      shift 2
+      ;;
+    --offset-channels=*|--offset-channel-list=*|--channels-for-offset=*)
+      offset_channels=${1#*=}
+      shift
+      ;;
     --dry-run)
       dry_run=1
       shift
@@ -172,10 +256,76 @@ if [ "${#inputs[@]}" -eq 0 ]; then
   exit 1
 fi
 
+case "${offset_reference}" in
+  event-median|event_median|median|event)
+    offset_reference_arg=-1
+    offset_reference_label="event-median"
+    ;;
+  *)
+    offset_reference_arg=${offset_reference}
+    offset_reference_label="channel ${offset_reference}"
+    ;;
+esac
+if ! [[ "${offset_reference_arg}" =~ ^-?[0-9]+$ ]]; then
+  echo "Invalid --offset-reference: ${offset_reference} (use event-median or a channel number)" >&2
+  exit 1
+fi
+if ! [[ "${offset_min_channels}" =~ ^[0-9]+$ ]] || [ "${offset_min_channels}" -lt 1 ]; then
+  echo "Invalid --offset-min-channels: ${offset_min_channels}" >&2
+  exit 1
+fi
+
 if [ "${check_logbook}" -eq 1 ] && [ ! -f "${logbook}" ]; then
   echo "Logbook not found: ${logbook}" >&2
   exit 1
 fi
+
+offset_channels_arg=""
+offset_channels_label="all"
+case "${offset_channels}" in
+  ""|all|All|ALL)
+    offset_channels_arg=""
+    offset_channels_label="all"
+    ;;
+  logbook|Logbook|LOGBOOK)
+    inferred_channels=""
+    missing_logbook_channels=0
+    if [ -f "${logbook}" ]; then
+      for input in "${inputs[@]}"; do
+        run="$(logbook_run_from_path "${input}")"
+        if logbook_has_run "${logbook}" "${run}"; then
+          run_channels="$(logbook_channels_csv "${logbook}" "${run}")"
+          if [ -n "${run_channels}" ]; then
+            inferred_channels="${inferred_channels},${run_channels}"
+          else
+            missing_logbook_channels=1
+          fi
+        else
+          missing_logbook_channels=1
+        fi
+      done
+    else
+      missing_logbook_channels=1
+    fi
+    offset_channels_arg="$(channels_to_csv "${inferred_channels#,}")"
+    if [ -n "${offset_channels_arg}" ]; then
+      offset_channels_label="logbook (${offset_channels_arg})"
+    else
+      offset_channels_label="all (logbook channels unavailable)"
+      if [ "${offset_study}" -eq 1 ]; then
+        echo "Warning: cannot infer offset channels from logbook; studying all channels." >&2
+      fi
+    fi
+    ;;
+  *)
+    offset_channels_arg="$(channels_to_csv "${offset_channels}")"
+    if [ -z "${offset_channels_arg}" ]; then
+      echo "Invalid --offset-channels: ${offset_channels}" >&2
+      exit 1
+    fi
+    offset_channels_label="${offset_channels_arg}"
+    ;;
+esac
 
 mkdir -p "$(dirname "${out_root}")" "$(dirname "${out_pdf}")" "${qa_dir}/output"
 list_file="${qa_dir}/output/TDC_calibration_inputs.list"
@@ -198,7 +348,7 @@ else
 fi
 
 macro_path="${qa_dir}/macro/TDC_calibration_rdf.cxx"
-cmd=(root -l -b -q "${macro_path}(\"${list_file}\",\"${out_root}\",${q_low},${q_high},${min_entries},\"${out_pdf}\",${duration_ns},${match_coincidence},${clock_mhz})")
+cmd=(root -l -b -q "${macro_path}(\"${list_file}\",\"${out_root}\",${q_low},${q_high},${min_entries},\"${out_pdf}\",${duration_ns},${match_coincidence},${clock_mhz},${offset_study},${offset_reference_arg},${offset_window_ns},${offset_min_channels},\"${offset_channels_arg}\")")
 
 echo "== TDC calibration inputs:"
 printf '   %s\n' "${inputs[@]}"
@@ -209,6 +359,11 @@ echo "== Logbook check: ${check_logbook}"
 echo "== Quantiles: ${q_low}, ${q_high}"
 echo "== Min entries per TDC: ${min_entries}"
 echo "== Match coincidence/ToT: ${match_coincidence}"
+echo "== Channel/TDC offset study: ${offset_study}"
+echo "== Offset reference: ${offset_reference_label}"
+echo "== Offset match window: ${offset_window_ns} ns"
+echo "== Offset min channels: ${offset_min_channels}"
+echo "== Offset channels: ${offset_channels_label}"
 
 if [ "${dry_run}" -eq 1 ]; then
   printf '%q ' "${cmd[@]}"

@@ -8,8 +8,7 @@ usage: run_timewalk_calibration.sh --input PATH [--input PATH ...] [options]
 Create/update calibration/timewalk_correction.root.
 
 Modes:
-  --mode trigger       legacy-compatible extraction with a trigger/reference
-                       channel in the same run (default)
+  --mode trigger       timewalk extraction from a timing reference in the same run (default)
   --mode intensity     ToT versus laser-intensity characterization without
                        extracting an absolute timewalk correction
 
@@ -32,8 +31,13 @@ Common options:
   -h, --help              show this help
 
 Trigger-mode options:
-      --trigger CH        trigger/reference channel (default: 22)
-      --sensors CSV       SiPM channels to correct (default: 17,19)
+      --reference-mode event-median|trigger
+                           event-median uses all selected SiPMs as laser reference (default);
+                           trigger uses --trigger as legacy reference channel
+      --reference-min-channels N
+                           minimum channels per event-median laser cluster (default: 3)
+      --trigger CH        laser trigger/reference channel for --reference-mode trigger (default: 22)
+      --sensors CSV       SiPM channels to correct (default: logbook)
   -w, --window NS         trigger matching window (default: 100)
       --trigger-deadtime NS
                            minimum separation for trigger cleanup (default: 50000)
@@ -42,15 +46,17 @@ Trigger-mode options:
                            tolerance for trigger-period cleanup (default: 50000)
       --signed-dt         match nearest trigger and keep signed time differences
       --timewalk-fit-ranges CSV
-                           fit ranges per channel (default: 17:7:14,19:3:13)
+                           fit ranges per channel (default: 17:0:30,19:0:30)
       --timewalk-fit-model MODEL
-                           pol1 or lin-exp-plateau (default: pol1)
+                           pol1, pol1-plateau, or lin-exp-plateau (default: pol1-plateau)
       --dt-tot-cut CSV    lower diagonal cut in the dt/ToT plane
       --trigger-tot-window CSV
                            trigger ToT window MIN:MAX
       --spill-range CSV   inclusive spill selection range MIN:MAX
       --channel-tot-window CSV
                            per-channel ToT window CH:MIN:MAX[,CH:MIN:MAX]
+      --tdc-selection CSV  leading TDC selection, TDC or CH:TDC CSV
+                           examples: 0 or 17:0,19:2,22:0; trailing partner is kept for ToT
       --edge-spill N      spill for edge maps (default: first selected spill)
       --edge-channels CSV all, analysis, or CSV (default: all)
       --edge-phase-period NS
@@ -80,19 +86,24 @@ use_lut=1
 fine_cut=0
 dry_run=0
 
+reference_mode="event-median"
+reference_min_channels=3
 trigger_channel=22
-sensor_channels="17,19"
+sensor_channels="logbook"
 match_window_ns=100
 trigger_deadtime_ns=50000
 trigger_period_ns=1000000
 trigger_period_tolerance_ns=50000
+trigger_period_set=0
+trigger_period_tolerance_set=0
 signed_dt=0
-timewalk_fit_ranges="17:7:14,19:3:13"
-timewalk_fit_model="pol1"
+timewalk_fit_ranges="17:0:30,19:0:30"
+timewalk_fit_model="pol1-plateau"
 dt_tot_cut=""
 trigger_tot_window=""
 spill_range=""
 channel_tot_windows=""
+tdc_selection=""
 edge_spill=-1
 edge_channels="all"
 edge_phase_period_ns=0
@@ -251,6 +262,24 @@ while [ "$#" -gt 0 ]; do
       sensor_channels=${1#*=}
       shift
       ;;
+    --reference-mode|--time-reference|--timewalk-reference)
+      need_arg "$@"
+      reference_mode=${2:-}
+      shift 2
+      ;;
+    --reference-mode=*|--time-reference=*|--timewalk-reference=*)
+      reference_mode=${1#*=}
+      shift
+      ;;
+    --reference-min-channels|--event-reference-min-channels)
+      need_arg "$@"
+      reference_min_channels=${2:-}
+      shift 2
+      ;;
+    --reference-min-channels=*|--event-reference-min-channels=*)
+      reference_min_channels=${1#*=}
+      shift
+      ;;
     -w|--window)
       need_arg "$@"
       match_window_ns=${2:-}
@@ -272,19 +301,23 @@ while [ "$#" -gt 0 ]; do
     --trigger-period)
       need_arg "$@"
       trigger_period_ns=${2:-}
+      trigger_period_set=1
       shift 2
       ;;
     --trigger-period=*)
       trigger_period_ns=${1#*=}
+      trigger_period_set=1
       shift
       ;;
     --trigger-period-tol|--trigger-period-tolerance)
       need_arg "$@"
       trigger_period_tolerance_ns=${2:-}
+      trigger_period_tolerance_set=1
       shift 2
       ;;
     --trigger-period-tol=*|--trigger-period-tolerance=*)
       trigger_period_tolerance_ns=${1#*=}
+      trigger_period_tolerance_set=1
       shift
       ;;
     --signed-dt)
@@ -343,6 +376,15 @@ while [ "$#" -gt 0 ]; do
       ;;
     --channel-tot-window=*|--channel-tot-range=*|--tot-window-by-channel=*|--duration-window=*)
       channel_tot_windows=${1#*=}
+      shift
+      ;;
+    --tdc-selection|--leading-tdc|--tdc-filter|--timewalk-tdc-selection)
+      need_arg "$@"
+      tdc_selection=${2:-}
+      shift 2
+      ;;
+    --tdc-selection=*|--leading-tdc=*|--tdc-filter=*|--timewalk-tdc-selection=*)
+      tdc_selection=${1#*=}
       shift
       ;;
     --edge-spill|--edge-plot-spill)
@@ -409,6 +451,23 @@ case "${mode}" in
     exit 1
     ;;
 esac
+case "${reference_mode}" in
+  event-median|event_median|median|event)
+    reference_mode="event-median"
+    ;;
+  trigger|ch22|reference-channel|reference_channel)
+    reference_mode="trigger"
+    ;;
+  *)
+    echo "Unknown reference mode: ${reference_mode}" >&2
+    usage >&2
+    exit 1
+    ;;
+esac
+if ! [[ "${reference_min_channels}" =~ ^[0-9]+$ ]] || [ "${reference_min_channels}" -lt 1 ]; then
+  echo "Invalid --reference-min-channels: ${reference_min_channels}" >&2
+  exit 1
+fi
 
 mkdir -p "$(dirname "${out_root}")" "$(dirname "${out_pdf}")" "$(dirname "${out_txt}")" "${qa_dir}/output"
 if [ "${dry_run}" -eq 0 ] && [ ! -s "${tdc_calib}" ]; then
@@ -445,15 +504,26 @@ else
   : > "${runlist}"
 fi
 
+auto_laser_rate_khz=""
+sensor_channels_from_inputs=""
 for input in "${inputs[@]}"; do
   run="$(logbook_run_from_path "${input}")"
   label="${run}"
   intensity="0"
+  laser_rate=""
   channels="${channels_override}"
   thresholds=""
   vbias=""
   if [ "${logbook_available}" -eq 1 ] && logbook_has_run "${logbook}" "${run}"; then
     intensity="$(logbook_field "${logbook}" "${run}" intensity)"
+    laser_rate="$(logbook_field "${logbook}" "${run}" rate || true)"
+    if [ -n "${laser_rate}" ]; then
+      if [ -z "${auto_laser_rate_khz}" ]; then
+        auto_laser_rate_khz="${laser_rate}"
+      elif [ "${auto_laser_rate_khz}" != "${laser_rate}" ]; then
+        echo "Warning: multiple laser rates in inputs (${auto_laser_rate_khz}, ${laser_rate}); using ${auto_laser_rate_khz} kHz for trigger cleanup." >&2
+      fi
+    fi
     if [ -z "${channels}" ] || [ "${channels}" = "logbook" ]; then
       channels="$(logbook_channels_csv "${logbook}" "${run}")"
     fi
@@ -464,7 +534,7 @@ for input in "${inputs[@]}"; do
     channels=""
   fi
   if [ -z "${channels}" ]; then
-    if [ "${mode}" = "trigger" ]; then
+    if [ "${mode}" = "trigger" ] && [ "${sensor_channels}" != "logbook" ]; then
       channels="${sensor_channels},${trigger_channel}"
     else
       echo "Cannot infer channels for ${input}; pass --channels or add the run to ${logbook}" >&2
@@ -472,6 +542,9 @@ for input in "${inputs[@]}"; do
     fi
   fi
   channels="$(channels_to_csv "${channels}")"
+  if [ "${sensor_channels}" = "logbook" ] && [ -n "${channels}" ]; then
+    sensor_channels_from_inputs="${sensor_channels_from_inputs} ${channels//,/ }"
+  fi
   if [ "${dry_run}" -eq 1 ]; then
     printf 'printf %q >> %q\n' "${label}\t${input}\t${intensity}\t${channels}\t${thresholds}\t\t${vbias}\t${mode}" "${runlist}"
   else
@@ -479,10 +552,34 @@ for input in "${inputs[@]}"; do
   fi
 done
 
+if [ "${sensor_channels}" = "logbook" ]; then
+  sensor_channels="$(channels_to_csv "${sensor_channels_from_inputs}")"
+  if [ -z "${sensor_channels}" ]; then
+    echo "Cannot infer --sensors from logbook; pass --sensors explicitly." >&2
+    exit 1
+  fi
+fi
+
+if [ "${mode}" = "trigger" ] && [ "${reference_mode}" = "trigger" ] &&
+   [ "${trigger_period_set}" -eq 0 ] && [ -n "${auto_laser_rate_khz}" ]; then
+  trigger_period_ns="$(awk -v rate="${auto_laser_rate_khz}" 'BEGIN {
+    if (rate > 0) {
+      printf "%.9g", 1000000.0 / rate
+    }
+  }')"
+  if [ -n "${trigger_period_ns}" ] && [ "${trigger_period_tolerance_set}" -eq 0 ]; then
+    trigger_period_tolerance_ns="$(awk -v period="${trigger_period_ns}" 'BEGIN {
+      if (period > 0) {
+        printf "%.9g", period * 0.05
+      }
+    }')"
+  fi
+fi
+
 if [ "${mode}" = "trigger" ]; then
   macro_path="${qa_dir}/macro/laser_intensity_scan_rdf.cxx"
   log_path="${qa_dir}/output/log_timewalk_correction_macro.txt"
-  cmd=(root -l -b -q "${macro_path}(\"${runlist}\",\"${tdc_calib}\",\"\",\"${out_pdf}\",\"${out_root}\",\"${out_txt}\",${trigger_channel},\"${sensor_channels}\",${match_window_ns},${duration_ns},${clock_mhz},${use_fine},${use_lut},${fine_cut},${require_tot},${trigger_deadtime_ns},${trigger_period_ns},${trigger_period_tolerance_ns},${signed_dt},\"${timewalk_fit_ranges}\",\"${timewalk_fit_model}\",\"${dt_tot_cut}\",\"${trigger_tot_window}\",\"${spill_range}\",\"${channel_tot_windows}\",${edge_spill},\"${edge_channels}\",${edge_phase_period_ns},${edge_spill_fraction})")
+  cmd=(root -l -b -q "${macro_path}(\"${runlist}\",\"${tdc_calib}\",\"\",\"${out_pdf}\",\"${out_root}\",\"${out_txt}\",${trigger_channel},\"${sensor_channels}\",${match_window_ns},${duration_ns},${clock_mhz},${use_fine},${use_lut},${fine_cut},${require_tot},${trigger_deadtime_ns},${trigger_period_ns},${trigger_period_tolerance_ns},${signed_dt},\"${timewalk_fit_ranges}\",\"${timewalk_fit_model}\",\"${dt_tot_cut}\",\"${trigger_tot_window}\",\"${spill_range}\",\"${channel_tot_windows}\",${edge_spill},\"${edge_channels}\",${edge_phase_period_ns},${edge_spill_fraction},\"${tdc_selection}\",\"${reference_mode}\",${reference_min_channels})")
 else
   macro_path="${qa_dir}/macro/tot_intensity_scan_rdf.cxx"
   log_path="${qa_dir}/output/log_tot_intensity_scan_macro.txt"
@@ -496,8 +593,17 @@ echo "== Output calibration: ${out_root}"
 echo "== Output PDF: ${out_pdf}"
 echo "== Output TXT: ${out_txt}"
 if [ "${mode}" = "trigger" ]; then
-  echo "== Trigger channel: ${trigger_channel}"
+  echo "== Reference mode: ${reference_mode}"
+  echo "== Event reference min channels: ${reference_min_channels}"
+  echo "== Laser trigger/reference channel: ${trigger_channel}"
   echo "== Sensor channels: ${sensor_channels}"
+  if [ "${reference_mode}" = "event-median" ]; then
+    echo "== Timewalk observable: dt(sensor - event median excluding sensor) vs sensor ToT"
+  else
+    echo "== Timewalk observable: dt(sensor - laser ch${trigger_channel}) vs sensor ToT"
+  fi
+  echo "== Trigger expected period: ${trigger_period_ns} ns (tolerance ${trigger_period_tolerance_ns} ns)"
+  echo "== Leading TDC selection: ${tdc_selection:-all}"
   echo "== Fit ranges: ${timewalk_fit_ranges}"
   echo "== Fit model: ${timewalk_fit_model}"
 else

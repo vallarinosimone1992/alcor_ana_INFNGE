@@ -85,6 +85,26 @@ script/run_tdc_calibration.sh \
 
 Every input run is checked against `config/logbook.json`; all `Operating Mode` values for that run must be `1`.
 
+The TDC calibration macro also studies relative channel/TDC offsets using the
+newly calibrated TDC times. By default the reference channel is ch22 and the
+channels to study are inferred from `config/logbook.json`:
+
+```bash
+script/run_tdc_calibration.sh \
+  --input ../data/<offset-calibration-run> \
+  --offset-reference 22 \
+  --offset-window 100
+```
+
+Use `--offset-channels 17,19,22` to override the logbook selection, or
+`--offset-channels all` to restore the all-channel study.
+
+The ROOT output includes `hChannelTdcOffset`, `hChannelTdcOffsetEntries`,
+`hChannelLeadingOffset`, and the `channel_tdc_offsets` tree. The offset value is
+the median `t_channel,TDC - t_reference,TDC`, so it can be subtracted from that
+channel/TDC time to align it to the reference. Use `--offset-reference event-median`
+only when you explicitly want an event-median reference instead of ch22.
+
 ### Timewalk / ToT Calibration
 
 The standard output is:
@@ -93,11 +113,25 @@ The standard output is:
 calibration/timewalk_correction.root
 ```
 
-Trigger-based mode keeps the previous three-channel method, for example trigger channel 22 and signal channels 17,19:
+By default, trigger mode now extracts timewalk versus an event-level laser
+reference: for each leading hit it uses the median time of the other selected
+channels in the same spill/event cluster. The input times already include the
+fine-TDC calibration and the static channel/TDC offset from
+`calibration/TDC_calibration.root`.
 
 ```bash
 script/run_timewalk_calibration.sh \
   --mode trigger \
+  --input ../data/20260610-171026 \
+  --sensors 17,19,22
+```
+
+The legacy channel-22 trigger reference is still available:
+
+```bash
+script/run_timewalk_calibration.sh \
+  --mode trigger \
+  --reference-mode trigger \
   --input ../data/20260610-171026 \
   --trigger 22 \
   --sensors 17,19
@@ -171,7 +205,11 @@ output/<run>_coincidence.root
 output/<run>_coincidence.txt
 ```
 
-The analysis always uses `calibration/TDC_calibration.root` for fine timing unless explicitly disabled with `--no-fine`. It also uses `calibration/timewalk_correction.root` when present, unless `--no-timewalk` is passed.
+The analysis always reads `calibration/TDC_calibration.root` for fine timing and
+for the static channel/TDC offsets. `--no-fine` disables the fine-time
+interpolation, while the static offsets from the calibration file are still
+available. It also uses `calibration/timewalk_correction.root` when present,
+unless `--no-timewalk` is passed.
 
 ## Public Scripts
 

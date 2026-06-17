@@ -22,7 +22,17 @@
     "20260611-155006",
     "20260611-155737",
     "20260611-160407",
-    "20260611-161045"
+    "20260611-161045",
+    "20260611-172932",
+    "20260611-181839",
+    "20260615-112139",
+    "20260616-091554",
+    "20260616-100123",
+    "20260616-103238",
+    "20260616-110415",
+    "20260616-122729",
+    "20260616-140420",
+    "20260616-144133"
   ],
   "runs": {
     "20260610-160356": {
@@ -170,7 +180,7 @@
         0,
         0
       ],
-      "notes": ""
+      "notes": "used for tdc calibration"
     },
     "20260610-171245": {
       "run": "20260610-171245",
@@ -799,7 +809,430 @@
         0,
         0
       ],
-      "notes": "SciFi calibration (with radio. src, close to front of box)"
+      "notes": "SciFi data (with radio. src, close to front of box)"
+    },
+    "20260611-172932": {
+      "run": "20260611-172932",
+      "raw_run": "20260611-172932",
+      "row": 23,
+      "spills": 5000,
+      "laser_on": false,
+      "laser_intensity": null,
+      "laser_rate_khz": null,
+      "radio_src": true,
+      "src_position": "middle",
+      "vbias": 30.1,
+      "channels": [
+        17,
+        19
+      ],
+      "operating_mode": [
+        4,
+        4
+      ],
+      "threshold": [
+        30,
+        30
+      ],
+      "offset1": [
+        2,
+        2
+      ],
+      "gain1": [
+        0,
+        0
+      ],
+      "gain2": [
+        0,
+        0
+      ],
+      "notes": "SciFi data (with radio. src, middle of scifi)"
+    },
+    "20260611-181839": {
+      "run": "20260611-181839",
+      "raw_run": "20260611-181839",
+      "row": 24,
+      "spills": 5000,
+      "laser_on": false,
+      "laser_intensity": null,
+      "laser_rate_khz": null,
+      "radio_src": true,
+      "src_position": "Near 3rd SiPM",
+      "vbias": 30.1,
+      "channels": [
+        17,
+        19
+      ],
+      "operating_mode": [
+        4,
+        4
+      ],
+      "threshold": [
+        30,
+        30
+      ],
+      "offset1": [
+        2,
+        2
+      ],
+      "gain1": [
+        0,
+        0
+      ],
+      "gain2": [
+        0,
+        0
+      ],
+      "notes": "SciFi data (with radio. src, middle of scifi)"
+    },
+    "20260615-112139": {
+      "run": "20260615-112139",
+      "raw_run": "20260615-112139",
+      "row": 25,
+      "spills": 5000,
+      "laser_on": true,
+      "laser_intensity": 14.5,
+      "laser_rate_khz": 10,
+      "radio_src": false,
+      "src_position": "",
+      "vbias": 30.1,
+      "channels": [
+        17,
+        19,
+        22
+      ],
+      "operating_mode": [
+        4,
+        4,
+        4
+      ],
+      "threshold": [
+        30,
+        30,
+        32
+      ],
+      "offset1": [
+        2,
+        2,
+        0
+      ],
+      "gain1": [
+        0,
+        0,
+        2
+      ],
+      "gain2": [
+        0,
+        0,
+        0
+      ],
+      "notes": "Laser with laser trigger on channel 22"
+    },
+    "20260616-091554": {
+      "run": "20260616-091554",
+      "raw_run": "20260616-091554/",
+      "row": 26,
+      "spills": 5000,
+      "laser_on": true,
+      "laser_intensity": "14.5->5.5",
+      "laser_rate_khz": 10,
+      "radio_src": false,
+      "src_position": "",
+      "vbias": 30.1,
+      "channels": [
+        17,
+        19,
+        22
+      ],
+      "operating_mode": [
+        4,
+        4,
+        4
+      ],
+      "threshold": [
+        30,
+        30,
+        32
+      ],
+      "offset1": [
+        2,
+        2,
+        0
+      ],
+      "gain1": [
+        0,
+        0,
+        2
+      ],
+      "gain2": [
+        0,
+        0,
+        0
+      ],
+      "notes": "Laser with trigger on channel 22"
+    },
+    "20260616-100123": {
+      "run": "20260616-100123",
+      "raw_run": "20260616-100123/",
+      "row": 27,
+      "spills": 2000,
+      "laser_on": true,
+      "laser_intensity": 5.5,
+      "laser_rate_khz": 10,
+      "radio_src": false,
+      "src_position": "",
+      "vbias": 30.1,
+      "channels": [
+        17,
+        19,
+        22
+      ],
+      "operating_mode": [
+        4,
+        4,
+        4
+      ],
+      "threshold": [
+        30,
+        30,
+        32
+      ],
+      "offset1": [
+        2,
+        2,
+        0
+      ],
+      "gain1": [
+        0,
+        0,
+        2
+      ],
+      "gain2": [
+        0,
+        0,
+        0
+      ],
+      "notes": "Laser with trigger on channel 22"
+    },
+    "20260616-103238": {
+      "run": "20260616-103238",
+      "raw_run": "20260616-103238/",
+      "row": 28,
+      "spills": 2000,
+      "laser_on": true,
+      "laser_intensity": 7.5,
+      "laser_rate_khz": 10,
+      "radio_src": false,
+      "src_position": "",
+      "vbias": 30.1,
+      "channels": [
+        17,
+        19,
+        22
+      ],
+      "operating_mode": [
+        4,
+        4,
+        4
+      ],
+      "threshold": [
+        30,
+        30,
+        32
+      ],
+      "offset1": [
+        2,
+        2,
+        0
+      ],
+      "gain1": [
+        0,
+        0,
+        2
+      ],
+      "gain2": [
+        0,
+        0,
+        0
+      ],
+      "notes": "\"\""
+    },
+    "20260616-110415": {
+      "run": "20260616-110415",
+      "raw_run": "20260616-110415/",
+      "row": 29,
+      "spills": 2000,
+      "laser_on": true,
+      "laser_intensity": 9.5,
+      "laser_rate_khz": 10,
+      "radio_src": false,
+      "src_position": "",
+      "vbias": 30.1,
+      "channels": [
+        17,
+        19,
+        22
+      ],
+      "operating_mode": [
+        4,
+        4,
+        4
+      ],
+      "threshold": [
+        30,
+        30,
+        32
+      ],
+      "offset1": [
+        2,
+        2,
+        0
+      ],
+      "gain1": [
+        0,
+        0,
+        2
+      ],
+      "gain2": [
+        0,
+        0,
+        0
+      ],
+      "notes": "\"\""
+    },
+    "20260616-122729": {
+      "run": "20260616-122729",
+      "raw_run": "20260616-122729/",
+      "row": 30,
+      "spills": 2000,
+      "laser_on": true,
+      "laser_intensity": 11.5,
+      "laser_rate_khz": 10,
+      "radio_src": false,
+      "src_position": "",
+      "vbias": 30.1,
+      "channels": [
+        17,
+        19,
+        22
+      ],
+      "operating_mode": [
+        4,
+        4,
+        4
+      ],
+      "threshold": [
+        30,
+        30,
+        32
+      ],
+      "offset1": [
+        2,
+        2,
+        0
+      ],
+      "gain1": [
+        0,
+        0,
+        2
+      ],
+      "gain2": [
+        0,
+        0,
+        0
+      ],
+      "notes": "\"\""
+    },
+    "20260616-140420": {
+      "run": "20260616-140420",
+      "raw_run": "20260616-140420/",
+      "row": 31,
+      "spills": 2000,
+      "laser_on": true,
+      "laser_intensity": 13.5,
+      "laser_rate_khz": 10,
+      "radio_src": false,
+      "src_position": "",
+      "vbias": 30.1,
+      "channels": [
+        17,
+        19,
+        22
+      ],
+      "operating_mode": [
+        4,
+        4,
+        4
+      ],
+      "threshold": [
+        30,
+        30,
+        32
+      ],
+      "offset1": [
+        2,
+        2,
+        0
+      ],
+      "gain1": [
+        0,
+        0,
+        2
+      ],
+      "gain2": [
+        0,
+        0,
+        0
+      ],
+      "notes": "\"\""
+    },
+    "20260616-144133": {
+      "run": "20260616-144133",
+      "raw_run": "20260616-144133/",
+      "row": 32,
+      "spills": 500,
+      "laser_on": true,
+      "laser_intensity": 13.5,
+      "laser_rate_khz": 10,
+      "radio_src": false,
+      "src_position": "",
+      "vbias": 30.1,
+      "channels": [
+        17,
+        19,
+        22,
+        23
+      ],
+      "operating_mode": [
+        1,
+        1,
+        1,
+        1
+      ],
+      "threshold": [
+        30,
+        30,
+        20,
+        25
+      ],
+      "offset1": [
+        2,
+        2,
+        0,
+        3
+      ],
+      "gain1": [
+        0,
+        0,
+        2,
+        0
+      ],
+      "gain2": [
+        0,
+        0,
+        0
+      ],
+      "notes": "\"\""
     }
   }
 }

@@ -1,6 +1,6 @@
-#include <ROOT/RDataFrame.hxx>
 #include <TCanvas.h>
 #include <TFile.h>
+#include <TH1.h>
 #include <TH1D.h>
 #include <TH2D.h>
 #include <TF1.h>
@@ -15,6 +15,7 @@
 #include <TError.h>
 #include <TStyle.h>
 #include <TSystem.h>
+#include <TTree.h>
 
 #include "analysis_io.h"
 #include "analysis_time.h"
@@ -73,8 +74,9 @@ void PrintCoincidenceHelp()
   std::cout << "  coincidence-hit distributions are appended to the same PDF" << std::endl;
   std::cout << "  only hits with min_duration <= ToT <= max_duration_ns are considered" << std::endl;
   std::cout << "  fine calibration file uses hFineMin/hFineMax; default formula used when missing" << std::endl;
+  std::cout << "  TDC calibration may also provide hChannelTdcOffset, applied per channel/TDC before ToT" << std::endl;
   std::cout << "  optional channel calibration uses hChanCalib_chXX vs ToT when a file path is provided" << std::endl;
-  std::cout << "  timewalk calibration reads timewalk_corr_*_chXX parameters from a laser analysis ROOT file" << std::endl;
+  std::cout << "  timewalk calibration reads signed timewalk_corr_*_chXX parameters from a laser analysis ROOT file" << std::endl;
   std::cout << "  force_window=true ignores per-line windows in the pairs file" << std::endl;
   std::cout << "  fine_cut excludes hits with |fine - cut| <= fine_cut (fine units)" << std::endl;
   std::cout << "  out_root writes histograms to a ROOT file when non-empty" << std::endl;
@@ -97,6 +99,7 @@ struct Hit {
   int fine = 0;
   int channel = -1;
   long long time_tick = 0;
+  double time_ns_raw = 0.0;
   double time_ns = 0.0;
   int spill = 0;
 };
@@ -593,26 +596,33 @@ struct TimewalkCorrection {
   double p2 = 0.0;
   double p3 = 1.0;
   double p4 = 0.0;
+  double baseline = 0.0;
+
+  double EvalNs(double tot) const
+  {
+    if (!std::isfinite(tot)) {
+      return 0.0;
+    }
+    if (model == 1) {
+      if (tot <= p2 || p3 <= 0.0) {
+        return p0 + p1 * tot;
+      } else {
+        return p4 + (p0 + p1 * p2 - p4) * std::exp(-(tot - p2) / p3);
+      }
+    }
+    if (model == 2) {
+      return p0 + p1 * std::min(tot, p2);
+    }
+    return p0 + p1 * tot;
+  }
 
   double CorrectionNs(double tot) const
   {
     if (!valid || !std::isfinite(tot)) {
       return 0.0;
     }
-    double value = 0.0;
-    if (model == 1) {
-      if (tot <= p2 || p3 <= 0.0) {
-        value = p0 + p1 * tot;
-      } else {
-        value = p4 + (p0 + p1 * p2 - p4) * std::exp(-(tot - p2) / p3);
-      }
-    } else {
-      value = p0 + p1 * tot;
-    }
-    if (!std::isfinite(value) || value <= 0.0) {
-      return 0.0;
-    }
-    return value;
+    const double value = EvalNs(tot) - baseline;
+    return std::isfinite(value) ? value : 0.0;
   }
 };
 
@@ -655,12 +665,16 @@ std::unordered_map<int, TimewalkCorrection> LoadTimewalkCorrections(const char *
     ReadTParameter(*file, "timewalk_corr_p2_ch" + std::to_string(ch), correction.p2);
     ReadTParameter(*file, "timewalk_corr_p3_ch" + std::to_string(ch), correction.p3);
     ReadTParameter(*file, "timewalk_corr_p4_ch" + std::to_string(ch), correction.p4);
+    if (!ReadTParameter(*file, "timewalk_corr_baseline_ch" + std::to_string(ch), correction.baseline) &&
+        (correction.model == 1 || correction.model == 2)) {
+      correction.baseline = correction.p4;
+    }
     correction.valid = true;
     corrections[ch] = correction;
 
     std::cout << "Loaded timewalk correction ch" << ch << " model=" << correction.model << " p0="
               << correction.p0 << " p1=" << correction.p1 << " p2=" << correction.p2 << " p3="
-              << correction.p3 << " p4=" << correction.p4 << std::endl;
+              << correction.p3 << " p4=" << correction.p4 << " baseline=" << correction.baseline << std::endl;
   }
 
   if (corrections.empty()) {
@@ -740,8 +754,7 @@ DurationInfo ComputeDurationInfo(const std::vector<Hit> &hits,
   }
 
   struct EdgeRef {
-    long long time_tick = 0;
-    int fine = 0;
+    double time_ns = 0.0;
     int tdc = 0;
     size_t index = 0;
   };
@@ -754,13 +767,13 @@ DurationInfo ComputeDurationInfo(const std::vector<Hit> &hits,
     std::vector<EdgeRef> edges;
     edges.reserve(indices.size());
     for (size_t idx : indices) {
-      edges.push_back({hits[idx].time_tick, hits[idx].fine, hits[idx].tdc, idx});
+      edges.push_back({hits[idx].time_ns_raw, hits[idx].tdc, idx});
     }
     std::sort(edges.begin(), edges.end(), [](const EdgeRef &a, const EdgeRef &b) {
-      if (a.time_tick != b.time_tick) {
-        return a.time_tick < b.time_tick;
+      if (a.time_ns != b.time_ns) {
+        return a.time_ns < b.time_ns;
       }
-      return a.fine < b.fine;
+      return a.tdc < b.tdc;
     });
 
     std::array<bool, 2> have_leading = {false, false};
@@ -779,10 +792,7 @@ DurationInfo ComputeDurationInfo(const std::vector<Hit> &hits,
       if (pair < 0 || pair > 1) {
         continue;
       }
-      const auto &hit = hits[edge.index];
-      int tdc_index = analysis_time::TdcIndex(hit.fifo, hit.column, hit.pixel, hit.tdc);
-      double time_ns =
-          analysis_time::TimeNsFromTick(fine_calib, edge.time_tick, edge.fine, tdc_index, tick_ns, use_fine);
+      const double time_ns = edge.time_ns;
       if (IsLeadingTdc(edge.tdc)) {
         leading_time_ns[pair] = time_ns;
         leading_idx[pair] = edge.index;
@@ -864,6 +874,262 @@ struct PairStats {
   long long entries = 0;
   int boot_trials = 0;
 };
+
+struct TreeCursor {
+  std::string path;
+  std::unique_ptr<TFile> file;
+  TTree *tree = nullptr;
+  Long64_t entry = 0;
+  Long64_t entries = 0;
+  int current_spill = 0;
+  bool has_channel = false;
+  bool has_time_tick = false;
+  bool has_spill = false;
+  bool has_run_id = false;
+  bool has_device = false;
+  bool has_counter = false;
+  bool has_pending = false;
+  bool eof = false;
+  Hit pending;
+
+  int device = 0;
+  int fifo = 0;
+  int type = 0;
+  int counter = 0;
+  int spill = 0;
+  int column = 0;
+  int pixel = 0;
+  int tdc = 0;
+  int rollover = 0;
+  int coarse = 0;
+  int fine = 0;
+  int channel = 0;
+  int run_id = 0;
+  Long64_t time_tick = 0;
+};
+
+bool HasTreeBranch(TTree *tree, const char *name)
+{
+  return tree && tree->GetBranch(name) != nullptr;
+}
+
+bool OpenTreeCursor(const std::string &path, const std::string &tree_name, TreeCursor &cursor)
+{
+  cursor = TreeCursor{};
+  cursor.path = path;
+  cursor.file.reset(TFile::Open(path.c_str(), "READ"));
+  if (!cursor.file || cursor.file->IsZombie()) {
+    std::cout << "Failed to open decoded ROOT file: " << path << std::endl;
+    return false;
+  }
+  cursor.tree = dynamic_cast<TTree *>(cursor.file->Get(tree_name.c_str()));
+  if (!cursor.tree) {
+    std::cout << "Missing tree '" << tree_name << "' in " << path << std::endl;
+    return false;
+  }
+
+  std::vector<std::string> missing;
+  for (const auto &name : {"type", "fifo", "column", "pixel", "tdc", "rollover", "coarse", "fine"}) {
+    if (!HasTreeBranch(cursor.tree, name)) {
+      missing.emplace_back(name);
+    }
+  }
+  if (!missing.empty()) {
+    std::cout << "Error: missing required branches in " << path << ": ";
+    for (size_t i = 0; i < missing.size(); ++i) {
+      if (i) {
+        std::cout << ", ";
+      }
+      std::cout << missing[i];
+    }
+    std::cout << std::endl;
+    return false;
+  }
+
+  cursor.has_channel = HasTreeBranch(cursor.tree, "channel");
+  cursor.has_time_tick = HasTreeBranch(cursor.tree, "time_tick");
+  cursor.has_spill = HasTreeBranch(cursor.tree, "spill");
+  cursor.has_run_id = HasTreeBranch(cursor.tree, "run_id");
+  cursor.has_device = HasTreeBranch(cursor.tree, "device");
+  cursor.has_counter = HasTreeBranch(cursor.tree, "counter");
+
+  cursor.tree->SetBranchStatus("*", 0);
+  auto enable = [&cursor](const char *name) {
+    if (HasTreeBranch(cursor.tree, name)) {
+      cursor.tree->SetBranchStatus(name, 1);
+    }
+  };
+  for (const auto &name : {"type", "fifo", "column", "pixel", "tdc", "rollover", "coarse", "fine"}) {
+    enable(name);
+  }
+  for (const auto &name : {"device", "counter", "spill", "run_id", "channel", "time_tick"}) {
+    enable(name);
+  }
+
+  cursor.tree->SetBranchAddress("type", &cursor.type);
+  cursor.tree->SetBranchAddress("fifo", &cursor.fifo);
+  cursor.tree->SetBranchAddress("column", &cursor.column);
+  cursor.tree->SetBranchAddress("pixel", &cursor.pixel);
+  cursor.tree->SetBranchAddress("tdc", &cursor.tdc);
+  cursor.tree->SetBranchAddress("rollover", &cursor.rollover);
+  cursor.tree->SetBranchAddress("coarse", &cursor.coarse);
+  cursor.tree->SetBranchAddress("fine", &cursor.fine);
+  if (cursor.has_device) {
+    cursor.tree->SetBranchAddress("device", &cursor.device);
+  }
+  if (cursor.has_counter) {
+    cursor.tree->SetBranchAddress("counter", &cursor.counter);
+  }
+  if (cursor.has_spill) {
+    cursor.tree->SetBranchAddress("spill", &cursor.spill);
+  }
+  if (cursor.has_run_id) {
+    cursor.tree->SetBranchAddress("run_id", &cursor.run_id);
+  }
+  if (cursor.has_channel) {
+    cursor.tree->SetBranchAddress("channel", &cursor.channel);
+  }
+  if (cursor.has_time_tick) {
+    cursor.tree->SetBranchAddress("time_tick", &cursor.time_tick);
+  }
+
+  cursor.entries = cursor.tree->GetEntries();
+  return true;
+}
+
+bool AdvanceCursor(TreeCursor &cursor,
+                   const std::unordered_set<int> &channels,
+                   const analysis_time::FineCalib &fine_calib,
+                   const analysis_time::ChannelTdcOffsetCalib &tdc_offset_calib,
+                   double tick_ns,
+                   bool use_fine,
+                   int fine_cut)
+{
+  cursor.has_pending = false;
+  while (cursor.entry < cursor.entries) {
+    cursor.tree->GetEntry(cursor.entry++);
+    if (!cursor.has_spill && cursor.type == 15) {
+      ++cursor.current_spill;
+      continue;
+    }
+    if (cursor.type != 1) {
+      continue;
+    }
+
+    const int ch = cursor.has_channel ? cursor.channel : cursor.column * 4 + cursor.pixel;
+    if (channels.find(ch) == channels.end()) {
+      continue;
+    }
+
+    const int tdc_index = analysis_time::TdcIndex(cursor.fifo, cursor.column, cursor.pixel, cursor.tdc);
+    if (use_fine && !analysis_time::PassFineCut(fine_calib, cursor.fine, tdc_index, fine_cut)) {
+      continue;
+    }
+
+    Hit hit;
+    hit.run_id = cursor.has_run_id ? cursor.run_id : 0;
+    hit.device = cursor.has_device ? cursor.device : 0;
+    hit.fifo = cursor.fifo;
+    hit.type = cursor.type;
+    hit.counter = cursor.has_counter ? cursor.counter : 0;
+    hit.column = cursor.column;
+    hit.pixel = cursor.pixel;
+    hit.tdc = cursor.tdc;
+    hit.rollover = cursor.rollover;
+    hit.coarse = cursor.coarse;
+    hit.fine = cursor.fine;
+    hit.channel = ch;
+    hit.time_tick = cursor.has_time_tick ? cursor.time_tick : analysis_time::TimeTick(cursor.rollover, cursor.coarse);
+    hit.spill = cursor.has_spill ? cursor.spill : cursor.current_spill;
+    hit.time_ns_raw = analysis_time::TimeNsFromTick(fine_calib, hit.time_tick, hit.fine, tdc_index, tick_ns, use_fine);
+    hit.time_ns = hit.time_ns_raw - tdc_offset_calib.CorrectionNs(ch, hit.tdc);
+    cursor.pending = hit;
+    cursor.has_pending = true;
+    return true;
+  }
+
+  cursor.eof = true;
+  return false;
+}
+
+uint64_t HitRunSpillKey(const Hit &hit)
+{
+  return RunSpillKey(hit.run_id, hit.spill);
+}
+
+struct PreviewStore {
+  size_t max_events = 0;
+  std::unordered_map<int, size_t> total_leading;
+  std::unordered_map<int, size_t> total_tot;
+  std::unordered_map<int, std::vector<double>> times_by_channel;
+  std::unordered_map<int, std::vector<double>> tots_by_channel;
+
+  explicit PreviewStore(size_t max_events_in = 0)
+      : max_events(max_events_in)
+  {}
+
+  void AddLeading(const Hit &hit, double tot_ns)
+  {
+    ++total_leading[hit.channel];
+    auto &times = times_by_channel[hit.channel];
+    if (times.size() < max_events) {
+      times.push_back(hit.time_ns);
+    }
+    if (tot_ns > 0.0) {
+      ++total_tot[hit.channel];
+      auto &tots = tots_by_channel[hit.channel];
+      if (tots.size() < max_events) {
+        tots.push_back(tot_ns);
+      }
+    }
+  }
+};
+
+void PrintPreviewStore(const std::vector<int> &channel_list, const PreviewStore &preview)
+{
+  if (preview.max_events == 0) {
+    return;
+  }
+
+  std::cout << "First " << preview.max_events
+            << " leading-hit timestamps per channel, ordered by spill stream (after timing corrections / duration filter)"
+            << std::endl;
+  for (int ch : channel_list) {
+    auto total_it = preview.total_leading.find(ch);
+    const size_t total = (total_it != preview.total_leading.end()) ? total_it->second : 0;
+    auto values_it = preview.times_by_channel.find(ch);
+    const size_t shown = (values_it != preview.times_by_channel.end()) ? values_it->second.size() : 0;
+    std::cout << "  channel " << ch << " -> showing " << shown << " / " << total << std::endl;
+    if (values_it == preview.times_by_channel.end()) {
+      continue;
+    }
+    for (size_t i = 0; i < values_it->second.size(); ++i) {
+      std::ostringstream line;
+      line << std::fixed << std::setprecision(3);
+      line << "    [" << i << "] time_ns=" << values_it->second[i];
+      std::cout << line.str() << std::endl;
+    }
+  }
+
+  std::cout << "First " << preview.max_events
+            << " leading-hit ToT per channel, ordered by spill stream (after duration filter)" << std::endl;
+  for (int ch : channel_list) {
+    auto total_it = preview.total_tot.find(ch);
+    const size_t total = (total_it != preview.total_tot.end()) ? total_it->second : 0;
+    auto values_it = preview.tots_by_channel.find(ch);
+    const size_t shown = (values_it != preview.tots_by_channel.end()) ? values_it->second.size() : 0;
+    std::cout << "  channel " << ch << " -> showing " << shown << " / " << total << std::endl;
+    if (values_it == preview.tots_by_channel.end()) {
+      continue;
+    }
+    for (size_t i = 0; i < values_it->second.size(); ++i) {
+      std::ostringstream line;
+      line << std::fixed << std::setprecision(3);
+      line << "    [" << i << "] tot_ns=" << values_it->second[i];
+      std::cout << line.str() << std::endl;
+    }
+  }
+}
 
 bool FindNearestInWindow(const std::vector<HitRef> &hits, double time_ns, double window_ns, size_t &index)
 {
@@ -1622,6 +1888,349 @@ bool BuildCoincidentHitDistributions(const std::vector<Hit> &hits,
   return true;
 }
 
+std::vector<std::string> CoincidentPlotVars()
+{
+  return {
+      "device",
+      "fifo",
+      "type",
+      "counter",
+      "column",
+      "pixel",
+      "tdc",
+      "rollover",
+      "coarse",
+      "fine",
+  };
+}
+
+std::unique_ptr<TH1D> MakeStreamingVarHist(const std::string &name,
+                                           const std::string &title,
+                                           const std::string &var)
+{
+  int bins = 64;
+  double lo = -0.5;
+  double hi = 63.5;
+
+  if (var == "fifo") {
+    bins = 25;
+    hi = 24.5;
+  } else if (var == "type") {
+    bins = 20;
+    hi = 19.5;
+  } else if (var == "column") {
+    bins = 8;
+    hi = 7.5;
+  } else if (var == "pixel") {
+    bins = 4;
+    hi = 3.5;
+  } else if (var == "tdc") {
+    bins = 4;
+    hi = 3.5;
+  } else if (var == "fine") {
+    bins = BinsForRange(0.0, static_cast<double>(analysis_time::kFineBins));
+    lo = -0.5;
+    hi = static_cast<double>(analysis_time::kFineBins) - 0.5;
+  } else if (var == "counter") {
+    bins = 200;
+    hi = 4095.5;
+  } else if (var == "rollover") {
+    bins = 200;
+    hi = 65535.5;
+  } else if (var == "coarse") {
+    bins = 200;
+    hi = 32767.5;
+  } else if (var == "device") {
+    bins = 16;
+    hi = 15.5;
+  }
+
+  auto hist = std::make_unique<TH1D>(name.c_str(), title.c_str(), bins, lo, hi);
+  hist->SetDirectory(nullptr);
+  hist->SetLineWidth(2);
+  return hist;
+}
+
+std::vector<CoincPlotSet> InitStreamingCoincidentPlotSets(const std::vector<PairConfig> &pairs,
+                                                          double max_duration_ns)
+{
+  std::vector<CoincPlotSet> sets;
+  sets.reserve(pairs.size());
+  auto vars = CoincidentPlotVars();
+  auto colors = DefaultColors();
+
+  for (size_t p = 0; p < pairs.size(); ++p) {
+    const auto &pair = pairs[p];
+    std::vector<int> pair_channels = {pair.channel_a, pair.channel_b};
+    std::ostringstream label;
+    label << "pair" << p << "_ch" << pair.channel_a << "_" << pair.channel_b << "_w" << pair.window_ns;
+    std::string label_tag = SanitizeTag(label.str());
+    std::ostringstream title_prefix;
+    title_prefix << "coincident hits ch " << pair.channel_a << " vs " << pair.channel_b
+                 << " (window " << pair.window_ns << " ns)";
+
+    CoincPlotSet set;
+    set.label = label_tag;
+    set.title_prefix = title_prefix.str();
+    set.channels = pair_channels;
+
+    const double duration_plot_max = std::max(pair.window_ns, max_duration_ns > 0.0 ? max_duration_ns : 0.0);
+    if (duration_plot_max > 0.0) {
+      int bins = static_cast<int>(duration_plot_max * 4.0);
+      if (bins < 1) {
+        bins = 1;
+      }
+      if (bins > 400) {
+        bins = 400;
+      }
+      CoincPlotGroup duration_group;
+      duration_group.kind = "duration";
+      duration_group.name = "coinc_" + label_tag + "_duration";
+      std::ostringstream duration_title;
+      duration_title << set.title_prefix << " Time-over-Threshold (ToT) (<= " << duration_plot_max
+                     << " ns); ToT [ns]; entries";
+      duration_group.title = duration_title.str();
+      duration_group.hists.reserve(pair_channels.size());
+      for (size_t i = 0; i < pair_channels.size(); ++i) {
+        std::string name = "h_coinc_" + label_tag + "_duration_ch" + std::to_string(pair_channels[i]);
+        std::ostringstream ch_title;
+        ch_title << set.title_prefix << " Time-over-Threshold (ToT) (channel " << pair_channels[i]
+                 << ", <= " << duration_plot_max << " ns); ToT [ns]; entries";
+        auto hist = std::make_unique<TH1D>(name.c_str(), ch_title.str().c_str(), bins, 0.0, duration_plot_max);
+        hist->SetLineColor(colors[i % colors.size()]);
+        hist->SetLineWidth(2);
+        hist->SetDirectory(nullptr);
+        duration_group.hists.push_back(std::move(hist));
+      }
+      set.groups.push_back(std::move(duration_group));
+    }
+
+    for (const auto &var : vars) {
+      CoincPlotGroup group;
+      group.kind = var;
+      group.name = "coinc_" + label_tag + "_" + var;
+      group.title = set.title_prefix + ": " + var + "; " + var + "; entries";
+      group.hists.reserve(pair_channels.size());
+      for (size_t i = 0; i < pair_channels.size(); ++i) {
+        std::string name = "h_coinc_" + label_tag + "_" + var + "_ch" + std::to_string(pair_channels[i]);
+        std::string ch_title =
+            set.title_prefix + " " + var + " (channel " + std::to_string(pair_channels[i]) + "); " + var +
+            "; entries";
+        auto hist = MakeStreamingVarHist(name, ch_title, var);
+        hist->SetLineColor(colors[i % colors.size()]);
+        group.hists.push_back(std::move(hist));
+      }
+      set.groups.push_back(std::move(group));
+    }
+
+    sets.push_back(std::move(set));
+  }
+
+  return sets;
+}
+
+void FillCoincidentPlotSetFromMask(const std::vector<Hit> &hits,
+                                   const std::vector<char> &coincident_hits,
+                                   CoincPlotSet &set,
+                                   const std::vector<double> &tot_per_hit,
+                                   double min_duration_ns,
+                                   const std::unordered_map<int, double> &per_channel_min_duration_ns,
+                                   double duration_plot_max_ns)
+{
+  if (hits.empty() || coincident_hits.empty() || set.groups.empty()) {
+    return;
+  }
+
+  std::unordered_map<int, size_t> channel_index;
+  channel_index.reserve(set.channels.size());
+  for (size_t i = 0; i < set.channels.size(); ++i) {
+    channel_index[set.channels[i]] = i;
+  }
+
+  for (size_t i = 0; i < hits.size(); ++i) {
+    if (i >= coincident_hits.size() || !coincident_hits[i]) {
+      continue;
+    }
+    auto idx_it = channel_index.find(hits[i].channel);
+    if (idx_it == channel_index.end()) {
+      continue;
+    }
+    const size_t channel_pos = idx_it->second;
+
+    for (auto &group : set.groups) {
+      if (channel_pos >= group.hists.size() || !group.hists[channel_pos]) {
+        continue;
+      }
+      if (group.kind == "duration") {
+        if (i >= tot_per_hit.size() || !IsLeadingTdc(hits[i].tdc)) {
+          continue;
+        }
+        const double dt_ns = tot_per_hit[i];
+        if (dt_ns <= 0.0) {
+          continue;
+        }
+        const double channel_min_duration =
+            std::max(0.0, ChannelMinDurationNs(per_channel_min_duration_ns, hits[i].channel, min_duration_ns));
+        if (dt_ns < channel_min_duration) {
+          continue;
+        }
+        if (duration_plot_max_ns > 0.0 && dt_ns > duration_plot_max_ns) {
+          continue;
+        }
+        group.hists[channel_pos]->Fill(dt_ns);
+      } else {
+        group.hists[channel_pos]->Fill(ValueForVar(hits[i], group.kind));
+      }
+    }
+  }
+}
+
+void ProcessStreamingSpill(std::vector<Hit> &hits,
+                           std::vector<PairConfig> &pairs,
+                           std::vector<GroupConfig> &groups,
+                           TH1D *pair_mean_hist,
+                           double pair_mean_window_a,
+                           double pair_mean_window_b,
+                           std::vector<CoincPlotSet> &pair_plot_sets,
+                           std::unordered_map<int, long long> &hit_counts,
+                           const analysis_time::FineCalib &fine_calib,
+                           double tick_ns,
+                           bool use_fine,
+                           double min_duration_ns,
+                           double max_duration_ns,
+                           const std::unordered_map<int, double> &per_channel_min_duration_ns,
+                           const analysis_time::ChannelCalib &chan_calib,
+                           const std::unordered_map<int, TimewalkCorrection> &timewalk_corrections,
+                           long long &timewalk_corrected_hits,
+                           PreviewStore &preview)
+{
+  if (hits.empty()) {
+    return;
+  }
+
+  std::vector<char> leading_mask;
+  std::vector<int> leading_to_trailing;
+  const bool use_duration_filter =
+      max_duration_ns > 0.0 || min_duration_ns > 0.0 || !per_channel_min_duration_ns.empty();
+  if (use_duration_filter) {
+    auto duration_info = ComputeDurationInfo(
+        hits, fine_calib, tick_ns, min_duration_ns, max_duration_ns, per_channel_min_duration_ns, use_fine);
+    leading_mask = std::move(duration_info.leading_mask);
+    leading_to_trailing = std::move(duration_info.leading_to_trailing);
+  } else {
+    leading_mask.assign(hits.size(), 0);
+    leading_to_trailing.assign(hits.size(), -1);
+    for (size_t i = 0; i < hits.size(); ++i) {
+      if (IsLeadingTdc(hits[i].tdc)) {
+        leading_mask[i] = 1;
+      }
+    }
+  }
+
+  std::vector<double> tot_per_hit(hits.size(), -1.0);
+  if (use_duration_filter) {
+    for (size_t i = 0; i < hits.size(); ++i) {
+      if (i >= leading_mask.size() || !leading_mask[i]) {
+        continue;
+      }
+      int trailing = (i < leading_to_trailing.size()) ? leading_to_trailing[i] : -1;
+      if (trailing < 0 || trailing >= static_cast<int>(hits.size())) {
+        continue;
+      }
+      double dt = hits[trailing].time_ns_raw - hits[i].time_ns_raw;
+      const double channel_min_duration =
+          std::max(0.0, ChannelMinDurationNs(per_channel_min_duration_ns, hits[i].channel, min_duration_ns));
+      if (dt <= 0.0 || dt < channel_min_duration || (max_duration_ns > 0.0 && dt > max_duration_ns)) {
+        continue;
+      }
+      tot_per_hit[i] = dt;
+      tot_per_hit[static_cast<size_t>(trailing)] = dt;
+    }
+  }
+
+  if (chan_calib.loaded) {
+    if (max_duration_ns > 0.0) {
+      for (size_t i = 0; i < hits.size(); ++i) {
+        if (i >= leading_mask.size() || !leading_mask[i]) {
+          continue;
+        }
+        double tot = tot_per_hit[i];
+        if (tot <= 0.0) {
+          continue;
+        }
+        hits[i].time_ns -= chan_calib.CorrectionNs(hits[i].channel, tot);
+      }
+    }
+  }
+
+  if (!timewalk_corrections.empty()) {
+    for (size_t i = 0; i < hits.size(); ++i) {
+      if (i >= leading_mask.size() || !leading_mask[i]) {
+        continue;
+      }
+      const double tot = tot_per_hit[i];
+      if (tot <= 0.0) {
+        continue;
+      }
+      auto correction_it = timewalk_corrections.find(hits[i].channel);
+      if (correction_it == timewalk_corrections.end()) {
+        continue;
+      }
+      const double correction_ns = correction_it->second.CorrectionNs(tot);
+      if (!std::isfinite(correction_ns)) {
+        continue;
+      }
+      hits[i].time_ns -= correction_ns;
+      ++timewalk_corrected_hits;
+    }
+  }
+
+  if (preview.max_events > 0) {
+    for (size_t i = 0; i < hits.size(); ++i) {
+      if (i < leading_mask.size() && leading_mask[i]) {
+        const double tot = (i < tot_per_hit.size()) ? tot_per_hit[i] : -1.0;
+        preview.AddLeading(hits[i], tot);
+      }
+    }
+  }
+
+  for (auto &pair : pairs) {
+    pair.coincident_hits.assign(hits.size(), 0);
+  }
+  std::vector<char> all_coincident_hits(hits.size(), 0);
+
+  std::unordered_map<int, std::vector<HitRef>> spill_hits;
+  for (size_t i = 0; i < hits.size(); ++i) {
+    if (i >= leading_mask.size() || !leading_mask[i]) {
+      continue;
+    }
+    spill_hits[hits[i].channel].push_back({hits[i].time_ns, i});
+  }
+
+  ProcessSpill(spill_hits, pairs, hits, tot_per_hit, hit_counts, leading_to_trailing, all_coincident_hits);
+  ProcessGroupSpill(spill_hits, groups, hits, leading_to_trailing, all_coincident_hits);
+  if (pair_mean_hist) {
+    std::vector<double> means_a;
+    std::vector<double> means_b;
+    if (CollectPairMeanTimes(spill_hits, 17, 19, pair_mean_window_a, means_a) &&
+        CollectPairMeanTimes(spill_hits, 22, 23, pair_mean_window_b, means_b)) {
+      FillMeanTimeDiffs(means_a, means_b, pair_mean_hist);
+    }
+  }
+
+  for (size_t p = 0; p < pairs.size() && p < pair_plot_sets.size(); ++p) {
+    const double duration_plot_max = std::max(pairs[p].window_ns, max_duration_ns > 0.0 ? max_duration_ns : 0.0);
+    FillCoincidentPlotSetFromMask(hits,
+                                  pairs[p].coincident_hits,
+                                  pair_plot_sets[p],
+                                  tot_per_hit,
+                                  min_duration_ns,
+                                  per_channel_min_duration_ns,
+                                  duration_plot_max);
+    pairs[p].coincident_hits.clear();
+  }
+}
+
 void FitAndAnnotateDurationStack(const CoincPlotSet &set,
                                  const CoincPlotGroup &group,
                                  std::vector<std::unique_ptr<TF1>> &fits,
@@ -2370,91 +2979,6 @@ void coincidence_rdf(const char *decoded_dir = "../raw_data/latest/kc705-196/dec
     std::cout << "Pair-mean plot skipped (needs channels 17,19,22,23 in config)." << std::endl;
   }
 
-  ROOT::RDataFrame df(input_spec.tree_name.c_str(), input_spec.files);
-  auto colnames = df.GetColumnNames();
-  if (colnames.empty()) {
-    std::cout << "Error: no branches found in tree '" << input_spec.tree_name
-              << "'. The decoded file may be empty. Re-run the decoder." << std::endl;
-    return;
-  }
-  auto has_branch = [&colnames](const std::string &name) {
-    return std::find(colnames.begin(), colnames.end(), name) != colnames.end();
-  };
-  std::vector<std::string> missing;
-  for (const auto &name : {"type", "fifo", "column", "pixel", "tdc", "rollover", "coarse", "fine"}) {
-    if (!has_branch(name)) {
-      missing.emplace_back(name);
-    }
-  }
-  if (!missing.empty()) {
-    std::cout << "Error: missing required branches in tree '" << input_spec.tree_name << "': ";
-    for (size_t i = 0; i < missing.size(); ++i) {
-      if (i) {
-        std::cout << ", ";
-      }
-      std::cout << missing[i];
-    }
-    std::cout << std::endl << "Available branches: ";
-    for (size_t i = 0; i < colnames.size(); ++i) {
-      if (i) {
-        std::cout << ", ";
-      }
-      std::cout << colnames[i];
-    }
-    std::cout << std::endl;
-    return;
-  }
-  bool has_channel = std::find(colnames.begin(), colnames.end(), "channel") != colnames.end();
-  bool has_time_tick = std::find(colnames.begin(), colnames.end(), "time_tick") != colnames.end();
-  bool has_spill = std::find(colnames.begin(), colnames.end(), "spill") != colnames.end();
-  bool has_run_id = std::find(colnames.begin(), colnames.end(), "run_id") != colnames.end();
-
-  ROOT::RDF::RNode df_time = df;
-  if (!has_channel) {
-    df_time = df_time.Define("channel", "column * 4 + pixel");
-  }
-  if (!has_time_tick) {
-    df_time = df_time.Define("time_tick", analysis_time::TimeTickLambda(), {"rollover", "coarse"});
-  }
-  if (!has_spill) {
-    df_time = df_time.Define("spill", "0");
-  }
-  if (!has_run_id) {
-    df_time = df_time.Define("run_id", "0");
-  }
-
-  auto types = df_time.Take<int>("type");
-  auto channels_v = df_time.Take<int>("channel");
-  auto ticks = df_time.Take<Long64_t>("time_tick");
-  auto fines = df_time.Take<int>("fine");
-  auto spills = df_time.Take<int>("spill");
-  auto run_ids = df_time.Take<int>("run_id");
-  auto devices = df_time.Take<int>("device");
-  auto fifos = df_time.Take<int>("fifo");
-  auto counters = df_time.Take<int>("counter");
-  auto columns = df_time.Take<int>("column");
-  auto pixels = df_time.Take<int>("pixel");
-  auto tdcs = df_time.Take<int>("tdc");
-  auto rollovers = df_time.Take<int>("rollover");
-  auto coarses = df_time.Take<int>("coarse");
-  ROOT::RDF::RunGraphs({types, channels_v, ticks, fines, spills, run_ids, devices, fifos, counters, columns, pixels,
-                        tdcs, rollovers, coarses});
-
-  const auto &types_val = types.GetValue();
-  const auto &channels_val = channels_v.GetValue();
-  const auto &ticks_val = ticks.GetValue();
-  const auto &fines_val = fines.GetValue();
-  const auto &spills_val = spills.GetValue();
-  const auto &run_ids_val = run_ids.GetValue();
-  const auto &devices_val = devices.GetValue();
-  const auto &fifos_val = fifos.GetValue();
-  const auto &counters_val = counters.GetValue();
-  const auto &columns_val = columns.GetValue();
-  const auto &pixels_val = pixels.GetValue();
-  const auto &tdcs_val = tdcs.GetValue();
-  const auto &rollovers_val = rollovers.GetValue();
-  const auto &coarses_val = coarses.GetValue();
-
   std::vector<int> channel_list(channels.begin(), channels.end());
   std::sort(channel_list.begin(), channel_list.end());
   const auto timewalk_corrections = LoadTimewalkCorrections(timewalk_calib_path, channel_list);
@@ -2462,10 +2986,6 @@ void coincidence_rdf(const char *decoded_dir = "../raw_data/latest/kc705-196/dec
     std::cout << "Timewalk calibration requested but no correction will be applied." << std::endl;
   }
 
-  std::vector<Hit> hits;
-  hits.reserve(types_val.size());
-  std::vector<char> coincident_hits;
-  coincident_hits.reserve(types_val.size());
   std::unordered_map<int, long long> hit_counts;
   const double tick_ns = analysis_time::TickNs(clock_mhz);
   analysis_time::FineCalib fine_calib;
@@ -2478,6 +2998,13 @@ void coincidence_rdf(const char *decoded_dir = "../raw_data/latest/kc705-196/dec
   }
   fine_calib.use_lut = use_lut;
   analysis_time::PrintFineCalibConstants(fine_calib);
+
+  analysis_time::ChannelTdcOffsetCalib tdc_offset_calib;
+  if (fine_calib_path && fine_calib_path[0] != '\0') {
+    tdc_offset_calib.LoadFromFile(fine_calib_path);
+  }
+  analysis_time::PrintChannelTdcOffsetSummary(tdc_offset_calib);
+
   if (chan_calib_path && chan_calib_path[0] != '\0') {
     if (chan_calib_loaded) {
       std::cout << "Loaded channel calibration: " << chan_calib_path << std::endl;
@@ -2495,169 +3022,85 @@ void coincidence_rdf(const char *decoded_dir = "../raw_data/latest/kc705-196/dec
   if (min_duration_ns < 0.0) {
     min_duration_ns = 0.0;
   }
-
-  int current_spill = 0;
-  for (size_t i = 0; i < types_val.size(); ++i) {
-    const int type = types_val[i];
-    int spill = 0;
-    int run_id = 0;
-    if (!has_spill) {
-      if (type == 15) {
-        ++current_spill;
-        continue;
-      }
-      if (type != 1) {
-        continue;
-      }
-      spill = current_spill;
-    } else {
-      if (type != 1) {
-        continue;
-      }
-      spill = spills_val[i];
-    }
-    if (has_run_id) {
-      run_id = run_ids_val[i];
-    }
-    const int ch = channels_val[i];
-    if (channels.find(ch) == channels.end()) {
-      continue;
-    }
-    Hit hit;
-    hit.run_id = run_id;
-    hit.device = devices_val[i];
-    hit.fifo = fifos_val[i];
-    hit.type = type;
-    hit.counter = counters_val[i];
-    hit.column = columns_val[i];
-    hit.pixel = pixels_val[i];
-    hit.tdc = tdcs_val[i];
-    hit.rollover = rollovers_val[i];
-    hit.coarse = coarses_val[i];
-    hit.fine = fines_val[i];
-    hit.channel = ch;
-    hit.time_tick = ticks_val[i];
-    hit.spill = spill;
-    int tdc_index = analysis_time::TdcIndex(hit.fifo, hit.column, hit.pixel, hit.tdc);
-    if (use_fine && !analysis_time::PassFineCut(fine_calib, fines_val[i], tdc_index, fine_cut)) {
-      continue;
-    }
-    double time_ns =
-        analysis_time::TimeNsFromTick(fine_calib, ticks_val[i], fines_val[i], tdc_index, tick_ns, use_fine);
-    hit.time_ns = time_ns;
-    hits.push_back(hit);
-    coincident_hits.push_back(0);
-  }
-
-  std::vector<char> leading_mask;
-  std::vector<int> leading_to_trailing;
-  const bool use_duration_filter = max_duration_ns > 0.0 || min_duration_ns > 0.0 || !per_channel_min_duration_ns.empty();
-  if (use_duration_filter) {
-    auto duration_info = ComputeDurationInfo(
-        hits, fine_calib, tick_ns, min_duration_ns, max_duration_ns, per_channel_min_duration_ns, use_fine);
-    leading_mask = std::move(duration_info.leading_mask);
-    leading_to_trailing = std::move(duration_info.leading_to_trailing);
-  } else {
-    leading_mask.assign(hits.size(), 0);
-    leading_to_trailing.assign(hits.size(), -1);
-    for (size_t i = 0; i < hits.size(); ++i) {
-      if (IsLeadingTdc(hits[i].tdc)) {
-        leading_mask[i] = 1;
-      }
-    }
-  }
-
-  std::vector<double> tot_per_hit(hits.size(), -1.0);
-  if (use_duration_filter) {
-    for (size_t i = 0; i < hits.size(); ++i) {
-      if (i >= leading_mask.size() || !leading_mask[i]) {
-        continue;
-      }
-      int trailing = (i < leading_to_trailing.size()) ? leading_to_trailing[i] : -1;
-      if (trailing < 0 || trailing >= static_cast<int>(hits.size())) {
-        continue;
-      }
-      double dt = hits[trailing].time_ns - hits[i].time_ns;
-      const double channel_min_duration =
-          std::max(0.0, ChannelMinDurationNs(per_channel_min_duration_ns, hits[i].channel, min_duration_ns));
-      if (dt <= 0.0 || dt < channel_min_duration || (max_duration_ns > 0.0 && dt > max_duration_ns)) {
-        continue;
-      }
-      tot_per_hit[i] = dt;
-      tot_per_hit[static_cast<size_t>(trailing)] = dt;
-    }
-  }
-
-  if (chan_calib.loaded) {
-    if (max_duration_ns <= 0.0) {
-      std::cout << "Channel calibration loaded but max_duration_ns <= 0; skipping correction." << std::endl;
-    } else {
-      for (size_t i = 0; i < hits.size(); ++i) {
-        if (i >= leading_mask.size() || !leading_mask[i]) {
-          continue;
-        }
-        double tot = tot_per_hit[i];
-        if (tot <= 0.0) {
-          continue;
-        }
-        hits[i].time_ns -= chan_calib.CorrectionNs(hits[i].channel, tot);
-      }
-    }
-  }
-
-  if (!timewalk_corrections.empty()) {
-    long long corrected_hits = 0;
-    for (size_t i = 0; i < hits.size(); ++i) {
-      if (i >= leading_mask.size() || !leading_mask[i]) {
-        continue;
-      }
-      const double tot = tot_per_hit[i];
-      if (tot <= 0.0) {
-        continue;
-      }
-      auto correction_it = timewalk_corrections.find(hits[i].channel);
-      if (correction_it == timewalk_corrections.end()) {
-        continue;
-      }
-      const double correction_ns = correction_it->second.CorrectionNs(tot);
-      if (correction_ns <= 0.0) {
-        continue;
-      }
-      hits[i].time_ns -= correction_ns;
-      ++corrected_hits;
-    }
-    std::cout << "Applied timewalk correction to " << corrected_hits << " leading hits" << std::endl;
+  if (chan_calib.loaded && max_duration_ns <= 0.0) {
+    std::cout << "Channel calibration loaded but max_duration_ns <= 0; skipping correction." << std::endl;
   }
 
   if (preview_hits < 0) {
     preview_hits = 0;
   }
-  PrintLeadingEventPreview(channel_list, hits, leading_mask, static_cast<size_t>(preview_hits));
-  PrintLeadingTotPreview(channel_list, hits, leading_mask, tot_per_hit, static_cast<size_t>(preview_hits));
 
-  for (auto &pair : pairs) {
-    pair.coincident_hits.assign(hits.size(), 0);
-  }
+  std::vector<CoincPlotSet> pair_plot_sets = InitStreamingCoincidentPlotSets(pairs, max_duration_ns);
+  PreviewStore preview(static_cast<size_t>(preview_hits));
 
-  std::unordered_map<uint64_t, std::unordered_map<int, std::vector<HitRef>>> spill_hits;
-  for (size_t i = 0; i < hits.size(); ++i) {
-    if (i >= leading_mask.size() || !leading_mask[i]) {
-      continue;
+  std::vector<TreeCursor> cursors;
+  cursors.reserve(input_spec.files.size());
+  for (const auto &file : input_spec.files) {
+    TreeCursor cursor;
+    if (!OpenTreeCursor(file, input_spec.tree_name, cursor)) {
+      return;
     }
-    spill_hits[RunSpillKey(hits[i].run_id, hits[i].spill)][hits[i].channel].push_back({hits[i].time_ns, i});
+    AdvanceCursor(cursor, channels, fine_calib, tdc_offset_calib, tick_ns, use_fine, fine_cut);
+    cursors.push_back(std::move(cursor));
   }
-  for (auto &spill : spill_hits) {
-    ProcessSpill(spill.second, pairs, hits, tot_per_hit, hit_counts, leading_to_trailing, coincident_hits);
-    ProcessGroupSpill(spill.second, groups, hits, leading_to_trailing, coincident_hits);
-    if (pair_mean_hist) {
-      std::vector<double> means_a;
-      std::vector<double> means_b;
-      if (CollectPairMeanTimes(spill.second, 17, 19, pair_mean_window_a, means_a) &&
-          CollectPairMeanTimes(spill.second, 22, 23, pair_mean_window_b, means_b)) {
-        FillMeanTimeDiffs(means_a, means_b, pair_mean_hist.get());
+
+  long long selected_hits = 0;
+  long long processed_spills = 0;
+  size_t max_spill_hits = 0;
+  long long timewalk_corrected_hits = 0;
+  while (true) {
+    bool found = false;
+    uint64_t min_key = std::numeric_limits<uint64_t>::max();
+    for (const auto &cursor : cursors) {
+      if (!cursor.has_pending) {
+        continue;
+      }
+      const uint64_t key = HitRunSpillKey(cursor.pending);
+      if (!found || key < min_key) {
+        min_key = key;
+        found = true;
       }
     }
+    if (!found) {
+      break;
+    }
+
+    std::vector<Hit> spill_hits;
+    for (auto &cursor : cursors) {
+      while (cursor.has_pending && HitRunSpillKey(cursor.pending) == min_key) {
+        spill_hits.push_back(cursor.pending);
+        AdvanceCursor(cursor, channels, fine_calib, tdc_offset_calib, tick_ns, use_fine, fine_cut);
+      }
+    }
+    selected_hits += static_cast<long long>(spill_hits.size());
+    max_spill_hits = std::max(max_spill_hits, spill_hits.size());
+    ProcessStreamingSpill(spill_hits,
+                          pairs,
+                          groups,
+                          pair_mean_hist.get(),
+                          pair_mean_window_a,
+                          pair_mean_window_b,
+                          pair_plot_sets,
+                          hit_counts,
+                          fine_calib,
+                          tick_ns,
+                          use_fine,
+                          min_duration_ns,
+                          max_duration_ns,
+                          per_channel_min_duration_ns,
+                          chan_calib,
+                          timewalk_corrections,
+                          timewalk_corrected_hits,
+                          preview);
+    ++processed_spills;
   }
+  std::cout << "Processed selected hits: " << selected_hits
+            << " across " << processed_spills
+            << " run/spill blocks (max selected hits in one block: " << max_spill_hits << ")" << std::endl;
+  if (!timewalk_corrections.empty()) {
+    std::cout << "Applied timewalk correction to " << timewalk_corrected_hits << " leading hits" << std::endl;
+  }
+  PrintPreviewStore(channel_list, preview);
 
   std::cout << "Coincidence summary" << std::endl;
   for (const auto &pair : pairs) {
@@ -2898,34 +3341,6 @@ void coincidence_rdf(const char *decoded_dir = "../raw_data/latest/kc705-196/dec
   }
 
   PlotGroupCoincidencePlots(groups, out_pdf);
-  std::vector<CoincPlotSet> pair_plot_sets;
-  for (size_t p = 0; p < pairs.size(); ++p) {
-    auto &pair = pairs[p];
-    std::vector<int> pair_channels = {pair.channel_a, pair.channel_b};
-    std::ostringstream label;
-    label << "pair" << p << "_ch" << pair.channel_a << "_" << pair.channel_b << "_w" << pair.window_ns;
-    std::string label_tag = SanitizeTag(label.str());
-    std::ostringstream title;
-    title << "coincident hits ch " << pair.channel_a << " vs " << pair.channel_b
-          << " (window " << pair.window_ns << " ns)";
-    const double duration_plot_max = std::max(pair.window_ns, max_duration_ns > 0.0 ? max_duration_ns : 0.0);
-    CoincPlotSet set;
-    if (BuildCoincidentHitDistributions(hits,
-                                        fine_calib,
-                                        pair.coincident_hits,
-                                        pair_channels,
-                                        tick_ns,
-                                        use_fine,
-                                        tot_per_hit,
-                                        min_duration_ns,
-                                        per_channel_min_duration_ns,
-                                        duration_plot_max,
-                                        label_tag,
-                                        title.str(),
-                                        set)) {
-      pair_plot_sets.push_back(std::move(set));
-    }
-  }
   DrawCoincidentStacksPerPair(pair_plot_sets, out_pdf);
   DrawCoincidentStacksPerVariable(pair_plot_sets, out_pdf);
 

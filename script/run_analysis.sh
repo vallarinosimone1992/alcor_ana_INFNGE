@@ -15,7 +15,8 @@ Options:
   -l, --logbook FILE      JSON logbook (default: config/logbook.json)
       --channels LIST     override active channels (default: config/logbook)
   -o, --output-prefix STR output prefix (default: derived from input run)
-  -k, --tdc-calib FILE    TDC calibration ROOT file (default: calibration/TDC_calibration.root)
+  -k, --tdc-calib FILE    TDC calibration ROOT file with fine timing and channel/TDC offsets
+                           (default: calibration/TDC_calibration.root)
       --calib FILE        alias for --tdc-calib
       --timewalk-calib FILE
                            timewalk correction ROOT file (default: calibration/timewalk_correction.root if present)
@@ -27,7 +28,7 @@ Options:
       --min-duration NS   minimum ToT duration override
   -m, --clock MHz         clock frequency override
   -f, --use-fine [0|1]    enable fine timing
-      --no-fine           disable fine timing
+      --no-fine           disable fine timing interpolation
       --no-lut            disable fine LUT
       --fine-cut N        exclude hits close to fine wrap cut
       --preview-hits N    print first N leading hits per channel
