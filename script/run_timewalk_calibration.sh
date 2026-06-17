@@ -31,16 +31,18 @@ Common options:
   -h, --help              show this help
 
 Trigger-mode options:
-      --reference-mode event-median|trigger
-                           event-median uses all selected SiPMs as laser reference (default);
-                           trigger uses --trigger as legacy reference channel
+      --reference-mode trigger|event-median
+                           trigger uses --trigger as laser reference (default: ch22);
+                           event-median uses selected SiPMs as laser reference
       --reference-min-channels N
-                           minimum channels per event-median laser cluster (default: 3)
-      --trigger CH        laser trigger/reference channel for --reference-mode trigger (default: 22)
-      --sensors CSV       SiPM channels to correct (default: logbook)
+                           minimum channels per event-median cluster (default: 3)
+      --trigger CH        laser trigger/reference channel (default: 22)
+      --sensors CSV       SiPM channels to correct (default: logbook; the trigger
+                           channel is removed in --reference-mode trigger)
   -w, --window NS         trigger matching window (default: 100)
-      --trigger-deadtime NS
-                           minimum separation for trigger cleanup (default: 50000)
+      --event-window NS   event-building window (default: same as --window)
+      --trigger-veto NS   veto after an accepted trigger, alias --trigger-deadtime
+                           (default: 0; e.g. 20 rejects 12-15 ns rebounds)
       --trigger-period NS expected valid trigger period (default: 1000000)
       --trigger-period-tol NS
                            tolerance for trigger-period cleanup (default: 50000)
@@ -49,7 +51,9 @@ Trigger-mode options:
                            fit ranges per channel (default: 17:0:30,19:0:30)
       --timewalk-fit-model MODEL
                            pol1, pol1-plateau, or lin-exp-plateau (default: pol1-plateau)
-      --dt-tot-cut CSV    lower diagonal cut in the dt/ToT plane
+      --dt-tot-cut CSV    diagonal cut CH:DT0:SLOPE[:TOT_MIN:TOT_MAX]
+      --dt-tot-cut-direction below|above
+                           below keeps dt <= line; above keeps dt >= line (default: below)
       --trigger-tot-window CSV
                            trigger ToT window MIN:MAX
       --spill-range CSV   inclusive spill selection range MIN:MAX
@@ -86,12 +90,13 @@ use_lut=1
 fine_cut=0
 dry_run=0
 
-reference_mode="event-median"
+reference_mode="trigger"
 reference_min_channels=3
 trigger_channel=22
 sensor_channels="logbook"
 match_window_ns=100
-trigger_deadtime_ns=50000
+event_window_ns=0
+trigger_deadtime_ns=0
 trigger_period_ns=1000000
 trigger_period_tolerance_ns=50000
 trigger_period_set=0
@@ -100,6 +105,7 @@ signed_dt=0
 timewalk_fit_ranges="17:0:30,19:0:30"
 timewalk_fit_model="pol1-plateau"
 dt_tot_cut=""
+dt_tot_cut_direction="below"
 trigger_tot_window=""
 spill_range=""
 channel_tot_windows=""
@@ -289,12 +295,21 @@ while [ "$#" -gt 0 ]; do
       match_window_ns=${1#*=}
       shift
       ;;
-    --trigger-deadtime)
+    --event-window|--event-window-ns)
+      need_arg "$@"
+      event_window_ns=${2:-}
+      shift 2
+      ;;
+    --event-window=*|--event-window-ns=*)
+      event_window_ns=${1#*=}
+      shift
+      ;;
+    --trigger-deadtime|--trigger-veto|--trigger-veto-ns)
       need_arg "$@"
       trigger_deadtime_ns=${2:-}
       shift 2
       ;;
-    --trigger-deadtime=*)
+    --trigger-deadtime=*|--trigger-veto=*|--trigger-veto-ns=*)
       trigger_deadtime_ns=${1#*=}
       shift
       ;;
@@ -349,6 +364,15 @@ while [ "$#" -gt 0 ]; do
       ;;
     --dt-tot-cut=*|--timewalk-dt-tot-cut=*|--timewalk-selection-cut=*)
       dt_tot_cut=${1#*=}
+      shift
+      ;;
+    --dt-tot-cut-direction|--dt-tot-direction|--timewalk-selection-direction)
+      need_arg "$@"
+      dt_tot_cut_direction=${2:-}
+      shift 2
+      ;;
+    --dt-tot-cut-direction=*|--dt-tot-direction=*|--timewalk-selection-direction=*)
+      dt_tot_cut_direction=${1#*=}
       shift
       ;;
     --trigger-tot-window|--trigger-tot-cut|--reference-tot-window|--ref-tot-window)
@@ -464,6 +488,19 @@ case "${reference_mode}" in
     exit 1
     ;;
 esac
+case "${dt_tot_cut_direction}" in
+  below|keep-below|keep_below|upper|max|"<="|lt)
+    dt_tot_cut_direction="below"
+    ;;
+  above|keep-above|keep_above|lower|min|">="|gt)
+    dt_tot_cut_direction="above"
+    ;;
+  *)
+    echo "Unknown dt/ToT cut direction: ${dt_tot_cut_direction}" >&2
+    usage >&2
+    exit 1
+    ;;
+esac
 if ! [[ "${reference_min_channels}" =~ ^[0-9]+$ ]] || [ "${reference_min_channels}" -lt 1 ]; then
   echo "Invalid --reference-min-channels: ${reference_min_channels}" >&2
   exit 1
@@ -490,6 +527,22 @@ channels_to_csv() {
     out = ""
     for (i = 1; i <= n; ++i) {
       if (a[i] == "") continue
+      if (out != "") out = out ","
+      out = out a[i]
+    }
+    print out
+  }'
+}
+
+remove_channel_from_csv() {
+  local value="$1"
+  local channel="$2"
+  value="${value//,/ }"
+  awk -v value="${value}" -v channel="${channel}" 'BEGIN {
+    n = split(value, a, /[[:space:]]+/)
+    out = ""
+    for (i = 1; i <= n; ++i) {
+      if (a[i] == "" || a[i] == channel) continue
       if (out != "") out = out ","
       out = out a[i]
     }
@@ -559,6 +612,13 @@ if [ "${sensor_channels}" = "logbook" ]; then
     exit 1
   fi
 fi
+if [ "${mode}" = "trigger" ] && [ "${reference_mode}" = "trigger" ]; then
+  sensor_channels="$(remove_channel_from_csv "${sensor_channels}" "${trigger_channel}")"
+  if [ -z "${sensor_channels}" ]; then
+    echo "No sensor channels left after removing trigger/reference channel ${trigger_channel}." >&2
+    exit 1
+  fi
+fi
 
 if [ "${mode}" = "trigger" ] && [ "${reference_mode}" = "trigger" ] &&
    [ "${trigger_period_set}" -eq 0 ] && [ -n "${auto_laser_rate_khz}" ]; then
@@ -579,7 +639,7 @@ fi
 if [ "${mode}" = "trigger" ]; then
   macro_path="${qa_dir}/macro/laser_intensity_scan_rdf.cxx"
   log_path="${qa_dir}/output/log_timewalk_correction_macro.txt"
-  cmd=(root -l -b -q "${macro_path}(\"${runlist}\",\"${tdc_calib}\",\"\",\"${out_pdf}\",\"${out_root}\",\"${out_txt}\",${trigger_channel},\"${sensor_channels}\",${match_window_ns},${duration_ns},${clock_mhz},${use_fine},${use_lut},${fine_cut},${require_tot},${trigger_deadtime_ns},${trigger_period_ns},${trigger_period_tolerance_ns},${signed_dt},\"${timewalk_fit_ranges}\",\"${timewalk_fit_model}\",\"${dt_tot_cut}\",\"${trigger_tot_window}\",\"${spill_range}\",\"${channel_tot_windows}\",${edge_spill},\"${edge_channels}\",${edge_phase_period_ns},${edge_spill_fraction},\"${tdc_selection}\",\"${reference_mode}\",${reference_min_channels})")
+  cmd=(root -l -b -q "${macro_path}(\"${runlist}\",\"${tdc_calib}\",\"\",\"${out_pdf}\",\"${out_root}\",\"${out_txt}\",${trigger_channel},\"${sensor_channels}\",${match_window_ns},${duration_ns},${clock_mhz},${use_fine},${use_lut},${fine_cut},${require_tot},${trigger_deadtime_ns},${trigger_period_ns},${trigger_period_tolerance_ns},${signed_dt},\"${timewalk_fit_ranges}\",\"${timewalk_fit_model}\",\"${dt_tot_cut}\",\"${trigger_tot_window}\",\"${spill_range}\",\"${channel_tot_windows}\",${edge_spill},\"${edge_channels}\",${edge_phase_period_ns},${edge_spill_fraction},\"${tdc_selection}\",\"${reference_mode}\",${reference_min_channels},${event_window_ns},\"${dt_tot_cut_direction}\")")
 else
   macro_path="${qa_dir}/macro/tot_intensity_scan_rdf.cxx"
   log_path="${qa_dir}/output/log_tot_intensity_scan_macro.txt"
@@ -594,16 +654,25 @@ echo "== Output PDF: ${out_pdf}"
 echo "== Output TXT: ${out_txt}"
 if [ "${mode}" = "trigger" ]; then
   echo "== Reference mode: ${reference_mode}"
-  echo "== Event reference min channels: ${reference_min_channels}"
+  if [ "${reference_mode}" = "event-median" ]; then
+    echo "== Event reference min channels: ${reference_min_channels}"
+  fi
   echo "== Laser trigger/reference channel: ${trigger_channel}"
   echo "== Sensor channels: ${sensor_channels}"
+  if [ "${event_window_ns}" = "0" ] || [ "${event_window_ns}" = "0.0" ]; then
+    echo "== Event-building window: same as match window"
+  else
+    echo "== Event-building window: ${event_window_ns} ns"
+  fi
   if [ "${reference_mode}" = "event-median" ]; then
     echo "== Timewalk observable: dt(sensor - event median excluding sensor) vs sensor ToT"
   else
     echo "== Timewalk observable: dt(sensor - laser ch${trigger_channel}) vs sensor ToT"
   fi
+  echo "== Trigger veto/dead-time after accepted trigger: ${trigger_deadtime_ns} ns"
   echo "== Trigger expected period: ${trigger_period_ns} ns (tolerance ${trigger_period_tolerance_ns} ns)"
   echo "== Leading TDC selection: ${tdc_selection:-all}"
+  echo "== dt/ToT cut direction: ${dt_tot_cut_direction}"
   echo "== Fit ranges: ${timewalk_fit_ranges}"
   echo "== Fit model: ${timewalk_fit_model}"
 else

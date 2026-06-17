@@ -15,6 +15,7 @@
 #include <TSystem.h>
 
 #include "analysis_io.h"
+#include "analysis_events.h"
 #include "analysis_time.h"
 
 #include <algorithm>
@@ -347,6 +348,7 @@ struct ChannelTdcOffsetStudy {
   int reference_mode = 0;
   int min_channels = 3;
   double match_window_ns = 0.0;
+  double event_window_ns = 0.0;
   std::array<bool, 32> target_channels{};
   std::vector<int> target_channel_list;
   std::array<std::array<long long, analysis_time::kTdcPerPixel>, 32> edge_counts{};
@@ -462,66 +464,50 @@ void ProcessChannelReferenceOffsetSpill(const std::vector<OffsetHit> &spill_hits
   if (study.ref_channel < 0 || spill_hits.empty()) {
     return;
   }
-  std::array<std::array<std::vector<OffsetHit>, analysis_time::kTdcPerPixel>, 32> times;
-  for (const auto &hit : spill_hits) {
-    if (hit.channel < 0 || hit.channel >= static_cast<int>(times.size()) ||
+  std::array<std::vector<size_t>, analysis_time::kTdcPerPixel> ref_indices;
+  std::array<std::vector<size_t>, analysis_time::kTdcPerPixel> target_indices;
+  for (size_t i = 0; i < spill_hits.size(); ++i) {
+    const auto &hit = spill_hits[i];
+    if (hit.channel < 0 || hit.channel >= 32 ||
         hit.tdc < 0 || hit.tdc >= analysis_time::kTdcPerPixel) {
       continue;
     }
     if (!KeepOffsetInputChannel(study, hit.channel)) {
       continue;
     }
-    times[hit.channel][hit.tdc].push_back(hit);
     ++study.edge_counts[hit.channel][hit.tdc];
+    if (hit.channel == study.ref_channel) {
+      ref_indices[hit.tdc].push_back(i);
+      continue;
+    }
+    if (IsTargetOffsetChannel(study, hit.channel)) {
+      target_indices[hit.tdc].push_back(i);
+    }
   }
 
   for (int tdc = 0; tdc < analysis_time::kTdcPerPixel; ++tdc) {
-    auto &ref_times = times[study.ref_channel][tdc];
-    if (ref_times.empty()) {
-      continue;
-    }
-    std::sort(ref_times.begin(), ref_times.end(), [](const OffsetHit &a, const OffsetHit &b) {
-      return a.time_ns < b.time_ns;
-    });
-    for (int ch = 0; ch < static_cast<int>(times.size()); ++ch) {
-      if (ch == study.ref_channel) {
+    auto events = analysis_events::BuildReferenceEvents(spill_hits,
+                                                        ref_indices[tdc],
+                                                        target_indices[tdc],
+                                                        study.event_window_ns,
+                                                        true);
+    for (const auto &event : events) {
+      if (event.reference_index >= spill_hits.size()) {
         continue;
       }
-      if (!IsTargetOffsetChannel(study, ch)) {
-        continue;
-      }
-      auto &target_times = times[ch][tdc];
-      if (target_times.empty()) {
-        continue;
-      }
-      std::sort(target_times.begin(), target_times.end(), [](const OffsetHit &a, const OffsetHit &b) {
-        return a.time_ns < b.time_ns;
-      });
-      auto *hist = OffsetDtHist(study, ch, tdc);
-      auto *raw_hist = OffsetRawDtHist(study, ch, tdc);
-      for (const auto &target : target_times) {
-        auto it = std::lower_bound(ref_times.begin(),
-                                   ref_times.end(),
-                                   target.time_ns,
-                                   [](const OffsetHit &ref, double time) { return ref.time_ns < time; });
-        double best_dt = std::numeric_limits<double>::infinity();
-        const OffsetHit *best_ref = nullptr;
-        if (it != ref_times.end()) {
-          best_dt = target.time_ns - it->time_ns;
-          best_ref = &(*it);
+      const auto &ref = spill_hits[event.reference_index];
+      for (const auto &event_hit : event.hits) {
+        if (event_hit.index >= spill_hits.size() || !IsTargetOffsetChannel(study, event_hit.channel)) {
+          continue;
         }
-        if (it != ref_times.begin()) {
-          const auto &previous = *(it - 1);
-          const double dt_prev = target.time_ns - previous.time_ns;
-          if (std::abs(dt_prev) < std::abs(best_dt)) {
-            best_dt = dt_prev;
-            best_ref = &previous;
-          }
+        if (std::abs(event_hit.dt_ns) > study.match_window_ns) {
+          continue;
         }
-        if (best_ref && std::abs(best_dt) <= study.match_window_ns) {
-          hist->Fill(best_dt);
-          raw_hist->Fill(target.time_raw_ns - best_ref->time_raw_ns);
-        }
+        const auto &target = spill_hits[event_hit.index];
+        auto *hist = OffsetDtHist(study, event_hit.channel, tdc);
+        auto *raw_hist = OffsetRawDtHist(study, event_hit.channel, tdc);
+        hist->Fill(event_hit.dt_ns);
+        raw_hist->Fill(target.time_raw_ns - ref.time_raw_ns);
       }
     }
   }
@@ -609,38 +595,32 @@ void ProcessEventMedianOffsetSpill(const std::vector<OffsetHit> &spill_hits, Cha
   if (spill_hits.empty()) {
     return;
   }
-  std::array<std::vector<OffsetEventEntry>, analysis_time::kTdcPerPixel> by_tdc;
-  for (const auto &hit : spill_hits) {
+  std::array<std::vector<size_t>, analysis_time::kTdcPerPixel> by_tdc;
+  for (size_t i = 0; i < spill_hits.size(); ++i) {
+    const auto &hit = spill_hits[i];
     if (hit.channel < 0 || hit.channel >= 32 || hit.tdc < 0 || hit.tdc >= analysis_time::kTdcPerPixel) {
       continue;
     }
     if (!IsTargetOffsetChannel(study, hit.channel)) {
       continue;
     }
-    by_tdc[hit.tdc].push_back({hit.channel, hit.time_ns});
+    by_tdc[hit.tdc].push_back(i);
     ++study.edge_counts[hit.channel][hit.tdc];
   }
 
   for (int tdc = 0; tdc < analysis_time::kTdcPerPixel; ++tdc) {
-    auto &entries = by_tdc[tdc];
-    if (entries.empty()) {
-      continue;
-    }
-    std::sort(entries.begin(), entries.end(), [](const OffsetEventEntry &a, const OffsetEventEntry &b) {
-      return a.time_ns < b.time_ns;
-    });
-    std::vector<OffsetEventEntry> cluster;
-    cluster.reserve(32);
-    double cluster_seed = entries.front().time_ns;
-    for (const auto &entry : entries) {
-      if (!cluster.empty() && std::abs(entry.time_ns - cluster_seed) > study.match_window_ns) {
-        ProcessOffsetEventCluster(cluster, tdc, study);
-        cluster.clear();
-        cluster_seed = entry.time_ns;
+    auto events = analysis_events::BuildClusterEvents(spill_hits, by_tdc[tdc], study.event_window_ns, study.min_channels);
+    for (const auto &event : events) {
+      for (const auto &event_hit : event.hits) {
+        if (event_hit.index >= spill_hits.size() || !IsTargetOffsetChannel(study, event_hit.channel)) {
+          continue;
+        }
+        if (std::abs(event_hit.dt_ns) > study.match_window_ns) {
+          continue;
+        }
+        OffsetDtHist(study, event_hit.channel, tdc)->Fill(event_hit.dt_ns);
       }
-      cluster.push_back(entry);
     }
-    ProcessOffsetEventCluster(cluster, tdc, study);
   }
 }
 
@@ -850,12 +830,14 @@ ChannelTdcOffsetStudy StudyChannelTdcOffsets(
     double clock_mhz,
     int requested_ref_channel,
     double match_window_ns,
+    double event_window_ns,
     int min_channels,
     const std::vector<int> &requested_channels)
 {
   ChannelTdcOffsetStudy study;
   study.attempted = true;
   study.match_window_ns = match_window_ns > 0.0 ? match_window_ns : 200.0;
+  study.event_window_ns = event_window_ns > 0.0 ? event_window_ns : study.match_window_ns;
   study.reference_mode = requested_ref_channel >= 0 ? 0 : 1;
   study.min_channels = std::max(1, min_channels);
   if (requested_channels.empty()) {
@@ -914,10 +896,12 @@ ChannelTdcOffsetStudy StudyChannelTdcOffsets(
 
   if (study.reference_mode == 1) {
     std::cout << "Offset study: event median reference, min channels " << study.min_channels
-              << ", cluster window +/-" << study.match_window_ns << " ns" << std::endl;
+              << ", event window +/-" << study.event_window_ns
+              << " ns, match window +/-" << study.match_window_ns << " ns" << std::endl;
   } else {
     std::cout << "Offset study: reference channel " << study.ref_channel
-              << ", match window +/-" << study.match_window_ns << " ns" << std::endl;
+              << ", event window +/-" << study.event_window_ns
+              << " ns, match window +/-" << study.match_window_ns << " ns" << std::endl;
   }
   std::cout << "Offset study target channels: " << ChannelListLabel(study.target_channel_list) << std::endl;
 
@@ -983,16 +967,18 @@ void fine_calibration_rdf(const char *input = "../data/calibration",
                           int offset_reference_channel = 22,
                           double offset_match_window_ns = 100.0,
                           int offset_min_channels = 3,
-                          const char *offset_channels_csv = "")
+                          const char *offset_channels_csv = "",
+                          double offset_event_window_ns = 0.0)
 {
   if (WantsHelp(input) || WantsHelp(out_root)) {
     std::cout << "fine_calibration_rdf usage:\n";
-    std::cout << "  fine_calibration_rdf(\"/path/to/decoded_or_parent\", \"fine_calibration.root\", 0.01, 0.99, 200, \"fine_calibration.pdf\", 0.0, false, 320.0, true, 22, 100.0, 3, \"17,19,22\")\n";
+    std::cout << "  fine_calibration_rdf(\"/path/to/decoded_or_parent\", \"fine_calibration.root\", 0.01, 0.99, 200, \"fine_calibration.pdf\", 0.0, false, 320.0, true, 22, 100.0, 3, \"17,19,22\", 0.0)\n";
     std::cout << "  required branches: type,fifo,column,pixel,tdc,fine\n";
     std::cout << "  match_coincidence=true uses leading edges with valid ToT (needs rollover/coarse, optional spill/run_id)\n";
     std::cout << "  output histograms: hFineMin, hFineMax (bins=" << analysis_time::kFineCalibSize << ")\n";
     std::cout << "  study_channel_offsets=true also writes channel_tdc_offsets and hChannelTdcOffset using calibrated TDC times\n";
     std::cout << "  offset_reference_channel defaults to reference time on ch22; -1 uses an event-median reference\n";
+    std::cout << "  offset_event_window_ns defines the event-building window; 0 uses offset_match_window_ns\n";
     std::cout << "  offset_channels_csv limits the offset study to selected channels; empty means all channels\n";
     return;
   }
@@ -1514,6 +1500,7 @@ void fine_calibration_rdf(const char *input = "../data/calibration",
                                           clock_mhz,
                                           offset_reference_channel,
                                           offset_match_window_ns,
+                                          offset_event_window_ns,
                                           offset_min_channels,
                                           offset_channels);
   }
@@ -1583,6 +1570,7 @@ void fine_calibration_rdf(const char *input = "../data/calibration",
     TParameter<int>("channel_offset_ref_channel", offset_study.ref_channel).Write();
     TParameter<int>("channel_offset_reference_mode", offset_study.reference_mode).Write();
     TParameter<double>("channel_offset_match_window_ns", offset_study.match_window_ns).Write();
+    TParameter<double>("channel_offset_event_window_ns", offset_study.event_window_ns).Write();
     TParameter<int>("channel_offset_min_channels", offset_study.min_channels).Write();
     TParameter<int>("channel_offset_available", offset_study.available ? 1 : 0).Write();
     TParameter<int>("channel_offset_n_target_channels",

@@ -30,6 +30,8 @@ Options:
       --offset-reference event-median|CH
                           reference time for offsets (default: channel 22; event-median uses event medians)
       --offset-window NS  matching window for offset study (default: 100)
+      --offset-event-window NS
+                          event-building window for offset study (default: same as --offset-window)
       --offset-min-channels N
                           minimum channels per laser event in event-median mode (default: 3)
       --offset-channels logbook|CSV|all
@@ -58,6 +60,7 @@ clock_mhz=320
 offset_study=1
 offset_reference="22"
 offset_window_ns=100
+offset_event_window_ns=0
 offset_min_channels=3
 offset_channels="logbook"
 dry_run=0
@@ -221,6 +224,15 @@ while [ "$#" -gt 0 ]; do
       offset_window_ns=${1#*=}
       shift
       ;;
+    --offset-event-window|--offset-event-window-ns)
+      need_arg "$@"
+      offset_event_window_ns=${2:-}
+      shift 2
+      ;;
+    --offset-event-window=*|--offset-event-window-ns=*)
+      offset_event_window_ns=${1#*=}
+      shift
+      ;;
     --offset-min-channels|--offset-minimum-channels)
       need_arg "$@"
       offset_min_channels=${2:-}
@@ -348,7 +360,7 @@ else
 fi
 
 macro_path="${qa_dir}/macro/TDC_calibration_rdf.cxx"
-cmd=(root -l -b -q "${macro_path}(\"${list_file}\",\"${out_root}\",${q_low},${q_high},${min_entries},\"${out_pdf}\",${duration_ns},${match_coincidence},${clock_mhz},${offset_study},${offset_reference_arg},${offset_window_ns},${offset_min_channels},\"${offset_channels_arg}\")")
+cmd=(root -l -b -q "${macro_path}(\"${list_file}\",\"${out_root}\",${q_low},${q_high},${min_entries},\"${out_pdf}\",${duration_ns},${match_coincidence},${clock_mhz},${offset_study},${offset_reference_arg},${offset_window_ns},${offset_min_channels},\"${offset_channels_arg}\",${offset_event_window_ns})")
 
 echo "== TDC calibration inputs:"
 printf '   %s\n' "${inputs[@]}"
@@ -362,6 +374,11 @@ echo "== Match coincidence/ToT: ${match_coincidence}"
 echo "== Channel/TDC offset study: ${offset_study}"
 echo "== Offset reference: ${offset_reference_label}"
 echo "== Offset match window: ${offset_window_ns} ns"
+if [ "${offset_event_window_ns}" = "0" ] || [ "${offset_event_window_ns}" = "0.0" ]; then
+  echo "== Offset event window: same as offset match window"
+else
+  echo "== Offset event window: ${offset_event_window_ns} ns"
+fi
 echo "== Offset min channels: ${offset_min_channels}"
 echo "== Offset channels: ${offset_channels_label}"
 

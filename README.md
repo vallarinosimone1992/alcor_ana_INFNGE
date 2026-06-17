@@ -103,7 +103,9 @@ The ROOT output includes `hChannelTdcOffset`, `hChannelTdcOffsetEntries`,
 `hChannelLeadingOffset`, and the `channel_tdc_offsets` tree. The offset value is
 the median `t_channel,TDC - t_reference,TDC`, so it can be subtracted from that
 channel/TDC time to align it to the reference. Use `--offset-reference event-median`
-only when you explicitly want an event-median reference instead of ch22.
+only when you explicitly want an event-median reference instead of ch22. The
+offset study builds events independently for each TDC; `--offset-event-window`
+can override the event-building window, otherwise `--offset-window` is used.
 
 ### Timewalk / ToT Calibration
 
@@ -113,28 +115,33 @@ The standard output is:
 calibration/timewalk_correction.root
 ```
 
-By default, trigger mode now extracts timewalk versus an event-level laser
-reference: for each leading hit it uses the median time of the other selected
-channels in the same spill/event cluster. The input times already include the
-fine-TDC calibration and the static channel/TDC offset from
-`calibration/TDC_calibration.root`.
+By default, trigger mode extracts timewalk versus the trigger/reference channel,
+normally ch22. The input times already include the fine-TDC calibration and the
+static channel/TDC offset from
+`calibration/TDC_calibration.root`. Events are built around the cleaned ch22
+trigger; each sensor channel contributes at most one hit per event, chosen as
+the closest hit inside `--event-window` (default: same as `--window`).
+If a diagonal `dt`/`ToT` selection is used, `--dt-tot-cut-direction below`
+keeps `dt <= DT0 + SLOPE*ToT` and is the default; use `above` only to keep the
+opposite side of the line.
 
 ```bash
 script/run_timewalk_calibration.sh \
   --mode trigger \
-  --input ../data/20260610-171026 \
-  --sensors 17,19,22
-```
-
-The legacy channel-22 trigger reference is still available:
-
-```bash
-script/run_timewalk_calibration.sh \
-  --mode trigger \
-  --reference-mode trigger \
   --input ../data/20260610-171026 \
   --trigger 22 \
   --sensors 17,19
+```
+
+The event-median reference is still available explicitly for diagnostics or
+global-offset studies:
+
+```bash
+script/run_timewalk_calibration.sh \
+  --mode trigger \
+  --reference-mode event-median \
+  --input ../data/20260610-171026 \
+  --sensors 17,19,22
 ```
 
 Laser-intensity mode characterizes `ToT` versus laser intensity from a series of logbook runs:

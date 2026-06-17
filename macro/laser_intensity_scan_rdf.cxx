@@ -10,6 +10,7 @@
 #include <TLegend.h>
 #include <TLine.h>
 #include <TList.h>
+#include <TLatex.h>
 #include <TMultiGraph.h>
 #include <TParameter.h>
 #include <TPad.h>
@@ -18,6 +19,7 @@
 #include <TSystem.h>
 #include <TTree.h>
 
+#include "analysis_events.h"
 #include "analysis_io.h"
 #include "analysis_time.h"
 
@@ -55,12 +57,23 @@ struct FitRange {
   double xmax = 0.0;
 };
 
+enum class DtTotCutDirection {
+  KeepBelow = 0,
+  KeepAbove = 1,
+};
+
+std::string DtTotCutDirectionName(DtTotCutDirection direction)
+{
+  return direction == DtTotCutDirection::KeepAbove ? "above" : "below";
+}
+
 struct DtTotCut {
   bool enabled = false;
   double intercept = 0.0;
   double slope = 0.0;
   double tot_min = -std::numeric_limits<double>::infinity();
   double tot_max = std::numeric_limits<double>::infinity();
+  DtTotCutDirection direction = DtTotCutDirection::KeepBelow;
 
   double Boundary(double tot) const { return intercept + slope * tot; }
 
@@ -74,7 +87,10 @@ struct DtTotCut {
     if (!Applies(tot)) {
       return true;
     }
-    return dt >= Boundary(tot);
+    if (direction == DtTotCutDirection::KeepAbove) {
+      return dt >= Boundary(tot);
+    }
+    return dt <= Boundary(tot);
   }
 };
 
@@ -130,15 +146,28 @@ std::string TimeReferenceModeName(TimeReferenceMode mode)
 
 TimeReferenceMode ParseTimeReferenceMode(const std::string &value)
 {
-  if (value.empty() || value == "event-median" || value == "event_median" || value == "median" ||
-      value == "event") {
-    return TimeReferenceMode::EventMedian;
-  }
-  if (value == "trigger" || value == "ch22" || value == "reference-channel" || value == "reference_channel") {
+  if (value.empty() || value == "trigger" || value == "ch22" || value == "reference-channel" ||
+      value == "reference_channel") {
     return TimeReferenceMode::Trigger;
   }
-  std::cerr << "Unknown reference mode '" << value << "', using event-median" << std::endl;
-  return TimeReferenceMode::EventMedian;
+  if (value == "event-median" || value == "event_median" || value == "median" || value == "event") {
+    return TimeReferenceMode::EventMedian;
+  }
+  std::cerr << "Unknown reference mode '" << value << "', using trigger" << std::endl;
+  return TimeReferenceMode::Trigger;
+}
+
+std::string DtExpressionTitle(TimeReferenceMode mode, int trigger_channel)
+{
+  if (mode == TimeReferenceMode::EventMedian) {
+    return "t_{ch} - t_{event median}";
+  }
+  return "t_{ch} - t_{trigger ch" + std::to_string(trigger_channel) + "}";
+}
+
+std::string DtAxisTitle(TimeReferenceMode mode, int trigger_channel)
+{
+  return DtExpressionTitle(mode, trigger_channel) + " [ns]";
 }
 
 std::string TimewalkFitModelName(TimewalkFitModel model)
@@ -184,24 +213,27 @@ void PrintHelp()
   std::cout << "laser_intensity_scan_rdf usage:\n"
             << "  laser_intensity_scan_rdf(\"runlist.tsv\", \"fine.root\", \"channel.root\","
             << " \"out.pdf\", \"out.root\", \"out.txt\", 22, \"17,19\", 100, 30, 320, true,"
-            << " true, 0, true, 50000, 1000000, 50000, false, \"17:0:30,19:0:30\","
+            << " true, 0, true, 0, 1000000, 50000, false, \"17:0:30,19:0:30\","
             << " \"pol1-plateau\", \"\", \"\", \"\", \"\", -1, \"all\", 0, 0.01,"
-            << " \"17:0,19:0,22:0\", \"event-median\", 3)\n\n"
-            << "Default reference mode uses the per-event laser median excluding the channel being corrected.\n"
-            << "Legacy trigger reference can be selected with reference_mode=\"trigger\" and trigger_channel=22.\n"
+            << " \"17:0,19:0,22:0\", \"trigger\", 3, 0.0, \"below\")\n\n"
+            << "Default reference mode uses trigger_channel, normally ch22, as laser reference.\n"
+            << "Event-median reference can be selected explicitly with reference_mode=\"event-median\".\n"
+            << "event_window_ns=0 uses match_window_ns for event building.\n"
             << "Timewalk corrections are fitted from t_sensor - t_reference versus sensor ToT.\n"
             << "Runlist TSV columns: run_label, input_path, intensity, channels, thresholds, spill, vbias, note\n"
             << "input_path can be a decoded dir, run dir, or parent dir accepted by analysis_io::ResolveInputSpec.\n"
-            << "Optional dt/ToT cuts use CH:DT0:SLOPE[:TOT_MIN:TOT_MAX] and keep dt >= DT0 + SLOPE*ToT.\n"
+            << "Optional dt/ToT cuts use CH:DT0:SLOPE[:TOT_MIN:TOT_MAX]; direction below keeps dt <= line.\n"
             << "Optional trigger ToT window uses MIN:MAX, e.g. 1:3.\n"
             << "Optional spill range uses MIN:MAX, inclusive.\n"
             << "Optional channel ToT windows use CH:MIN:MAX, e.g. 17:18:25.\n"
             << "Optional leading TDC selection uses TDC or CH:TDC CSV, e.g. 0 or 17:0,19:2,22:0.\n"
             << "  Only leading TDC 0 or 2 is accepted; the trailing partner is kept for ToT.\n"
+            << "Trigger veto/dead-time is applied after an accepted trigger; default is 0 ns.\n"
             << "Timewalk fit models: pol1, pol1-plateau, lin-exp-plateau.\n"
             << "Optional edge diagnostic spill uses -1 for the first selected spill.\n"
             << "Optional edge diagnostic channels use all, analysis, or a CSV list.\n"
-            << "Optional edge diagnostic fraction is the initial spill fraction to plot, default 0.01.\n";
+            << "Optional edge diagnostic fraction is the initial spill fraction to plot, default 0.01.\n"
+            << "The PDF also includes per-channel leading-hit inter-arrival and ToT-vs-previous-hit diagnostics.\n";
 }
 
 bool IsLeadingTdc(int tdc)
@@ -397,6 +429,18 @@ std::vector<int> ParseChannelsCsv(const std::string &csv)
   return channels;
 }
 
+std::string ChannelsLabel(const std::vector<int> &channels)
+{
+  std::ostringstream out;
+  for (size_t i = 0; i < channels.size(); ++i) {
+    if (i > 0) {
+      out << ",";
+    }
+    out << channels[i];
+  }
+  return out.str();
+}
+
 std::vector<int> ParseEdgeChannelsCsv(const std::string &csv, const std::vector<int> &analysis_channels)
 {
   if (csv.empty() || csv == "analysis" || csv == "selected") {
@@ -450,7 +494,21 @@ FitRange FitRangeForChannel(const std::map<int, FitRange> &ranges, int channel)
   return it->second;
 }
 
-std::map<int, DtTotCut> ParseDtTotCutsCsv(const std::string &csv)
+DtTotCutDirection ParseDtTotCutDirection(const std::string &value)
+{
+  if (value.empty() || value == "below" || value == "keep-below" || value == "keep_below" ||
+      value == "upper" || value == "max" || value == "<=" || value == "lt") {
+    return DtTotCutDirection::KeepBelow;
+  }
+  if (value == "above" || value == "keep-above" || value == "keep_above" ||
+      value == "lower" || value == "min" || value == ">=" || value == "gt") {
+    return DtTotCutDirection::KeepAbove;
+  }
+  std::cerr << "Unknown dt/ToT cut direction '" << value << "', using below" << std::endl;
+  return DtTotCutDirection::KeepBelow;
+}
+
+std::map<int, DtTotCut> ParseDtTotCutsCsv(const std::string &csv, DtTotCutDirection direction)
 {
   std::map<int, DtTotCut> cuts;
   for (const auto &token : Split(csv, ',')) {
@@ -466,6 +524,7 @@ std::map<int, DtTotCut> ParseDtTotCutsCsv(const std::string &csv)
       const int channel = std::stoi(fields[0]);
       DtTotCut cut;
       cut.enabled = true;
+      cut.direction = direction;
       cut.intercept = std::stod(fields[1]);
       cut.slope = std::stod(fields[2]);
       if (fields.size() == 5) {
@@ -1647,6 +1706,17 @@ TH2D *FindTimewalkHist(const RunResult &result, int channel)
   return nullptr;
 }
 
+TH1D *FindRunHist1D(const RunResult &result, const std::string &prefix, int channel)
+{
+  const std::string name = prefix + SafeName(result.config.label) + "_ch" + std::to_string(channel);
+  for (const auto &owned : result.histograms) {
+    if (std::string(owned->GetName()) == name) {
+      return owned.get();
+    }
+  }
+  return nullptr;
+}
+
 TH2D *FindRunHist2D(const RunResult &result, const std::string &prefix, int channel)
 {
   const std::string name = prefix + SafeName(result.config.label) + "_ch" + std::to_string(channel);
@@ -1695,10 +1765,10 @@ std::unique_ptr<TH2D> MakeAccumulatedTimewalkHist(const std::vector<RunResult> &
 {
   return MakeAccumulatedHist2D(results,
                                channel,
-                               "h_dt_vs_tot_",
-                               "h_dt_vs_tot_accum_ch" + std::to_string(channel),
-                               "Accumulated #Deltat vs ToT ch" + std::to_string(channel) +
-                                   ";ToT [ns];t_{ch} - t_{trigger} [ns];entries");
+	                               "h_dt_vs_tot_",
+	                               "h_dt_vs_tot_accum_ch" + std::to_string(channel),
+	                               "Accumulated #Deltat vs ToT ch" + std::to_string(channel) +
+	                                   ";ToT [ns];#Deltat [ns];entries");
 }
 
 std::unique_ptr<TH2D> MakeAccumulatedRawTimewalkHist(const std::vector<RunResult> &results, int channel)
@@ -1708,7 +1778,7 @@ std::unique_ptr<TH2D> MakeAccumulatedRawTimewalkHist(const std::vector<RunResult
                                "h_raw_dt_vs_tot_",
                                "h_raw_dt_vs_tot_accum_ch" + std::to_string(channel),
                                "Accumulated raw #Deltat vs ToT ch" + std::to_string(channel) +
-                                   ";ToT [ns];t_{ch} - t_{trigger} [ns];entries");
+                                   ";ToT [ns];#Deltat [ns];entries");
 }
 
 std::unique_ptr<TH2D> MakeAccumulatedRejectedTimewalkHist(const std::vector<RunResult> &results, int channel)
@@ -1718,7 +1788,7 @@ std::unique_ptr<TH2D> MakeAccumulatedRejectedTimewalkHist(const std::vector<RunR
                                "h_rejected_dt_vs_tot_",
                                "h_rejected_dt_vs_tot_accum_ch" + std::to_string(channel),
                                "Accumulated rejected #Deltat vs ToT ch" + std::to_string(channel) +
-                                   ";ToT [ns];t_{ch} - t_{trigger} [ns];entries");
+                                   ";ToT [ns];#Deltat [ns];entries");
 }
 
 std::map<int, TimewalkCorrection> BuildTimewalkCorrections(const std::vector<RunResult> &results,
@@ -1849,7 +1919,8 @@ void CleanTriggerCandidates(std::vector<size_t> &indices,
                             const std::vector<Hit> &hits,
                             double trigger_deadtime_ns,
                             double trigger_period_ns,
-                            double trigger_period_tolerance_ns);
+                            double trigger_period_tolerance_ns,
+                            std::vector<size_t> *after_deadtime_indices = nullptr);
 
 std::vector<EventMedianMatch> BuildEventMedianMatches(const std::vector<Hit> &hits,
                                                       const std::unordered_set<int> &selected_channels,
@@ -1857,7 +1928,7 @@ std::vector<EventMedianMatch> BuildEventMedianMatches(const std::vector<Hit> &hi
                                                       bool require_valid_tot,
                                                       const std::map<int, TotWindow> &channel_tot_windows,
                                                       int min_channels,
-                                                      double match_window_ns);
+                                                      double event_window_ns);
 
 void BuildCorrectedTimewalkAndCoincidencePlots(std::vector<RunResult> &results,
                                                const std::vector<int> &sensor_channels,
@@ -1883,6 +1954,7 @@ void BuildCorrectedTimewalkAndCoincidencePlots(std::vector<RunResult> &results,
                                                const SpillRange &spill_range,
                                                const std::map<int, TotWindow> &channel_tot_windows,
                                                const TdcSelection &tdc_selection,
+                                               double event_window_ns,
                                                std::vector<std::unique_ptr<TH2D>> &corrected_accumulated_histograms)
 {
   if (sensor_channels.empty()) {
@@ -1974,7 +2046,7 @@ void BuildCorrectedTimewalkAndCoincidencePlots(std::vector<RunResult> &results,
                                                require_valid_tot,
                                                channel_tot_windows,
                                                event_reference_min_channels,
-                                               match_window_ns);
+                                               event_window_ns);
         std::map<int, std::map<int, std::vector<MatchedCorrectedHit>>> matched_by_event_channel;
         for (const auto &match : matches) {
           const auto &hit = hits[match.index];
@@ -2023,7 +2095,7 @@ void BuildCorrectedTimewalkAndCoincidencePlots(std::vector<RunResult> &results,
       }
 
       std::vector<size_t> trigger_indices;
-      std::map<int, std::vector<size_t>> sensor_by_channel;
+      std::vector<size_t> sensor_indices;
       for (size_t i = 0; i < hits.size(); ++i) {
         const Hit &hit = hits[i];
         if (selected_channels.find(hit.channel) == selected_channels.end() || !hit.leading ||
@@ -2042,7 +2114,7 @@ void BuildCorrectedTimewalkAndCoincidencePlots(std::vector<RunResult> &results,
             trigger_indices.push_back(i);
           }
         } else {
-          sensor_by_channel[hit.channel].push_back(i);
+          sensor_indices.push_back(i);
         }
       }
 
@@ -2060,56 +2132,30 @@ void BuildCorrectedTimewalkAndCoincidencePlots(std::vector<RunResult> &results,
       }
 
       std::map<size_t, std::map<int, std::vector<MatchedCorrectedHit>>> matched_by_trigger_channel;
-      for (int ch : sensor_channels) {
-        auto channel_it = sensor_by_channel.find(ch);
-        if (channel_it == sensor_by_channel.end()) {
+      auto events = analysis_events::BuildReferenceEvents(hits, trigger_indices, sensor_indices, event_window_ns, signed_dt);
+      for (const auto &event : events) {
+        if (event.reference_index >= hits.size()) {
           continue;
         }
-        auto &sensor_indices = channel_it->second;
-        std::sort(sensor_indices.begin(),
-                  sensor_indices.end(),
-                  [&](size_t a, size_t b) { return hits[a].time_ns < hits[b].time_ns; });
-
-        for (size_t sensor_idx : sensor_indices) {
-          const double sensor_time = hits[sensor_idx].time_ns;
-          auto upper = std::upper_bound(trigger_indices.begin(),
-                                        trigger_indices.end(),
-                                        sensor_time,
-                                        [&](double value, size_t idx) { return value < hits[idx].time_ns; });
-
-          double raw_dt = std::numeric_limits<double>::quiet_NaN();
-          if (signed_dt) {
-            bool found = false;
-            double best_abs_dt = std::numeric_limits<double>::max();
-            if (upper != trigger_indices.end()) {
-              const double candidate_dt = sensor_time - hits[*upper].time_ns;
-              best_abs_dt = std::abs(candidate_dt);
-              raw_dt = candidate_dt;
-              found = true;
-            }
-            if (upper != trigger_indices.begin()) {
-              const double candidate_dt = sensor_time - hits[*std::prev(upper)].time_ns;
-              const double abs_dt = std::abs(candidate_dt);
-              if (!found || abs_dt < best_abs_dt) {
-                best_abs_dt = abs_dt;
-                raw_dt = candidate_dt;
-                found = true;
-              }
-            }
-            if (!found || best_abs_dt > match_window_ns) {
-              continue;
-            }
-          } else {
-            if (upper == trigger_indices.begin()) {
-              continue;
-            }
-            const size_t best_idx = *std::prev(upper);
-            raw_dt = sensor_time - hits[best_idx].time_ns;
-            if (raw_dt < 0.0 || raw_dt > match_window_ns) {
-              continue;
-            }
+        size_t trigger_index = 0;
+        const auto trigger_it = std::find(trigger_indices.begin(), trigger_indices.end(), event.reference_index);
+        if (trigger_it != trigger_indices.end()) {
+          trigger_index = static_cast<size_t>(std::distance(trigger_indices.begin(), trigger_it));
+        }
+        for (const auto &event_hit : event.hits) {
+          if (event_hit.index >= hits.size()) {
+            continue;
           }
-
+          const int ch = event_hit.channel;
+          if (std::find(sensor_channels.begin(), sensor_channels.end(), ch) == sensor_channels.end()) {
+            continue;
+          }
+          const double raw_dt = event_hit.dt_ns;
+          if ((!signed_dt && (raw_dt < 0.0 || raw_dt > match_window_ns)) ||
+              (signed_dt && std::abs(raw_dt) > match_window_ns)) {
+            continue;
+          }
+          const size_t sensor_idx = event_hit.index;
           const double sensor_tot = hits[sensor_idx].tot_ns;
           if (sensor_tot <= 0.0) {
             continue;
@@ -2123,7 +2169,6 @@ void BuildCorrectedTimewalkAndCoincidencePlots(std::vector<RunResult> &results,
           const double correction_ns =
               correction_it != corrections.end() ? correction_it->second.CorrectionNs(sensor_tot) : 0.0;
           StoredSensorHit corrected{ch, hits[sensor_idx].spill, hits[sensor_idx].time_ns - correction_ns, sensor_tot};
-          size_t trigger_index = 0;
           double dt = std::numeric_limits<double>::quiet_NaN();
           if (!FindMatchedReference(corrected.time_ns, triggers, match_window_ns, signed_dt, trigger_index, dt)) {
             continue;
@@ -2227,10 +2272,14 @@ void CleanTriggerCandidates(std::vector<size_t> &indices,
                             const std::vector<Hit> &hits,
                             double trigger_deadtime_ns,
                             double trigger_period_ns,
-                            double trigger_period_tolerance_ns)
+                            double trigger_period_tolerance_ns,
+                            std::vector<size_t> *after_deadtime_indices)
 {
   std::sort(indices.begin(), indices.end(), [&](size_t a, size_t b) { return hits[a].time_ns < hits[b].time_ns; });
   if (indices.size() < 2) {
+    if (after_deadtime_indices) {
+      *after_deadtime_indices = indices;
+    }
     return;
   }
 
@@ -2247,6 +2296,9 @@ void CleanTriggerCandidates(std::vector<size_t> &indices,
     }
   } else {
     clustered = indices;
+  }
+  if (after_deadtime_indices) {
+    *after_deadtime_indices = clustered;
   }
 
   if (trigger_period_ns <= 0.0 || trigger_period_tolerance_ns <= 0.0 || clustered.size() < 2) {
@@ -2304,6 +2356,31 @@ void DrawDtTotCutLine(const DtTotCut &cut, TH2D *hist)
   line->SetLineWidth(3);
   line->SetLineStyle(2);
   line->Draw("same");
+}
+
+void DrawSectionPage(TCanvas &canvas,
+                     const std::string &title,
+                     const std::string &subtitle,
+                     const std::string &out_pdf)
+{
+  canvas.Clear();
+  canvas.SetRightMargin(0.05);
+  canvas.SetLeftMargin(0.05);
+  auto *pad = static_cast<TPad *>(canvas.cd());
+  if (pad) {
+    pad->SetLogx(false);
+    pad->SetLogy(false);
+    pad->SetLogz(false);
+  }
+  TLatex text;
+  text.SetNDC(true);
+  text.SetTextAlign(12);
+  text.SetTextFont(42);
+  text.SetTextSize(0.055);
+  text.DrawLatex(0.08, 0.62, title.c_str());
+  text.SetTextSize(0.030);
+  text.DrawLatex(0.08, 0.52, subtitle.c_str());
+  canvas.Print(out_pdf.c_str());
 }
 
 double MedianOf(std::vector<double> values)
@@ -2388,11 +2465,11 @@ std::vector<EventMedianMatch> BuildEventMedianMatches(const std::vector<Hit> &hi
                                                       bool require_valid_tot,
                                                       const std::map<int, TotWindow> &channel_tot_windows,
                                                       int min_channels,
-                                                      double match_window_ns)
+                                                      double event_window_ns)
 {
   (void)require_valid_tot;
   (void)channel_tot_windows;
-  std::array<std::vector<EventMedianCandidate>, analysis_time::kTdcPerPixel> by_tdc;
+  std::array<std::vector<size_t>, analysis_time::kTdcPerPixel> by_tdc;
   for (size_t i = 0; i < hits.size(); ++i) {
     const auto &hit = hits[i];
     if (selected_channels.find(hit.channel) == selected_channels.end() || !hit.leading ||
@@ -2402,30 +2479,19 @@ std::vector<EventMedianMatch> BuildEventMedianMatches(const std::vector<Hit> &hi
     if (hit.tdc < 0 || hit.tdc >= analysis_time::kTdcPerPixel) {
       continue;
     }
-    by_tdc[hit.tdc].push_back({i, hit.channel, hit.tdc, hit.time_ns});
+    by_tdc[hit.tdc].push_back(i);
   }
 
   std::vector<EventMedianMatch> matches;
   int event_id = 0;
-  for (auto &entries : by_tdc) {
-    if (entries.empty()) {
-      continue;
-    }
-    std::sort(entries.begin(), entries.end(), [](const EventMedianCandidate &a, const EventMedianCandidate &b) {
-      return a.time_ns < b.time_ns;
-    });
-    std::vector<EventMedianCandidate> cluster;
-    cluster.reserve(kNumAlcorChannels);
-    double cluster_seed = entries.front().time_ns;
-    for (const auto &entry : entries) {
-      if (!cluster.empty() && std::abs(entry.time_ns - cluster_seed) > match_window_ns) {
-        ProcessEventMedianCluster(cluster, min_channels, event_id++, matches);
-        cluster.clear();
-        cluster_seed = entry.time_ns;
+  for (const auto &indices : by_tdc) {
+    auto events = analysis_events::BuildClusterEvents(hits, indices, event_window_ns, min_channels);
+    for (const auto &event : events) {
+      const int combined_event_id = event_id++;
+      for (const auto &event_hit : event.hits) {
+        matches.push_back({event_hit.index, event_hit.dt_ns, combined_event_id});
       }
-      cluster.push_back(entry);
     }
-    ProcessEventMedianCluster(cluster, min_channels, event_id++, matches);
   }
   return matches;
 }
@@ -2439,6 +2505,7 @@ RunResult AnalyzeRun(const RunConfig &run,
                      TimeReferenceMode reference_mode,
                      int event_reference_min_channels,
                      double match_window_ns,
+                     double event_window_ns,
                      double trigger_deadtime_ns,
                      double trigger_period_ns,
                      double trigger_period_tolerance_ns,
@@ -2473,6 +2540,8 @@ RunResult AnalyzeRun(const RunConfig &run,
   const double timewalk_dt_max = TimewalkDtMax(match_window_ns);
   std::map<int, TH1D *> h_dt;
   std::map<int, TH1D *> h_tot;
+  std::map<int, TH1D *> h_tot_no_selection;
+  std::map<int, TH1D *> h_tot_full_selection;
   std::map<int, TH2D *> h_dt_vs_tot;
   std::map<int, TH2D *> h_raw_dt_vs_tot;
   std::map<int, TH2D *> h_rejected_dt_vs_tot;
@@ -2482,16 +2551,20 @@ RunResult AnalyzeRun(const RunConfig &run,
   std::map<int, TH2D *> h_dt_vs_spill;
   std::map<int, TH2D *> h_raw_dt_vs_spill;
   std::map<int, TH2D *> h_rejected_dt_vs_spill;
+  std::map<int, TH1D *> h_interhit_leading;
+  std::map<int, TH1D *> h_interhit_full_selection;
+  std::map<int, TH2D *> h_duration_vs_prev_interhit;
+  const std::string dt_axis_title = DtAxisTitle(reference_mode, trigger_channel);
   for (int ch : sensor_channels) {
     const std::string reference_label =
         reference_mode == TimeReferenceMode::EventMedian ? "event median" : "clean trigger ch" + std::to_string(trigger_channel);
     std::ostringstream title;
-    title << run.label << " I=" << run.intensity << " ch" << ch
+    title << "[FULL SELECTION] " << run.label << " I=" << run.intensity << " ch" << ch
           << (reference_mode == TimeReferenceMode::EventMedian
-                  ? " - event median"
-                  : (signed_dt ? " - nearest clean trigger ch" : " - previous clean trigger ch") +
-                        std::to_string(trigger_channel))
-          << ";t_{ch} - t_{trigger} [ns];entries";
+	                  ? " - event median"
+	                  : (signed_dt ? " - nearest clean trigger ch" : " - previous clean trigger ch") +
+	                        std::to_string(trigger_channel))
+	          << ";" << dt_axis_title << ";entries";
     h_dt[ch] = MakeHist(result.histograms,
                         "h_dt_" + safe_label + "_ch" + std::to_string(ch),
                         title.str(),
@@ -2500,14 +2573,17 @@ RunResult AnalyzeRun(const RunConfig &run,
                         match_window_ns);
 
     std::ostringstream corr_title;
-    corr_title << run.label << " I=" << run.intensity << " ch" << ch << " #Deltat vs ToT to "
+    corr_title << "[FULL SELECTION] " << run.label << " I=" << run.intensity << " ch" << ch
+               << " #Deltat vs ToT to "
                << reference_label << ";ToT [ns];#Deltat [ns];entries";
     std::ostringstream raw_corr_title;
-    raw_corr_title << run.label << " I=" << run.intensity << " ch" << ch << " raw #Deltat vs ToT to "
+    raw_corr_title << "[CUT DIAGNOSTIC: before dt/ToT cut] " << run.label << " I=" << run.intensity
+                   << " ch" << ch << " #Deltat vs ToT to "
                    << reference_label << ";ToT [ns];#Deltat [ns];entries";
     std::ostringstream rejected_corr_title;
-    rejected_corr_title << run.label << " I=" << run.intensity << " ch" << ch
-                        << " rejected by #Deltat-ToT cut;ToT [ns];t_{ch} - t_{trigger} [ns];entries";
+    rejected_corr_title << "[CUT DIAGNOSTIC: rejected by dt/ToT cut] " << run.label << " I="
+                        << run.intensity << " ch" << ch
+                        << " rejected by #Deltat-ToT cut;ToT [ns];" << dt_axis_title << ";entries";
     h_raw_dt_vs_tot[ch] = MakeHist2D(result.histograms2d,
                                      "h_raw_dt_vs_tot_" + safe_label + "_ch" + std::to_string(ch),
                                      raw_corr_title.str(),
@@ -2553,6 +2629,105 @@ RunResult AnalyzeRun(const RunConfig &run,
                          std::max(1.0, max_duration_ns));
   }
 
+  std::vector<int> timing_diagnostic_channels = edge_channels;
+  for (int ch : tot_channels) {
+    timing_diagnostic_channels.push_back(ch);
+  }
+  std::sort(timing_diagnostic_channels.begin(), timing_diagnostic_channels.end());
+  timing_diagnostic_channels.erase(std::unique(timing_diagnostic_channels.begin(), timing_diagnostic_channels.end()),
+                                   timing_diagnostic_channels.end());
+  const double interhit_min_ns = 0.1;
+  const double interhit_max_ns =
+      std::max(1.0e9, trigger_period_ns > 0.0 ? 10.0 * trigger_period_ns : 0.0);
+  constexpr int interhit_bins = 160;
+  constexpr int duration_bins = 120;
+  for (int ch : timing_diagnostic_channels) {
+    std::ostringstream tot_no_selection_title;
+    tot_no_selection_title << "[NO ANALYSIS CUTS] " << run.label << " I=" << run.intensity << " ToT ch" << ch
+                           << ";ToT [ns];entries";
+    h_tot_no_selection[ch] = MakeHist(result.histograms,
+                                      "h_tot_no_selection_" + safe_label + "_ch" + std::to_string(ch),
+                                      tot_no_selection_title.str(),
+                                      200,
+                                      0.0,
+                                      std::max(1.0, max_duration_ns));
+
+    std::ostringstream interhit_title;
+    interhit_title << "[NO ANALYSIS CUTS] " << run.label << " I=" << run.intensity
+                   << " consecutive leading hits ch" << ch
+                   << ";t_{i} - t_{i-1} [ns];entries";
+    h_interhit_leading[ch] = MakeLogHist(result.histograms,
+                                         "h_interhit_leading_" + safe_label + "_ch" + std::to_string(ch),
+                                         interhit_title.str(),
+                                         interhit_bins,
+                                         interhit_min_ns,
+                                         interhit_max_ns);
+
+    std::ostringstream duration_title;
+    duration_title << "[NO ANALYSIS CUTS] " << run.label << " I=" << run.intensity
+                   << " hit duration vs previous leading hit ch" << ch
+                   << ";t_{i} - t_{i-1} [ns];ToT [ns];entries";
+    h_duration_vs_prev_interhit[ch] = MakeLogXHist2D(result.histograms2d,
+                                                    "h_duration_vs_prev_interhit_" + safe_label + "_ch" +
+                                                        std::to_string(ch),
+                                                    duration_title.str(),
+                                                    interhit_bins,
+                                                    interhit_min_ns,
+                                                    interhit_max_ns,
+                                                    duration_bins,
+                                                    0.0,
+                                                    std::max(1.0, max_duration_ns));
+  }
+  for (int ch : tot_channels) {
+    std::ostringstream tot_full_selection_title;
+    tot_full_selection_title << "[FULL SELECTION] " << run.label << " I=" << run.intensity << " ToT ch" << ch
+                             << ";ToT [ns];entries";
+    h_tot_full_selection[ch] = MakeHist(result.histograms,
+                                        "h_tot_full_selection_" + safe_label + "_ch" + std::to_string(ch),
+                                        tot_full_selection_title.str(),
+                                        200,
+                                        0.0,
+                                        std::max(1.0, max_duration_ns));
+    std::ostringstream interhit_full_title;
+    interhit_full_title << "[FULL SELECTION] " << run.label << " I=" << run.intensity
+                        << " consecutive accepted leading hits ch" << ch
+                        << ";t_{i} - t_{i-1} [ns];entries";
+    h_interhit_full_selection[ch] = MakeLogHist(result.histograms,
+                                                "h_interhit_full_selection_" + safe_label + "_ch" +
+                                                    std::to_string(ch),
+                                                interhit_full_title.str(),
+                                                interhit_bins,
+                                                interhit_min_ns,
+                                                interhit_max_ns);
+  }
+  TH1D *h_trigger_candidate_interhit = MakeLogHist(result.histograms,
+                                                   "h_trigger_candidate_interhit_" + safe_label + "_ch" +
+                                                       std::to_string(trigger_channel),
+                                                   "[CUT DIAGNOSTIC] " + run.label + " trigger candidates ch" +
+                                                       std::to_string(trigger_channel) +
+                                                       ";t_{i} - t_{i-1} [ns];entries",
+                                                   interhit_bins,
+                                                   interhit_min_ns,
+                                                   interhit_max_ns);
+  TH1D *h_trigger_after_veto_interhit = MakeLogHist(result.histograms,
+                                                    "h_trigger_after_veto_interhit_" + safe_label + "_ch" +
+                                                        std::to_string(trigger_channel),
+                                                    "[CUT DIAGNOSTIC] " + run.label + " trigger after veto ch" +
+                                                        std::to_string(trigger_channel) +
+                                                        ";t_{i} - t_{i-1} [ns];entries",
+                                                    interhit_bins,
+                                                    interhit_min_ns,
+                                                    interhit_max_ns);
+  TH1D *h_trigger_clean_interhit = MakeLogHist(result.histograms,
+                                               "h_trigger_clean_interhit_" + safe_label + "_ch" +
+                                                   std::to_string(trigger_channel),
+                                               "[CUT DIAGNOSTIC] " + run.label + " clean trigger ch" +
+                                                   std::to_string(trigger_channel) +
+                                                   ";t_{i} - t_{i-1} [ns];entries",
+                                               interhit_bins,
+                                               interhit_min_ns,
+                                               interhit_max_ns);
+
   auto input = analysis_io::ResolveInputSpec(run.input_path);
   if (input.files.empty()) {
     std::cerr << "No decoded ROOT input found for " << run.label << " at " << run.input_path << std::endl;
@@ -2568,7 +2743,8 @@ RunResult AnalyzeRun(const RunConfig &run,
   const double spill_xmax = static_cast<double>(max_spill) + 0.5;
   for (int ch : tot_channels) {
     std::ostringstream title;
-    title << run.label << " I=" << run.intensity << " ToT vs spill ch" << ch << ";spill;ToT [ns];entries";
+    title << "[CUT DIAGNOSTIC: before final matching] " << run.label << " I=" << run.intensity
+          << " ToT vs spill ch" << ch << ";spill;ToT [ns];entries";
     h_tot_vs_spill[ch] = MakeHist2D(result.histograms2d,
                                     "h_tot_vs_spill_" + safe_label + "_ch" + std::to_string(ch),
                                     title.str(),
@@ -2581,7 +2757,8 @@ RunResult AnalyzeRun(const RunConfig &run,
   }
   for (int ch : sensor_channels) {
     std::ostringstream selected_title;
-    selected_title << run.label << " I=" << run.intensity << " selected ToT vs spill ch" << ch
+    selected_title << "[FULL SELECTION] " << run.label << " I=" << run.intensity
+                   << " selected ToT vs spill ch" << ch
                    << ";spill;ToT [ns];entries";
     h_tot_vs_spill_selected[ch] = MakeHist2D(result.histograms2d,
                                             "h_tot_vs_spill_selected_" + safe_label + "_ch" + std::to_string(ch),
@@ -2594,7 +2771,8 @@ RunResult AnalyzeRun(const RunConfig &run,
                                             std::max(1.0, max_duration_ns));
 
     std::ostringstream rejected_title;
-    rejected_title << run.label << " I=" << run.intensity << " rejected ToT vs spill ch" << ch
+    rejected_title << "[CUT DIAGNOSTIC: rejected by dt/ToT cut] " << run.label << " I=" << run.intensity
+                   << " rejected ToT vs spill ch" << ch
                    << ";spill;ToT [ns];entries";
     h_tot_vs_spill_rejected[ch] = MakeHist2D(result.histograms2d,
                                             "h_tot_vs_spill_rejected_" + safe_label + "_ch" + std::to_string(ch),
@@ -2607,8 +2785,9 @@ RunResult AnalyzeRun(const RunConfig &run,
                                             std::max(1.0, max_duration_ns));
 
     std::ostringstream raw_dt_title;
-    raw_dt_title << run.label << " I=" << run.intensity << " raw #Deltat vs spill ch" << ch
-                 << ";spill;t_{ch} - t_{trigger} [ns];entries";
+    raw_dt_title << "[CUT DIAGNOSTIC: before dt/ToT cut] " << run.label << " I=" << run.intensity
+                 << " raw #Deltat vs spill ch" << ch
+                 << ";spill;" << dt_axis_title << ";entries";
     h_raw_dt_vs_spill[ch] = MakeHist2D(result.histograms2d,
                                        "h_raw_dt_vs_spill_" + safe_label + "_ch" + std::to_string(ch),
                                        raw_dt_title.str(),
@@ -2620,8 +2799,9 @@ RunResult AnalyzeRun(const RunConfig &run,
                                        timewalk_dt_max);
 
     std::ostringstream selected_dt_title;
-    selected_dt_title << run.label << " I=" << run.intensity << " selected #Deltat vs spill ch" << ch
-                      << ";spill;t_{ch} - t_{trigger} [ns];entries";
+    selected_dt_title << "[FULL SELECTION] " << run.label << " I=" << run.intensity
+                      << " selected #Deltat vs spill ch" << ch
+                      << ";spill;" << dt_axis_title << ";entries";
     h_dt_vs_spill[ch] = MakeHist2D(result.histograms2d,
                                    "h_dt_vs_spill_" + safe_label + "_ch" + std::to_string(ch),
                                    selected_dt_title.str(),
@@ -2633,8 +2813,9 @@ RunResult AnalyzeRun(const RunConfig &run,
                                    timewalk_dt_max);
 
     std::ostringstream rejected_dt_title;
-    rejected_dt_title << run.label << " I=" << run.intensity << " rejected #Deltat vs spill ch" << ch
-                      << ";spill;t_{ch} - t_{trigger} [ns];entries";
+    rejected_dt_title << "[CUT DIAGNOSTIC: rejected by dt/ToT cut] " << run.label << " I=" << run.intensity
+                      << " rejected #Deltat vs spill ch" << ch
+                      << ";spill;" << dt_axis_title << ";entries";
     h_rejected_dt_vs_spill[ch] = MakeHist2D(result.histograms2d,
                                            "h_rejected_dt_vs_spill_" + safe_label + "_ch" + std::to_string(ch),
                                            rejected_dt_title.str(),
@@ -2658,6 +2839,24 @@ RunResult AnalyzeRun(const RunConfig &run,
     }
 
     ComputeTot(hits, max_duration_ns);
+    std::map<int, std::vector<double>> full_selection_times_by_channel;
+    auto fill_full_selection_interhits = [&]() {
+      for (auto &kv : full_selection_times_by_channel) {
+        TH1D *hist = h_interhit_full_selection.count(kv.first) ? h_interhit_full_selection[kv.first] : nullptr;
+        if (!hist) {
+          continue;
+        }
+        auto &times = kv.second;
+        std::sort(times.begin(), times.end());
+        times.erase(std::unique(times.begin(), times.end()), times.end());
+        for (size_t i = 1; i < times.size(); ++i) {
+          const double dt_prev_ns = times[i] - times[i - 1];
+          if (dt_prev_ns > 0.0 && std::isfinite(dt_prev_ns)) {
+            hist->Fill(dt_prev_ns);
+          }
+        }
+      }
+    };
 
     if (!edge_channel_set.empty()) {
       for (const auto &hit : hits) {
@@ -2670,6 +2869,43 @@ RunResult AnalyzeRun(const RunConfig &run,
         }
         if (hit.spill == selected_edge_spill) {
           edge_hits.push_back({hit.channel, hit.spill, hit.leading, hit.time_ns});
+        }
+      }
+    }
+
+    std::map<int, std::vector<const Hit *>> leading_by_channel;
+    for (const auto &hit : hits) {
+      if (!hit.leading || !tdc_selection.KeepLeadingHit(hit.channel, hit.tdc)) {
+        continue;
+      }
+      if (hit.tot_ns > 0.0 && h_tot_no_selection.count(hit.channel) > 0) {
+        h_tot_no_selection[hit.channel]->Fill(hit.tot_ns);
+      }
+      if (h_interhit_leading.count(hit.channel) == 0 && h_duration_vs_prev_interhit.count(hit.channel) == 0) {
+        continue;
+      }
+      leading_by_channel[hit.channel].push_back(&hit);
+    }
+    for (auto &kv : leading_by_channel) {
+      auto &channel_hits = kv.second;
+      std::sort(channel_hits.begin(), channel_hits.end(), [](const Hit *a, const Hit *b) {
+        return a->time_ns < b->time_ns;
+      });
+      TH1D *interhit_hist = h_interhit_leading.count(kv.first) ? h_interhit_leading[kv.first] : nullptr;
+      TH2D *duration_hist =
+          h_duration_vs_prev_interhit.count(kv.first) ? h_duration_vs_prev_interhit[kv.first] : nullptr;
+      for (size_t i = 1; i < channel_hits.size(); ++i) {
+        const Hit *previous = channel_hits[i - 1];
+        const Hit *current = channel_hits[i];
+        const double dt_prev_ns = current->time_ns - previous->time_ns;
+        if (dt_prev_ns <= 0.0 || !std::isfinite(dt_prev_ns)) {
+          continue;
+        }
+        if (interhit_hist) {
+          interhit_hist->Fill(dt_prev_ns);
+        }
+        if (duration_hist && current->tot_ns > 0.0) {
+          duration_hist->Fill(dt_prev_ns, current->tot_ns);
         }
       }
     }
@@ -2712,7 +2948,7 @@ RunResult AnalyzeRun(const RunConfig &run,
                                              require_valid_tot,
                                              channel_tot_windows,
                                              event_reference_min_channels,
-                                             match_window_ns);
+                                             event_window_ns);
       for (const auto &match : matches) {
         const auto &hit = hits[match.index];
         const int ch = hit.channel;
@@ -2749,23 +2985,28 @@ RunResult AnalyzeRun(const RunConfig &run,
           continue;
         }
 
-        dt_stats[ch].Add(dt);
-        h_dt[ch]->Fill(dt);
+	        dt_stats[ch].Add(dt);
+	        h_dt[ch]->Fill(dt);
+	        full_selection_times_by_channel[ch].push_back(hit.time_ns);
+	        if (has_valid_sensor_tot && h_tot_full_selection.count(ch) > 0) {
+	          h_tot_full_selection[ch]->Fill(sensor_tot);
+	        }
         if (has_valid_sensor_tot && h_dt_vs_tot.count(ch) > 0 && in_timewalk_range) {
           h_dt_vs_tot[ch]->Fill(sensor_tot, dt);
         }
         if (h_dt_vs_spill.count(ch) > 0 && in_timewalk_range) {
           h_dt_vs_spill[ch]->Fill(hit.spill, dt);
         }
-        if (has_valid_sensor_tot && h_tot_vs_spill_selected.count(ch) > 0) {
-          h_tot_vs_spill_selected[ch]->Fill(hit.spill, sensor_tot);
-        }
-      }
+	        if (has_valid_sensor_tot && h_tot_vs_spill_selected.count(ch) > 0) {
+	          h_tot_vs_spill_selected[ch]->Fill(hit.spill, sensor_tot);
+	        }
+	      }
+      fill_full_selection_interhits();
       return;
     }
 
     std::vector<size_t> trigger_indices;
-    std::map<int, std::vector<size_t>> sensor_by_channel;
+    std::vector<size_t> sensor_indices;
     for (size_t i = 0; i < hits.size(); ++i) {
       const Hit &hit = hits[i];
       if (selected_channels.find(hit.channel) == selected_channels.end() || !hit.leading ||
@@ -2792,7 +3033,7 @@ RunResult AnalyzeRun(const RunConfig &run,
         continue;
       }
 
-      sensor_by_channel[hit.channel].push_back(i);
+      sensor_indices.push_back(i);
       if (hit.tot_ns > 0.0) {
         tot_stats[hit.channel].Add(hit.tot_ns);
         h_tot[hit.channel]->Fill(hit.tot_ns);
@@ -2804,7 +3045,31 @@ RunResult AnalyzeRun(const RunConfig &run,
 
     // The cleanup is intentionally applied only to the laser trigger channel.
     // SiPM channels are not cleaned here; they are only matched to the cleaned trigger sequence below.
-    CleanTriggerCandidates(trigger_indices, hits, trigger_deadtime_ns, trigger_period_ns, trigger_period_tolerance_ns);
+    auto fill_trigger_interhit = [&](TH1D *hist, const std::vector<size_t> &indices) {
+      if (!hist || indices.size() < 2) {
+        return;
+      }
+      std::vector<size_t> sorted_indices = indices;
+      std::sort(sorted_indices.begin(), sorted_indices.end(), [&](size_t a, size_t b) {
+        return hits[a].time_ns < hits[b].time_ns;
+      });
+      for (size_t i = 1; i < sorted_indices.size(); ++i) {
+        const double dt_prev_ns = hits[sorted_indices[i]].time_ns - hits[sorted_indices[i - 1]].time_ns;
+        if (dt_prev_ns > 0.0 && std::isfinite(dt_prev_ns)) {
+          hist->Fill(dt_prev_ns);
+        }
+      }
+    };
+    fill_trigger_interhit(h_trigger_candidate_interhit, trigger_indices);
+    std::vector<size_t> trigger_after_veto_indices;
+    CleanTriggerCandidates(trigger_indices,
+                           hits,
+                           trigger_deadtime_ns,
+                           trigger_period_ns,
+                           trigger_period_tolerance_ns,
+                           &trigger_after_veto_indices);
+    fill_trigger_interhit(h_trigger_after_veto_interhit, trigger_after_veto_indices);
+    fill_trigger_interhit(h_trigger_clean_interhit, trigger_indices);
     result.trigger22_clean_candidates += static_cast<long long>(trigger_indices.size());
 
     for (size_t i = 1; i < trigger_indices.size(); ++i) {
@@ -2813,66 +3078,38 @@ RunResult AnalyzeRun(const RunConfig &run,
     }
 
     for (size_t idx : trigger_indices) {
+      full_selection_times_by_channel[trigger_channel].push_back(hits[idx].time_ns);
       if (hits[idx].tot_ns > 0.0) {
         tot_stats[trigger_channel].Add(hits[idx].tot_ns);
         h_tot[trigger_channel]->Fill(hits[idx].tot_ns);
+        if (h_tot_full_selection.count(trigger_channel) > 0) {
+          h_tot_full_selection[trigger_channel]->Fill(hits[idx].tot_ns);
+        }
         if (h_tot_vs_spill.count(trigger_channel) > 0) {
           h_tot_vs_spill[trigger_channel]->Fill(hits[idx].spill, hits[idx].tot_ns);
         }
       }
     }
 
-    for (auto &by_channel : sensor_by_channel) {
-      auto &indices = by_channel.second;
-      std::sort(indices.begin(), indices.end(), [&](size_t a, size_t b) { return hits[a].time_ns < hits[b].time_ns; });
-    }
-
-    for (int ch : sensor_channels) {
-      auto channel_it = sensor_by_channel.find(ch);
-      if (channel_it == sensor_by_channel.end() || trigger_indices.empty()) {
+    auto events = analysis_events::BuildReferenceEvents(hits, trigger_indices, sensor_indices, event_window_ns, signed_dt);
+    for (const auto &event : events) {
+      if (event.reference_index >= hits.size()) {
         continue;
       }
-      const auto &sensor_indices = channel_it->second;
-      for (size_t sensor_idx : sensor_indices) {
-        const double sensor_time = hits[sensor_idx].time_ns;
-        auto upper = std::upper_bound(trigger_indices.begin(),
-                                      trigger_indices.end(),
-                                      sensor_time,
-                                      [&](double value, size_t idx) { return value < hits[idx].time_ns; });
-
-        double dt = std::numeric_limits<double>::quiet_NaN();
-        if (signed_dt) {
-          bool found = false;
-          double best_abs_dt = std::numeric_limits<double>::max();
-          if (upper != trigger_indices.end()) {
-            const double candidate_dt = sensor_time - hits[*upper].time_ns;
-            best_abs_dt = std::abs(candidate_dt);
-            dt = candidate_dt;
-            found = true;
-          }
-          if (upper != trigger_indices.begin()) {
-            const double candidate_dt = sensor_time - hits[*std::prev(upper)].time_ns;
-            const double abs_dt = std::abs(candidate_dt);
-            if (!found || abs_dt < best_abs_dt) {
-              best_abs_dt = abs_dt;
-              dt = candidate_dt;
-              found = true;
-            }
-          }
-          if (!found || best_abs_dt > match_window_ns) {
-            continue;
-          }
-        } else {
-          if (upper == trigger_indices.begin()) {
-            continue;
-          }
-          const size_t best_idx = *std::prev(upper);
-          dt = sensor_time - hits[best_idx].time_ns;
-          if (dt < 0.0 || dt > match_window_ns) {
-            continue;
-          }
+      for (const auto &event_hit : event.hits) {
+        if (event_hit.index >= hits.size()) {
+          continue;
         }
-
+        const int ch = event_hit.channel;
+        if (std::find(sensor_channels.begin(), sensor_channels.end(), ch) == sensor_channels.end()) {
+          continue;
+        }
+        const double dt = event_hit.dt_ns;
+        if ((!signed_dt && (dt < 0.0 || dt > match_window_ns)) ||
+            (signed_dt && std::abs(dt) > match_window_ns)) {
+          continue;
+        }
+        const size_t sensor_idx = event_hit.index;
         const double sensor_tot = hits[sensor_idx].tot_ns;
         const bool has_valid_sensor_tot = sensor_tot > 0.0;
         const bool in_timewalk_range = dt >= timewalk_dt_min && dt <= timewalk_dt_max;
@@ -2900,6 +3137,10 @@ RunResult AnalyzeRun(const RunConfig &run,
 
         dt_stats[ch].Add(dt);
         h_dt[ch]->Fill(dt);
+        full_selection_times_by_channel[ch].push_back(hits[sensor_idx].time_ns);
+        if (has_valid_sensor_tot && h_tot_full_selection.count(ch) > 0) {
+          h_tot_full_selection[ch]->Fill(sensor_tot);
+        }
         if (has_valid_sensor_tot && h_dt_vs_tot.count(ch) > 0 && in_timewalk_range) {
           h_dt_vs_tot[ch]->Fill(sensor_tot, dt);
         }
@@ -2911,6 +3152,7 @@ RunResult AnalyzeRun(const RunConfig &run,
         }
       }
     }
+    fill_full_selection_interhits();
   };
 
   std::vector<TreeCursor> cursors;
@@ -3111,10 +3353,18 @@ void DrawRunHistograms(TCanvas &canvas,
                        const RunResult &result,
                        const std::vector<int> &sensor_channels,
                        int trigger_channel,
+                       const std::vector<int> &edge_channels,
+                       TimeReferenceMode reference_mode,
                        const std::map<int, FitRange> &fit_ranges,
                        TimewalkFitModel fit_model,
                        const std::string &out_pdf)
 {
+  const std::string dt_axis_title = DtAxisTitle(reference_mode, trigger_channel);
+  DrawSectionPage(canvas,
+                  "FULL SELECTION",
+                  "Plots used as timewalk inputs after the configured trigger/reference, ToT, TDC, spill, and dt/ToT selections.",
+                  out_pdf);
+
   canvas.Clear();
   canvas.SetRightMargin(0.05);
   auto *legend_dt = new TLegend(0.72, 0.72, 0.92, 0.90);
@@ -3122,9 +3372,9 @@ void DrawRunHistograms(TCanvas &canvas,
   legend_dt->SetBorderSize(0);
   legend_dt->SetFillStyle(0);
   auto *stack_dt = new THStack(("stack_dt_" + SafeName(result.config.label)).c_str(),
-                               (result.config.label + " I=" + std::to_string(result.config.intensity) +
-                                " time difference;t_{ch} - t_{trigger} [ns];entries")
-                                   .c_str());
+	                               ("[FULL SELECTION] " + result.config.label + " I=" + std::to_string(result.config.intensity) +
+	                                " time difference;" + dt_axis_title + ";entries")
+	                                   .c_str());
   stack_dt->SetBit(kCanDelete);
   double max_dt = 0.0;
   for (size_t i = 0; i < sensor_channels.size(); ++i) {
@@ -3162,7 +3412,7 @@ void DrawRunHistograms(TCanvas &canvas,
   legend_tot->SetBorderSize(0);
   legend_tot->SetFillStyle(0);
   auto *stack_tot = new THStack(("stack_tot_" + SafeName(result.config.label)).c_str(),
-                                (result.config.label + " I=" + std::to_string(result.config.intensity) +
+                                ("[FULL SELECTION] " + result.config.label + " I=" + std::to_string(result.config.intensity) +
                                  " ToT;ToT [ns];entries")
                                     .c_str());
   stack_tot->SetBit(kCanDelete);
@@ -3172,7 +3422,8 @@ void DrawRunHistograms(TCanvas &canvas,
   tot_channels.erase(std::unique(tot_channels.begin(), tot_channels.end()), tot_channels.end());
   double max_tot = 0.0;
   for (size_t i = 0; i < tot_channels.size(); ++i) {
-    const std::string name = "h_tot_" + SafeName(result.config.label) + "_ch" + std::to_string(tot_channels[i]);
+    const std::string name =
+        "h_tot_full_selection_" + SafeName(result.config.label) + "_ch" + std::to_string(tot_channels[i]);
     TH1D *hist = nullptr;
     for (const auto &owned : result.histograms) {
       if (std::string(owned->GetName()) == name) {
@@ -3198,6 +3449,11 @@ void DrawRunHistograms(TCanvas &canvas,
   stack_tot->Draw("nostack hist");
   legend_tot->Draw();
   canvas.Print(out_pdf.c_str());
+
+  DrawSectionPage(canvas,
+                  "NO ANALYSIS CUTS",
+                  "Timing and ToT diagnostics before trigger veto, trigger-period cleanup, matching windows, ToT windows, and dt/ToT cuts.",
+                  out_pdf);
 
   auto draw_edge_pair = [&](const std::string &leading_prefix,
                             const std::string &trailing_prefix) {
@@ -3229,6 +3485,224 @@ void DrawRunHistograms(TCanvas &canvas,
 
   draw_edge_pair("h_edge_time_leading_", "h_edge_time_trailing_");
   draw_edge_pair("h_edge_phase_leading_", "h_edge_phase_trailing_");
+
+  std::vector<int> timing_diagnostic_channels = edge_channels;
+  for (int ch : tot_channels) {
+    timing_diagnostic_channels.push_back(ch);
+  }
+  std::sort(timing_diagnostic_channels.begin(), timing_diagnostic_channels.end());
+  timing_diagnostic_channels.erase(std::unique(timing_diagnostic_channels.begin(), timing_diagnostic_channels.end()),
+                                   timing_diagnostic_channels.end());
+
+  auto draw_no_selection_tot_pages = [&]() {
+    std::vector<int> channels_with_entries;
+    channels_with_entries.reserve(timing_diagnostic_channels.size());
+    for (int ch : timing_diagnostic_channels) {
+      TH1D *hist = FindRunHist1D(result, "h_tot_no_selection_", ch);
+      if (hist && hist->GetEntries() > 0.0) {
+        channels_with_entries.push_back(ch);
+      }
+    }
+    constexpr size_t pads_per_page = 8;
+    for (size_t start = 0; start < channels_with_entries.size(); start += pads_per_page) {
+      canvas.Clear();
+      canvas.SetRightMargin(0.05);
+      canvas.Divide(4, 2, 0.001, 0.001);
+      bool has_page = false;
+      const size_t stop = std::min(start + pads_per_page, channels_with_entries.size());
+      for (size_t i = start; i < stop; ++i) {
+        const int ch = channels_with_entries[i];
+        TH1D *hist = FindRunHist1D(result, "h_tot_no_selection_", ch);
+        canvas.cd(static_cast<int>(i - start + 1));
+        if (auto *pad = gPad) {
+          pad->SetLogx(false);
+          pad->SetLogy(true);
+          pad->SetRightMargin(0.08);
+        }
+        if (!hist || hist->GetEntries() <= 0.0) {
+          continue;
+        }
+        has_page = true;
+        hist->SetLineColor(ch == trigger_channel ? kRed + 1 : kBlue + 1);
+        hist->SetLineWidth(ch == trigger_channel ? 3 : 2);
+        hist->SetTitle(("[NO ANALYSIS CUTS] " + result.config.label + " ToT ch" + std::to_string(ch) +
+                        ";ToT [ns];entries")
+                           .c_str());
+        hist->Draw("hist");
+      }
+      if (has_page) {
+        canvas.Print(out_pdf.c_str());
+      }
+    }
+  };
+
+  auto draw_interhit_overlay_pages = [&]() {
+    std::vector<int> channels_with_entries;
+    channels_with_entries.reserve(timing_diagnostic_channels.size());
+    for (int ch : timing_diagnostic_channels) {
+      TH1D *before = FindRunHist1D(result, "h_interhit_leading_", ch);
+      TH1D *after = FindRunHist1D(result, "h_interhit_full_selection_", ch);
+      if ((before && before->GetEntries() > 0.0) || (after && after->GetEntries() > 0.0)) {
+        channels_with_entries.push_back(ch);
+      }
+    }
+    constexpr size_t pads_per_page = 8;
+    for (size_t start = 0; start < channels_with_entries.size(); start += pads_per_page) {
+      canvas.Clear();
+      canvas.SetRightMargin(0.05);
+      canvas.Divide(4, 2, 0.001, 0.001);
+      bool has_page = false;
+      const size_t stop = std::min(start + pads_per_page, channels_with_entries.size());
+      for (size_t i = start; i < stop; ++i) {
+        const int ch = channels_with_entries[i];
+        TH1D *before = FindRunHist1D(result, "h_interhit_leading_", ch);
+        TH1D *after = FindRunHist1D(result, "h_interhit_full_selection_", ch);
+        canvas.cd(static_cast<int>(i - start + 1));
+        if (auto *pad = gPad) {
+          pad->SetLogx(true);
+          pad->SetLogy(true);
+          pad->SetRightMargin(0.08);
+        }
+        if ((!before || before->GetEntries() <= 0.0) && (!after || after->GetEntries() <= 0.0)) {
+          continue;
+        }
+        has_page = true;
+        const double before_max = before ? before->GetMaximum() : 0.0;
+        const double after_max = after ? after->GetMaximum() : 0.0;
+        const double ymax = 1.25 * std::max(before_max, after_max) + 1.0;
+        bool drawn = false;
+        if (before && before->GetEntries() > 0.0) {
+          before->SetLineColor(kGray + 2);
+          before->SetLineWidth(2);
+          before->SetMaximum(ymax);
+          before->SetTitle((result.config.label + " consecutive leading hits ch" + std::to_string(ch) +
+                            ";t_{i} - t_{i-1} [ns];entries")
+                               .c_str());
+          before->Draw("hist");
+          drawn = true;
+        }
+        if (after && after->GetEntries() > 0.0) {
+          after->SetLineColor(ch == trigger_channel ? kRed + 1 : kBlue + 1);
+          after->SetLineWidth(ch == trigger_channel ? 3 : 2);
+          after->SetMaximum(ymax);
+          if (!drawn) {
+            after->SetTitle((result.config.label + " consecutive leading hits ch" + std::to_string(ch) +
+                             ";t_{i} - t_{i-1} [ns];entries")
+                                .c_str());
+            after->Draw("hist");
+          } else {
+            after->Draw("hist same");
+          }
+        }
+        auto *legend = new TLegend(0.45, 0.72, 0.88, 0.88);
+        legend->SetBit(kCanDelete);
+        legend->SetBorderSize(0);
+        legend->SetFillStyle(0);
+        if (before && before->GetEntries() > 0.0) {
+          legend->AddEntry(before, "no analysis cuts", "l");
+        }
+        if (after && after->GetEntries() > 0.0) {
+          legend->AddEntry(after, "full selection", "l");
+        }
+        legend->Draw();
+      }
+      if (has_page) {
+        canvas.Print(out_pdf.c_str());
+      }
+    }
+  };
+
+  auto draw_duration_vs_interhit_pages = [&]() {
+    std::vector<int> channels_with_entries;
+    channels_with_entries.reserve(timing_diagnostic_channels.size());
+    for (int ch : timing_diagnostic_channels) {
+      TH2D *hist = FindRunHist2D(result, "h_duration_vs_prev_interhit_", ch);
+      if (hist && hist->GetEntries() > 0.0) {
+        channels_with_entries.push_back(ch);
+      }
+    }
+    constexpr size_t pads_per_page = 8;
+    for (size_t start = 0; start < channels_with_entries.size(); start += pads_per_page) {
+      canvas.Clear();
+      canvas.SetRightMargin(0.05);
+      canvas.Divide(4, 2, 0.001, 0.001);
+      bool has_page = false;
+      const size_t stop = std::min(start + pads_per_page, channels_with_entries.size());
+      for (size_t i = start; i < stop; ++i) {
+        const int ch = channels_with_entries[i];
+        TH2D *hist = FindRunHist2D(result, "h_duration_vs_prev_interhit_", ch);
+        canvas.cd(static_cast<int>(i - start + 1));
+        if (auto *pad = gPad) {
+          pad->SetLogx(true);
+          pad->SetLogz(true);
+          pad->SetRightMargin(0.14);
+        }
+        if (!hist || hist->GetEntries() <= 0.0) {
+          continue;
+        }
+        has_page = true;
+        hist->SetTitle((result.config.label + " ToT vs previous hit interval ch" + std::to_string(ch) +
+                        ";t_{i} - t_{i-1} [ns];ToT [ns];entries")
+                           .c_str());
+        hist->Draw("colz");
+      }
+      if (has_page) {
+        canvas.Print(out_pdf.c_str());
+      }
+    }
+  };
+
+  draw_no_selection_tot_pages();
+  draw_interhit_overlay_pages();
+  draw_duration_vs_interhit_pages();
+
+  DrawSectionPage(canvas,
+                  "CUT DIAGNOSTICS",
+                  "Intermediate views that isolate one selection step, such as trigger veto/period cleanup or dt/ToT rejection.",
+                  out_pdf);
+
+  TH1D *trigger_candidates = FindRunHist1D(result, "h_trigger_candidate_interhit_", trigger_channel);
+  TH1D *trigger_after_veto = FindRunHist1D(result, "h_trigger_after_veto_interhit_", trigger_channel);
+  TH1D *trigger_clean = FindRunHist1D(result, "h_trigger_clean_interhit_", trigger_channel);
+  if ((trigger_candidates && trigger_candidates->GetEntries() > 0.0) ||
+      (trigger_after_veto && trigger_after_veto->GetEntries() > 0.0) ||
+      (trigger_clean && trigger_clean->GetEntries() > 0.0)) {
+    canvas.Clear();
+    canvas.SetRightMargin(0.05);
+    if (auto *pad = static_cast<TPad *>(canvas.cd())) {
+      pad->SetLogx(true);
+      pad->SetLogy(true);
+    }
+    auto *stack = new THStack(("stack_trigger_interhit_" + SafeName(result.config.label)).c_str(),
+                              (result.config.label + " ch" + std::to_string(trigger_channel) +
+                               " trigger inter-hit interval;t_{i} - t_{i-1} [ns];entries")
+                                  .c_str());
+    stack->SetBit(kCanDelete);
+    auto *legend = new TLegend(0.62, 0.74, 0.90, 0.90);
+    legend->SetBit(kCanDelete);
+    legend->SetBorderSize(0);
+    legend->SetFillStyle(0);
+    auto add_trigger_hist = [&](TH1D *hist, int color, const std::string &label) {
+      if (!hist || hist->GetEntries() <= 0.0) {
+        return;
+      }
+      auto *draw_hist = static_cast<TH1D *>(hist->Clone());
+      draw_hist->SetDirectory(nullptr);
+      draw_hist->SetLineColor(color);
+      draw_hist->SetLineWidth(2);
+      stack->Add(draw_hist, "hist");
+      legend->AddEntry(draw_hist, label.c_str(), "l");
+    };
+    add_trigger_hist(trigger_candidates, kGray + 2, "candidates before cleanup");
+    add_trigger_hist(trigger_after_veto, kOrange + 7, "after veto");
+    add_trigger_hist(trigger_clean, kRed + 1, "clean trigger");
+    if (stack->GetHists()) {
+      stack->GetHists()->SetOwner(kTRUE);
+    }
+    stack->Draw("nostack hist");
+    legend->Draw();
+    canvas.Print(out_pdf.c_str());
+  }
 
   canvas.Clear();
   canvas.SetRightMargin(0.05);
@@ -3305,8 +3779,8 @@ void DrawRunHistograms(TCanvas &canvas,
     }
   };
 
-  draw_sensor_tot_vs_spill_group("h_tot_vs_spill_selected_", "selected");
-  draw_sensor_tot_vs_spill_group("h_tot_vs_spill_rejected_", "rejected");
+  draw_sensor_tot_vs_spill_group("h_tot_vs_spill_selected_", "[FULL SELECTION]");
+  draw_sensor_tot_vs_spill_group("h_tot_vs_spill_rejected_", "[CUT DIAGNOSTIC: rejected by dt/ToT cut]");
 
   auto draw_sensor_dt_vs_spill_group = [&](const std::string &prefix, const std::string &label) {
     canvas.Clear();
@@ -3335,7 +3809,7 @@ void DrawRunHistograms(TCanvas &canvas,
       has_group = true;
       hist->SetTitle((result.config.label + " I=" + std::to_string(result.config.intensity) + " " + label +
                       " #Deltat vs spill ch" + std::to_string(ch) +
-                      ";spill;t_{ch} - t_{trigger} [ns];entries")
+                      ";spill;" + dt_axis_title + ";entries")
                          .c_str());
       hist->Draw("colz");
       auto profile = MakeDtVsSpillProfile(*hist);
@@ -3349,9 +3823,9 @@ void DrawRunHistograms(TCanvas &canvas,
     }
   };
 
-  draw_sensor_dt_vs_spill_group("h_raw_dt_vs_spill_", "raw");
-  draw_sensor_dt_vs_spill_group("h_dt_vs_spill_", "selected");
-  draw_sensor_dt_vs_spill_group("h_rejected_dt_vs_spill_", "rejected");
+  draw_sensor_dt_vs_spill_group("h_raw_dt_vs_spill_", "[CUT DIAGNOSTIC: before dt/ToT cut]");
+  draw_sensor_dt_vs_spill_group("h_dt_vs_spill_", "[FULL SELECTION]");
+  draw_sensor_dt_vs_spill_group("h_rejected_dt_vs_spill_", "[CUT DIAGNOSTIC: rejected by dt/ToT cut]");
   canvas.Clear();
 
   if (sensor_channels.size() >= 2) {
@@ -3579,6 +4053,9 @@ void WriteTextSummary(const std::string &path,
 	                      const SpillRange &spill_range,
 	                      const std::map<int, TotWindow> &channel_tot_windows,
 	                      const TdcSelection &tdc_selection,
+	                      double match_window_ns,
+	                      double event_window_ns,
+	                      double trigger_deadtime_ns,
 	                      int edge_spill,
 	                      const std::string &edge_channels_csv,
 	                      double edge_phase_period_ns,
@@ -3593,10 +4070,12 @@ void WriteTextSummary(const std::string &path,
     return;
   }
   out << "# runlist: " << runlist_path << "\n";
-  out << "# fine_calib: " << fine_calib_path << "\n";
-	  out << "# channel_calib: " << chan_calib_path << "\n";
-	  out << "# reference_mode: " << TimeReferenceModeName(reference_mode) << "\n";
-	  if (reference_mode == TimeReferenceMode::EventMedian) {
+	  out << "# fine_calib: " << fine_calib_path << "\n";
+		  out << "# channel_calib: " << chan_calib_path << "\n";
+		  out << "# reference_mode: " << TimeReferenceModeName(reference_mode) << "\n";
+		  out << "# match_window_ns: " << match_window_ns << "\n";
+		  out << "# event_window_ns: " << event_window_ns << "\n";
+		  if (reference_mode == TimeReferenceMode::EventMedian) {
 	    out << "# dt is t_channel - median(event excluding channel), min_channels="
 	        << event_reference_min_channels << "\n";
 	  } else {
@@ -3604,7 +4083,7 @@ void WriteTextSummary(const std::string &path,
 	    out << "# dt trigger matching: " << (signed_dt ? "nearest signed trigger" : "previous trigger, dt >= 0") << "\n";
 	  }
 	  out << "# ToT statistics use valid leading/trailing hits after optional spill and channel-ToT selections, before dt matching\n";
-	  out << "# optional dt/ToT cut keeps events with dt >= DT0 + SLOPE*ToT; rejected events are written as h_rejected_*\n";
+	  out << "# optional dt/ToT cut keeps events below or above DT0 + SLOPE*ToT according to dt_tot_cut_direction\n";
 	  if (trigger_tot_window.enabled) {
 	    out << "# trigger ToT window: [" << trigger_tot_window.min << "," << trigger_tot_window.max
 	        << "] ns, applied before trigger cleanup and sensor matching\n";
@@ -3630,6 +4109,9 @@ void WriteTextSummary(const std::string &path,
 	  }
 	  out << "# h_dt_vs_tot histograms correlate matched dt with ToT for each sensor channel, using |dt|/dt < "
 	      << kTimewalkDtLimitNs << " ns range\n";
+	  out << "# Plot stages: [NO ANALYSIS CUTS] excludes trigger veto/period cleanup, matching windows, ToT windows, and dt/ToT cuts\n";
+	  out << "# Plot stages: [FULL SELECTION] is the sample accepted for the timewalk input after all configured selections\n";
+	  out << "# Plot stages: [CUT DIAGNOSTIC] isolates an intermediate selection or rejection step\n";
 	  out << "# h_dt_vs_tot ProfileX objects are fitted with the configured timewalk model and written as *_pfx plus TF1\n";
 	  out << "# h_dt_vs_tot_accum_ch* objects sum all intensities per channel and are fitted in the same way\n";
 	  out << "# h_tot_vs_spill_* histograms show ToT versus spill for each channel, with *_pfx mean-ToT profiles\n";
@@ -3639,19 +4121,27 @@ void WriteTextSummary(const std::string &path,
 	      << " (-1 means first selected spill), initial fraction=" << edge_spill_fraction << "\n";
 	  out << "# h_edge_phase_* histograms fold the same single-spill edges modulo "
 	      << edge_phase_period_ns << " ns\n";
+	  out << "# h_interhit_leading_* histograms show leading-hit intervals t_i-t_{i-1} per channel before analysis cuts\n";
+	  out << "# h_interhit_full_selection_* histograms show the same intervals after the full timewalk selection\n";
+	  out << "# h_duration_vs_prev_interhit_* histograms show hit duration/ToT versus interval from the previous leading hit\n";
+	  out << "# h_trigger_candidate_interhit_*, h_trigger_after_veto_interhit_*, and h_trigger_clean_interhit_* compare trigger-channel intervals before veto, after veto, and after period cleanup\n";
+	  out << "# trigger_veto_ns: " << trigger_deadtime_ns
+	      << " ns, applied after each accepted trigger candidate before period cleanup\n";
 	  out << "# h_dt_corr_vs_tot_accum_ch* histograms use all corrected events accumulated over all intensities\n";
 	  out << "# h_dt_corr_ch*_ch* histograms are corrected channel-channel coincidences in ["
 	      << kCorrectedCoincidenceDtMinNs << ", " << kCorrectedCoincidenceDtMaxNs
 	      << "] ns, matched through the same clean trigger\n";
 	  out << "# trigger ToT statistics use the cleaned channel-" << trigger_channel << " trigger candidates\n";
-	  out << "# trigger22 cleanup/dead-time is applied only to channel " << trigger_channel << "\n";
+	  out << "# trigger veto/dead-time is applied only to channel " << trigger_channel << "\n";
   out << "# trigger22 period cleanup keeps only candidates compatible with the expected trigger period\n";
   out << "# trigger22_clean_period is computed after channel-" << trigger_channel << " dead-time cleaning\n";
   for (int ch : sensor_channels) {
     auto cut_it = dt_tot_cuts.find(ch);
     if (cut_it != dt_tot_cuts.end() && cut_it->second.enabled) {
       const auto &cut = cut_it->second;
-      out << "# dt_tot_cut_ch" << ch << ": keep dt >= " << cut.intercept << " + " << cut.slope << "*ToT";
+      out << "# dt_tot_cut_ch" << ch << ": keep dt "
+          << (cut.direction == DtTotCutDirection::KeepAbove ? ">= " : "<= ")
+          << cut.intercept << " + " << cut.slope << "*ToT";
       if (std::isfinite(cut.tot_min) || std::isfinite(cut.tot_max)) {
         out << " for ToT in [" << cut.tot_min << "," << cut.tot_max << "] ns";
       }
@@ -3723,7 +4213,7 @@ void laser_intensity_scan_rdf(const char *runlist_path = "help",
                               bool use_lut = true,
                               int fine_cut = 0,
                               bool require_valid_tot = true,
-                              double trigger_deadtime_ns = 50000.0,
+                              double trigger_deadtime_ns = 0.0,
                               double trigger_period_ns = 1000000.0,
                               double trigger_period_tolerance_ns = 50000.0,
                               bool signed_dt = false,
@@ -3738,8 +4228,10 @@ void laser_intensity_scan_rdf(const char *runlist_path = "help",
                               double edge_phase_period_ns = 0.0,
                               double edge_spill_fraction = 0.01,
                               const char *tdc_selection_csv = "",
-                              const char *reference_mode_name = "event-median",
-                              int event_reference_min_channels = 3)
+                              const char *reference_mode_name = "trigger",
+                              int event_reference_min_channels = 3,
+                              double event_window_ns = 0.0,
+                              const char *dt_tot_cut_direction_name = "below")
 {
   if (WantsHelp(runlist_path)) {
     PrintHelp();
@@ -3751,11 +4243,17 @@ void laser_intensity_scan_rdf(const char *runlist_path = "help",
   if (match_window_ns <= 0.0) {
     match_window_ns = 100.0;
   }
+  if (event_window_ns <= 0.0) {
+    event_window_ns = match_window_ns;
+  }
   if (trigger_period_ns < 0.0) {
     trigger_period_ns = 0.0;
   }
   if (trigger_period_tolerance_ns < 0.0) {
     trigger_period_tolerance_ns = 0.0;
+  }
+  if (trigger_deadtime_ns < 0.0) {
+    trigger_deadtime_ns = 0.0;
   }
 
   auto runs = LoadRunList(runlist_path);
@@ -3768,18 +4266,34 @@ void laser_intensity_scan_rdf(const char *runlist_path = "help",
     std::cerr << "No sensor channels configured." << std::endl;
     return;
   }
+  const TimeReferenceMode reference_mode = ParseTimeReferenceMode(reference_mode_name ? reference_mode_name : "");
+  if (reference_mode == TimeReferenceMode::Trigger) {
+    const auto old_size = sensor_channels.size();
+    sensor_channels.erase(std::remove(sensor_channels.begin(), sensor_channels.end(), trigger_channel),
+                          sensor_channels.end());
+    if (sensor_channels.size() != old_size) {
+      std::cout << "Reference mode trigger: removing ch" << trigger_channel
+                << " from sensor channels; it is used only as trigger reference." << std::endl;
+    }
+    if (sensor_channels.empty()) {
+      std::cerr << "No sensor channels left after removing trigger/reference channel " << trigger_channel << "."
+                << std::endl;
+      return;
+    }
+  }
   std::vector<int> analysis_channels = sensor_channels;
   analysis_channels.push_back(trigger_channel);
   std::sort(analysis_channels.begin(), analysis_channels.end());
   analysis_channels.erase(std::unique(analysis_channels.begin(), analysis_channels.end()), analysis_channels.end());
   auto edge_channels = ParseEdgeChannelsCsv(edge_channels_csv ? edge_channels_csv : "all", analysis_channels);
   auto timewalk_fit_ranges = ParseFitRangesCsv(timewalk_fit_ranges_csv ? timewalk_fit_ranges_csv : "");
-  auto dt_tot_cuts = ParseDtTotCutsCsv(dt_tot_cuts_csv ? dt_tot_cuts_csv : "");
+  const auto dt_tot_cut_direction =
+      ParseDtTotCutDirection(dt_tot_cut_direction_name ? dt_tot_cut_direction_name : "below");
+  auto dt_tot_cuts = ParseDtTotCutsCsv(dt_tot_cuts_csv ? dt_tot_cuts_csv : "", dt_tot_cut_direction);
   auto trigger_tot_window = ParseTotWindow(trigger_tot_window_csv ? trigger_tot_window_csv : "");
   auto spill_range = ParseSpillRange(spill_range_csv ? spill_range_csv : "");
   auto channel_tot_windows = ParseChannelTotWindowsCsv(channel_tot_windows_csv ? channel_tot_windows_csv : "");
   auto tdc_selection = ParseTdcSelectionCsv(tdc_selection_csv ? tdc_selection_csv : "");
-  const TimeReferenceMode reference_mode = ParseTimeReferenceMode(reference_mode_name ? reference_mode_name : "");
   event_reference_min_channels = std::max(1, event_reference_min_channels);
   const auto timewalk_fit_model =
       ParseTimewalkFitModel(timewalk_fit_model_name ? timewalk_fit_model_name : "pol1-plateau");
@@ -3811,7 +4325,7 @@ void laser_intensity_scan_rdf(const char *runlist_path = "help",
   std::cout << "Run list: " << runlist_path << std::endl;
   std::cout << "Runs: " << runs.size() << std::endl;
   std::cout << "Laser trigger/reference channel: " << trigger_channel << std::endl;
-  std::cout << "Sensor channels: " << sensor_channels_csv << std::endl;
+  std::cout << "Sensor channels: " << ChannelsLabel(sensor_channels) << std::endl;
   std::cout << "Time reference mode: " << TimeReferenceModeName(reference_mode) << std::endl;
   if (reference_mode == TimeReferenceMode::EventMedian) {
     std::cout << "Event-median min channels: " << event_reference_min_channels << std::endl;
@@ -3821,13 +4335,15 @@ void laser_intensity_scan_rdf(const char *runlist_path = "help",
               << ") vs sensor ToT" << std::endl;
   }
   std::cout << "Match window (ns): " << match_window_ns << std::endl;
-  std::cout << "Trigger dead-time cleaning (ns): " << trigger_deadtime_ns << std::endl;
+  std::cout << "Event-building window (ns): " << event_window_ns << std::endl;
+  std::cout << "Trigger veto/dead-time after accepted trigger (ns): " << trigger_deadtime_ns << std::endl;
   std::cout << "Trigger expected period (ns): " << trigger_period_ns << std::endl;
   std::cout << "Trigger period tolerance (ns): " << trigger_period_tolerance_ns << std::endl;
   std::cout << "Signed nearest-trigger dt: " << signed_dt << std::endl;
   std::cout << "Timewalk fit ranges: " << (timewalk_fit_ranges_csv ? timewalk_fit_ranges_csv : "") << std::endl;
   std::cout << "Timewalk fit model: " << TimewalkFitModelName(timewalk_fit_model) << std::endl;
   std::cout << "dt/ToT selection cuts: " << (dt_tot_cuts_csv ? dt_tot_cuts_csv : "") << std::endl;
+  std::cout << "dt/ToT cut direction: " << DtTotCutDirectionName(dt_tot_cut_direction) << std::endl;
   std::cout << "Trigger ToT window: " << (trigger_tot_window_csv ? trigger_tot_window_csv : "") << std::endl;
   std::cout << "Spill range: " << (spill_range_csv ? spill_range_csv : "") << std::endl;
   std::cout << "Channel ToT windows: " << (channel_tot_windows_csv ? channel_tot_windows_csv : "") << std::endl;
@@ -3855,10 +4371,11 @@ void laser_intensity_scan_rdf(const char *runlist_path = "help",
                                  fine_calib,
                                  tdc_offset_calib,
                                  chan_calib,
-                                 reference_mode,
-                                 event_reference_min_channels,
-                                 match_window_ns,
-                                 trigger_deadtime_ns,
+	                                 reference_mode,
+	                                 event_reference_min_channels,
+	                                 match_window_ns,
+	                                 event_window_ns,
+	                                 trigger_deadtime_ns,
                                  trigger_period_ns,
                                  trigger_period_tolerance_ns,
                                  max_duration_ns,
@@ -3869,10 +4386,10 @@ void laser_intensity_scan_rdf(const char *runlist_path = "help",
                                  signed_dt,
                                  dt_tot_cuts,
                                  trigger_tot_window,
-                                 spill_range,
-                                 channel_tot_windows,
-                                 tdc_selection,
-                                 edge_spill,
+			        spill_range,
+			        channel_tot_windows,
+			        tdc_selection,
+			        edge_spill,
                                  edge_channels,
                                  edge_phase_period_ns,
                                  edge_spill_fraction));
@@ -3903,9 +4420,10 @@ void laser_intensity_scan_rdf(const char *runlist_path = "help",
                                             dt_tot_cuts,
                                             trigger_tot_window,
                                             spill_range,
-                                            channel_tot_windows,
-                                            tdc_selection,
-                                            corrected_accumulated_timewalk_histograms);
+	                                            channel_tot_windows,
+	                                            tdc_selection,
+	                                            event_window_ns,
+	                                            corrected_accumulated_timewalk_histograms);
 
   std::vector<std::unique_ptr<TGraphErrors>> graphs;
   std::vector<TGraphErrors *> dt_mean_graphs;
@@ -3981,10 +4499,13 @@ void laser_intensity_scan_rdf(const char *runlist_path = "help",
 	        timewalk_corrections,
 	        dt_tot_cuts,
 	        trigger_tot_window,
-	        spill_range,
-	        channel_tot_windows,
-	        tdc_selection,
-	        edge_spill,
+			        spill_range,
+			        channel_tot_windows,
+			        tdc_selection,
+			        match_window_ns,
+			        event_window_ns,
+			        trigger_deadtime_ns,
+		        edge_spill,
 	        edge_channels_csv ? edge_channels_csv : "all",
 	        edge_phase_period_ns > 0.0 ? edge_phase_period_ns : trigger_period_ns,
 	        edge_spill_fraction,
@@ -3999,10 +4520,13 @@ void laser_intensity_scan_rdf(const char *runlist_path = "help",
     TParameter<int>("reference_mode", static_cast<int>(reference_mode)).Write();
     TParameter<int>("event_reference_min_channels", event_reference_min_channels).Write();
     TParameter<double>("match_window_ns", match_window_ns).Write();
+    TParameter<double>("event_window_ns", event_window_ns).Write();
     TParameter<double>("trigger_deadtime_ns", trigger_deadtime_ns).Write();
+    TParameter<double>("trigger_veto_ns", trigger_deadtime_ns).Write();
     TParameter<double>("trigger_period_ns", trigger_period_ns).Write();
     TParameter<double>("trigger_period_tolerance_ns", trigger_period_tolerance_ns).Write();
     TParameter<int>("signed_dt", signed_dt ? 1 : 0).Write();
+    TParameter<int>("dt_tot_cut_direction", static_cast<int>(dt_tot_cut_direction)).Write();
     TParameter<double>("max_duration_ns", max_duration_ns).Write();
     TParameter<double>("clock_mhz", clock_mhz).Write();
     TParameter<int>("trigger_tot_window_enabled", trigger_tot_window.enabled ? 1 : 0).Write();
@@ -4056,6 +4580,8 @@ void laser_intensity_scan_rdf(const char *runlist_path = "help",
       TParameter<double>(("dt_tot_cut_slope_ch" + std::to_string(ch)).c_str(), cut.slope).Write();
       TParameter<double>(("dt_tot_cut_tot_min_ch" + std::to_string(ch)).c_str(), cut.tot_min).Write();
       TParameter<double>(("dt_tot_cut_tot_max_ch" + std::to_string(ch)).c_str(), cut.tot_max).Write();
+      TParameter<int>(("dt_tot_cut_direction_ch" + std::to_string(ch)).c_str(), static_cast<int>(cut.direction))
+          .Write();
     }
     for (auto &graph : graphs) {
       graph->Write();
@@ -4131,24 +4657,41 @@ void laser_intensity_scan_rdf(const char *runlist_path = "help",
     gStyle->SetOptStat(1110);
     gStyle->SetEndErrorSize(4);
     TCanvas canvas("c_laser_intensity_scan", "laser intensity scan", 1600, 900);
+    const std::string dt_summary_title = reference_mode == TimeReferenceMode::EventMedian
+                                             ? "Mean time difference to event median"
+                                             : "Mean time difference to laser trigger";
+    const std::string dt_rms_title = reference_mode == TimeReferenceMode::EventMedian
+                                         ? "Time-difference RMS to event median"
+                                         : "Time-difference RMS to laser trigger";
+    const std::string dt_expression_title = DtExpressionTitle(reference_mode, trigger_channel);
+    const std::string dt_axis_title = "mean(" + dt_expression_title + ") [ns]";
+    const std::string dt_rms_axis_title = "RMS(" + dt_expression_title + ") [ns]";
     canvas.Print((std::string(out_pdf) + "[").c_str());
     DrawGraphs(canvas,
                dt_mean_graphs,
                dt_labels,
-               "Mean time difference to laser trigger",
-               "mean(t_{ch} - t_{trigger}) [ns]",
+               dt_summary_title,
+               dt_axis_title,
                out_pdf);
     DrawGraphs(canvas,
                dt_rms_graphs,
                dt_labels,
-               "Time-difference RMS to laser trigger",
-               "RMS(t_{ch} - t_{trigger}) [ns]",
+               dt_rms_title,
+               dt_rms_axis_title,
                out_pdf);
 	    DrawGraphs(canvas, tot_mean_graphs, tot_labels, "Mean ToT", "mean ToT [ns]", out_pdf);
 	    DrawGraphs(canvas, tot_rms_graphs, tot_labels, "ToT RMS", "RMS ToT [ns]", out_pdf);
 	    for (const auto &result : results) {
 	      DrawRunHistograms(
-	          canvas, result, sensor_channels, trigger_channel, timewalk_fit_ranges, timewalk_fit_model, out_pdf);
+	          canvas,
+	          result,
+	          sensor_channels,
+	          trigger_channel,
+	          edge_channels,
+	          reference_mode,
+	          timewalk_fit_ranges,
+	          timewalk_fit_model,
+	          out_pdf);
 	    }
 	    DrawAccumulatedTimewalkFits(
 	        canvas, results, sensor_channels, timewalk_fit_ranges, timewalk_fit_model, dt_tot_cuts, out_pdf);
