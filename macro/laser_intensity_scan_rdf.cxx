@@ -46,8 +46,6 @@
 namespace {
 constexpr int kNumAlcorChannels = 32;
 constexpr double kTimewalkDtLimitNs = 20.0;
-constexpr double kCorrectedTimewalkDtMinNs = -3.0;
-constexpr double kCorrectedTimewalkDtMaxNs = 3.0;
 constexpr double kCorrectedCoincidenceDtMinNs = -3.0;
 constexpr double kCorrectedCoincidenceDtMaxNs = 3.0;
 
@@ -1215,7 +1213,7 @@ struct TimewalkCorrection {
     if (!valid || !std::isfinite(tot)) {
       return 0.0;
     }
-    const double value = EvalNs(tot) - baseline;
+    const double value = EvalNs(tot);
     if (!std::isfinite(value)) {
       return 0.0;
     }
@@ -1843,7 +1841,7 @@ std::map<int, TimewalkCorrection> BuildTimewalkCorrections(const std::vector<Run
     if (correction.fit_range.enabled) {
       std::cout << " fitted in ToT [" << correction.fit_range.xmin << ", " << correction.fit_range.xmax << "] ns";
     }
-    std::cout << "; applied correction is f(ToT)-baseline=" << correction.baseline << " ns" << std::endl;
+    std::cout << "; applied correction is f(ToT); baseline/plateau=" << correction.baseline << " ns" << std::endl;
   }
   return corrections;
 }
@@ -1898,6 +1896,7 @@ bool FindMatchedReference(double sensor_time,
 
 struct MatchedCorrectedHit {
   double time_ns = 0.0;
+  double time_before_timewalk_ns = 0.0;
   double tot_ns = 0.0;
   double dt_to_trigger_ns = 0.0;
 };
@@ -1961,9 +1960,11 @@ void BuildCorrectedTimewalkAndCoincidencePlots(std::vector<RunResult> &results,
     return;
   }
 
-  const double tot_max = std::max(1.0, max_duration_ns);
-  std::map<int, TH2D *> h_dt_corr_vs_tot_accum;
-  for (int ch : sensor_channels) {
+	  const double tot_max = std::max(1.0, max_duration_ns);
+	  const double corrected_dt_min = TimewalkDtMin(signed_dt, match_window_ns);
+	  const double corrected_dt_max = TimewalkDtMax(match_window_ns);
+	  std::map<int, TH2D *> h_dt_corr_vs_tot_accum;
+	  for (int ch : sensor_channels) {
     const std::string reference_label =
         reference_mode == TimeReferenceMode::EventMedian ? "event median" : "clean trigger";
     std::ostringstream title;
@@ -1973,25 +1974,37 @@ void BuildCorrectedTimewalkAndCoincidencePlots(std::vector<RunResult> &results,
                                             "h_dt_corr_vs_tot_accum_ch" + std::to_string(ch),
                                             title.str(),
                                             200,
-                                            0.0,
-                                            tot_max,
-                                            400,
-                                            kCorrectedTimewalkDtMinNs,
-	                                            kCorrectedTimewalkDtMaxNs);
+	                                            0.0,
+	                                            tot_max,
+	                                            400,
+	                                            corrected_dt_min,
+		                                            corrected_dt_max);
   }
 
-  for (auto &result : results) {
-    const std::string safe_label = SafeName(result.config.label);
-    TH1D *corrected_coincidence_hist = nullptr;
-    int ch_a = -1;
-    int ch_b = -1;
-    if (sensor_channels.size() >= 2) {
-      ch_a = sensor_channels[0];
-      ch_b = sensor_channels[1];
-      std::ostringstream title;
-      title << result.config.label << " I=" << result.config.intensity << " corrected coincidence ch" << ch_a
-            << "-ch" << ch_b << ";t_{" << ch_a << ",corr} - t_{" << ch_b << ",corr} [ns];entries";
-      corrected_coincidence_hist =
+	  for (auto &result : results) {
+	    const std::string safe_label = SafeName(result.config.label);
+	    TH1D *uncorrected_coincidence_hist = nullptr;
+	    TH1D *corrected_coincidence_hist = nullptr;
+	    int ch_a = -1;
+	    int ch_b = -1;
+	    if (sensor_channels.size() >= 2) {
+	      ch_a = sensor_channels[0];
+	      ch_b = sensor_channels[1];
+	      std::ostringstream raw_title;
+	      raw_title << result.config.label << " I=" << result.config.intensity << " coincidence before timewalk ch"
+	                << ch_a << "-ch" << ch_b << ";t_{" << ch_a << "} - t_{" << ch_b
+	                << "} [ns];entries";
+	      uncorrected_coincidence_hist =
+	          MakeHist(result.histograms,
+	                   "h_dt_uncorr_ch" + std::to_string(ch_a) + "_ch" + std::to_string(ch_b) + "_" + safe_label,
+	                   raw_title.str(),
+	                   240,
+	                   kCorrectedCoincidenceDtMinNs,
+	                   kCorrectedCoincidenceDtMaxNs);
+	      std::ostringstream title;
+	      title << result.config.label << " I=" << result.config.intensity << " corrected coincidence ch" << ch_a
+	            << "-ch" << ch_b << ";t_{" << ch_a << ",corr} - t_{" << ch_b << ",corr} [ns];entries";
+	      corrected_coincidence_hist =
           MakeHist(result.histograms,
                    "h_dt_corr_ch" + std::to_string(ch_a) + "_ch" + std::to_string(ch_b) + "_" + safe_label,
                    title.str(),
@@ -2018,27 +2031,32 @@ void BuildCorrectedTimewalkAndCoincidencePlots(std::vector<RunResult> &results,
       }
       ComputeTot(hits, max_duration_ns);
 
-      for (auto &hit : hits) {
-        if (selected_channels.find(hit.channel) == selected_channels.end() || !hit.leading ||
-            !tdc_selection.KeepLeadingHit(hit.channel, hit.tdc)) {
-          continue;
-        }
-        if (chan_calib.loaded && hit.tot_ns > 0.0) {
-          hit.time_ns -= chan_calib.CorrectionNs(hit.channel, hit.tot_ns);
-        }
-      }
+	      for (auto &hit : hits) {
+	        if (selected_channels.find(hit.channel) == selected_channels.end() || !hit.leading ||
+	            !tdc_selection.KeepLeadingHit(hit.channel, hit.tdc)) {
+	          continue;
+	        }
+	        if (chan_calib.loaded && hit.tot_ns > 0.0) {
+	          hit.time_ns -= chan_calib.CorrectionNs(hit.channel, hit.tot_ns);
+	        }
+	      }
+	      std::vector<double> time_before_timewalk(hits.size(), std::numeric_limits<double>::quiet_NaN());
+	      for (size_t i = 0; i < hits.size(); ++i) {
+	        time_before_timewalk[i] = hits[i].time_ns;
+	      }
 
-      if (reference_mode == TimeReferenceMode::EventMedian) {
-        for (auto &hit : hits) {
-          if (selected_channels.find(hit.channel) == selected_channels.end() || !hit.leading ||
-              !tdc_selection.KeepLeadingHit(hit.channel, hit.tdc) || hit.tot_ns <= 0.0) {
-            continue;
-          }
-          auto correction_it = corrections.find(hit.channel);
-          if (correction_it != corrections.end()) {
-            hit.time_ns -= correction_it->second.CorrectionNs(hit.tot_ns);
-          }
-        }
+	      if (reference_mode == TimeReferenceMode::EventMedian) {
+	        for (size_t i = 0; i < hits.size(); ++i) {
+	          auto &hit = hits[i];
+	          if (selected_channels.find(hit.channel) == selected_channels.end() || !hit.leading ||
+	              !tdc_selection.KeepLeadingHit(hit.channel, hit.tdc) || hit.tot_ns <= 0.0) {
+	            continue;
+	          }
+	          auto correction_it = corrections.find(hit.channel);
+	          if (correction_it != corrections.end()) {
+	            hit.time_ns -= correction_it->second.CorrectionNs(hit.tot_ns);
+	          }
+	        }
 
         auto matches = BuildEventMedianMatches(hits,
                                                selected_channels,
@@ -2057,17 +2075,18 @@ void BuildCorrectedTimewalkAndCoincidencePlots(std::vector<RunResult> &results,
           if (!channel_tot_window.Pass(hit.tot_ns)) {
             continue;
           }
-          if (match.dt_ns >= kCorrectedTimewalkDtMinNs && match.dt_ns <= kCorrectedTimewalkDtMaxNs &&
-              h_dt_corr_vs_tot_accum.count(hit.channel) > 0) {
-            h_dt_corr_vs_tot_accum[hit.channel]->Fill(hit.tot_ns, match.dt_ns);
-          }
-          matched_by_event_channel[match.event_id][hit.channel].push_back({hit.time_ns, hit.tot_ns, match.dt_ns});
-        }
+	          if (match.dt_ns >= corrected_dt_min && match.dt_ns <= corrected_dt_max &&
+	              h_dt_corr_vs_tot_accum.count(hit.channel) > 0) {
+	            h_dt_corr_vs_tot_accum[hit.channel]->Fill(hit.tot_ns, match.dt_ns);
+	          }
+	          matched_by_event_channel[match.event_id][hit.channel].push_back(
+	              {hit.time_ns, time_before_timewalk[match.index], hit.tot_ns, match.dt_ns});
+	        }
 
-        if (!corrected_coincidence_hist || ch_a < 0 || ch_b < 0) {
-          return;
-        }
-        for (const auto &event_entry : matched_by_event_channel) {
+	        if ((!corrected_coincidence_hist && !uncorrected_coincidence_hist) || ch_a < 0 || ch_b < 0) {
+	          return;
+	        }
+	        for (const auto &event_entry : matched_by_event_channel) {
           const auto &by_channel = event_entry.second;
           auto hits_a_it = by_channel.find(ch_a);
           auto hits_b_it = by_channel.find(ch_b);
@@ -2085,14 +2104,20 @@ void BuildCorrectedTimewalkAndCoincidencePlots(std::vector<RunResult> &results,
           const auto best_b = best_hit(hits_b_it->second);
           if (best_a == hits_a_it->second.end() || best_b == hits_b_it->second.end()) {
             continue;
-          }
-          const double dt_ab = best_a->time_ns - best_b->time_ns;
-          if (dt_ab >= kCorrectedCoincidenceDtMinNs && dt_ab <= kCorrectedCoincidenceDtMaxNs) {
-            corrected_coincidence_hist->Fill(dt_ab);
-          }
-        }
-        return;
-      }
+	          }
+	          const double dt_ab = best_a->time_ns - best_b->time_ns;
+	          if (corrected_coincidence_hist && dt_ab >= kCorrectedCoincidenceDtMinNs &&
+	              dt_ab <= kCorrectedCoincidenceDtMaxNs) {
+	            corrected_coincidence_hist->Fill(dt_ab);
+	          }
+	          const double raw_dt_ab = best_a->time_before_timewalk_ns - best_b->time_before_timewalk_ns;
+	          if (uncorrected_coincidence_hist && raw_dt_ab >= kCorrectedCoincidenceDtMinNs &&
+	              raw_dt_ab <= kCorrectedCoincidenceDtMaxNs) {
+	            uncorrected_coincidence_hist->Fill(raw_dt_ab);
+	          }
+	        }
+	        return;
+	      }
 
       std::vector<size_t> trigger_indices;
       std::vector<size_t> sensor_indices;
@@ -2168,21 +2193,22 @@ void BuildCorrectedTimewalkAndCoincidencePlots(std::vector<RunResult> &results,
           auto correction_it = corrections.find(ch);
           const double correction_ns =
               correction_it != corrections.end() ? correction_it->second.CorrectionNs(sensor_tot) : 0.0;
-          StoredSensorHit corrected{ch, hits[sensor_idx].spill, hits[sensor_idx].time_ns - correction_ns, sensor_tot};
-          double dt = std::numeric_limits<double>::quiet_NaN();
-          if (!FindMatchedReference(corrected.time_ns, triggers, match_window_ns, signed_dt, trigger_index, dt)) {
-            continue;
-          }
-          matched_by_trigger_channel[trigger_index][ch].push_back({corrected.time_ns, corrected.tot_ns, dt});
-          if (dt >= kCorrectedTimewalkDtMinNs && dt <= kCorrectedTimewalkDtMaxNs) {
-            h_dt_corr_vs_tot_accum[ch]->Fill(corrected.tot_ns, dt);
-          }
-        }
-      }
+	          StoredSensorHit corrected{ch, hits[sensor_idx].spill, hits[sensor_idx].time_ns - correction_ns, sensor_tot};
+	          double dt = std::numeric_limits<double>::quiet_NaN();
+	          if (!FindMatchedReference(corrected.time_ns, triggers, match_window_ns, signed_dt, trigger_index, dt)) {
+	            continue;
+	          }
+	          matched_by_trigger_channel[trigger_index][ch].push_back(
+	              {corrected.time_ns, time_before_timewalk[sensor_idx], corrected.tot_ns, dt});
+	          if (dt >= corrected_dt_min && dt <= corrected_dt_max) {
+	            h_dt_corr_vs_tot_accum[ch]->Fill(corrected.tot_ns, dt);
+	          }
+	        }
+	      }
 
-      if (!corrected_coincidence_hist || ch_a < 0 || ch_b < 0) {
-        return;
-      }
+	      if ((!corrected_coincidence_hist && !uncorrected_coincidence_hist) || ch_a < 0 || ch_b < 0) {
+	        return;
+	      }
       for (const auto &trigger_entry : matched_by_trigger_channel) {
         const auto &by_channel = trigger_entry.second;
         auto hits_a_it = by_channel.find(ch_a);
@@ -2201,13 +2227,19 @@ void BuildCorrectedTimewalkAndCoincidencePlots(std::vector<RunResult> &results,
         const auto best_b = best_hit(hits_b_it->second);
         if (best_a == hits_a_it->second.end() || best_b == hits_b_it->second.end()) {
           continue;
-        }
-        const double dt_ab = best_a->time_ns - best_b->time_ns;
-        if (dt_ab >= kCorrectedCoincidenceDtMinNs && dt_ab <= kCorrectedCoincidenceDtMaxNs) {
-          corrected_coincidence_hist->Fill(dt_ab);
-        }
-      }
-    };
+	        }
+	        const double dt_ab = best_a->time_ns - best_b->time_ns;
+	        if (corrected_coincidence_hist && dt_ab >= kCorrectedCoincidenceDtMinNs &&
+	            dt_ab <= kCorrectedCoincidenceDtMaxNs) {
+	          corrected_coincidence_hist->Fill(dt_ab);
+	        }
+	        const double raw_dt_ab = best_a->time_before_timewalk_ns - best_b->time_before_timewalk_ns;
+	        if (uncorrected_coincidence_hist && raw_dt_ab >= kCorrectedCoincidenceDtMinNs &&
+	            raw_dt_ab <= kCorrectedCoincidenceDtMaxNs) {
+	          uncorrected_coincidence_hist->Fill(raw_dt_ab);
+	        }
+	      }
+	    };
 
     std::vector<TreeCursor> cursors;
     cursors.reserve(input.files.size());
@@ -3354,12 +3386,36 @@ void DrawRunHistograms(TCanvas &canvas,
                        const std::vector<int> &sensor_channels,
                        int trigger_channel,
                        const std::vector<int> &edge_channels,
-                       TimeReferenceMode reference_mode,
-                       const std::map<int, FitRange> &fit_ranges,
-                       TimewalkFitModel fit_model,
-                       const std::string &out_pdf)
+	                       TimeReferenceMode reference_mode,
+	                       const std::map<int, FitRange> &fit_ranges,
+	                       const std::map<int, DtTotCut> &dt_tot_cuts,
+	                       TimewalkFitModel fit_model,
+	                       const std::string &out_pdf)
 {
   const std::string dt_axis_title = DtAxisTitle(reference_mode, trigger_channel);
+  auto set_linear_2d_pad = []() {
+    if (auto *pad = gPad) {
+      pad->SetLogx(false);
+      pad->SetLogy(false);
+      pad->SetLogz(false);
+      pad->SetRightMargin(0.14);
+    }
+  };
+  auto set_linear_profile_pad = []() {
+    if (auto *pad = gPad) {
+      pad->SetLogx(false);
+      pad->SetLogy(false);
+      pad->SetLogz(false);
+      pad->SetRightMargin(0.05);
+    }
+  };
+  auto set_profile_y_range = [](TProfile *profile, const TH2D &hist) {
+    if (!profile || !hist.GetYaxis()) {
+      return;
+    }
+    profile->SetMinimum(hist.GetYaxis()->GetXmin());
+    profile->SetMaximum(hist.GetYaxis()->GetXmax());
+  };
   DrawSectionPage(canvas,
                   "FULL SELECTION",
                   "Plots used as timewalk inputs after the configured trigger/reference, ToT, TDC, spill, and dt/ToT selections.",
@@ -3449,6 +3505,89 @@ void DrawRunHistograms(TCanvas &canvas,
   stack_tot->Draw("nostack hist");
   legend_tot->Draw();
   canvas.Print(out_pdf.c_str());
+
+  auto draw_timewalk_2d_group = [&](const std::string &prefix,
+                                    const std::string &label,
+                                    bool draw_profile_and_fit,
+                                    bool draw_cut_line) {
+	    canvas.Clear();
+	    canvas.SetRightMargin(0.05);
+	    canvas.Divide(static_cast<int>(sensor_channels.size()), 1, 0.001, 0.001);
+	    bool has_group = false;
+	    for (size_t i = 0; i < sensor_channels.size(); ++i) {
+	      const int ch = sensor_channels[i];
+	      TH2D *hist = FindRunHist2D(result, prefix, ch);
+	      canvas.cd(static_cast<int>(i + 1));
+      set_linear_2d_pad();
+      if (!hist || hist->GetEntries() <= 0.0) {
+        continue;
+      }
+      has_group = true;
+      auto *draw_hist = static_cast<TH2D *>(hist->Clone());
+      draw_hist->SetDirectory(nullptr);
+      draw_hist->SetBit(kCanDelete);
+      draw_hist->SetStats(false);
+      draw_hist->SetTitle((label + " " + result.config.label + " I=" + std::to_string(result.config.intensity) +
+                           " ch" + std::to_string(ch) + ";ToT [ns];" + dt_axis_title + ";entries")
+                              .c_str());
+      draw_hist->Draw("colz");
+	      if (draw_cut_line) {
+	        DrawDtTotCutLine(DtTotCutForChannel(dt_tot_cuts, ch), draw_hist);
+	      }
+	    }
+	    if (has_group) {
+	      canvas.Print(out_pdf.c_str());
+	    }
+	    if (!draw_profile_and_fit || !has_group) {
+	      return;
+	    }
+
+	    canvas.Clear();
+	    canvas.SetRightMargin(0.05);
+	    canvas.Divide(static_cast<int>(sensor_channels.size()), 1, 0.001, 0.001);
+	    bool has_profile_group = false;
+	    std::vector<std::unique_ptr<TProfile>> profiles;
+	    std::vector<std::unique_ptr<TF1>> fits;
+	    profiles.reserve(sensor_channels.size());
+	    fits.reserve(sensor_channels.size());
+	    for (size_t i = 0; i < sensor_channels.size(); ++i) {
+	      const int ch = sensor_channels[i];
+	      TH2D *hist = FindRunHist2D(result, prefix, ch);
+	      canvas.cd(static_cast<int>(i + 1));
+	      set_linear_profile_pad();
+	      if (!hist || hist->GetEntries() <= 0.0) {
+	        continue;
+	      }
+	      auto profile = MakeTimewalkProfile(*hist);
+	      if (!profile) {
+	        continue;
+	      }
+	      has_profile_group = true;
+	      profile->SetTitle(("[PROFILE ONLY] " + label + " " + result.config.label +
+	                         " I=" + std::to_string(result.config.intensity) + " ch" + std::to_string(ch) +
+	                         ";ToT [ns];mean " + dt_axis_title)
+	                            .c_str());
+	      profile->SetMarkerColor(kBlack);
+	      profile->SetLineColor(kBlack);
+	      set_profile_y_range(profile.get(), *hist);
+	      auto fit = FitTimewalkProfile(profile.get(), FitRangeForChannel(fit_ranges, ch), fit_model);
+	      profile->Draw("E1");
+	      if (fit) {
+	        fit->SetLineColor(kRed + 1);
+	        fit->SetLineWidth(3);
+	        fit->Draw("same");
+	        fits.push_back(std::move(fit));
+	      }
+	      profiles.push_back(std::move(profile));
+	    }
+	    if (has_profile_group) {
+	      canvas.Print(out_pdf.c_str());
+	    }
+	  };
+
+  draw_timewalk_2d_group("h_raw_dt_vs_tot_", "[CUT DIAGNOSTIC: before dt/ToT cut]", false, true);
+  draw_timewalk_2d_group("h_dt_vs_tot_", "[FULL SELECTION] #Deltat vs ToT", true, true);
+  draw_timewalk_2d_group("h_rejected_dt_vs_tot_", "[CUT DIAGNOSTIC: rejected by dt/ToT cut]", false, true);
 
   DrawSectionPage(canvas,
                   "NO ANALYSIS CUTS",
@@ -3708,8 +3847,6 @@ void DrawRunHistograms(TCanvas &canvas,
   canvas.SetRightMargin(0.05);
   canvas.Divide(static_cast<int>(tot_channels.size()), 1, 0.001, 0.001);
   bool has_tot_vs_spill = false;
-  std::vector<std::unique_ptr<TProfile>> tot_vs_spill_profiles;
-  tot_vs_spill_profiles.reserve(tot_channels.size());
   for (size_t i = 0; i < tot_channels.size(); ++i) {
     const int ch = tot_channels[i];
     const std::string name = "h_tot_vs_spill_" + SafeName(result.config.label) + "_ch" + std::to_string(ch);
@@ -3721,22 +3858,54 @@ void DrawRunHistograms(TCanvas &canvas,
       }
     }
     canvas.cd(static_cast<int>(i + 1));
-    if (auto *pad = gPad) {
-      pad->SetRightMargin(0.14);
-    }
+    set_linear_2d_pad();
     if (!hist || hist->GetEntries() <= 0.0) {
       continue;
     }
     has_tot_vs_spill = true;
     hist->Draw("colz");
-    auto profile = MakeTotVsSpillProfile(*hist);
-    if (profile) {
-      profile->Draw("E1 same");
-      tot_vs_spill_profiles.push_back(std::move(profile));
-    }
   }
   if (has_tot_vs_spill) {
     canvas.Print(out_pdf.c_str());
+  }
+  if (has_tot_vs_spill) {
+    canvas.Clear();
+    canvas.SetRightMargin(0.05);
+    canvas.Divide(static_cast<int>(tot_channels.size()), 1, 0.001, 0.001);
+    bool has_profile_group = false;
+    std::vector<std::unique_ptr<TProfile>> tot_vs_spill_profiles;
+    tot_vs_spill_profiles.reserve(tot_channels.size());
+    for (size_t i = 0; i < tot_channels.size(); ++i) {
+      const int ch = tot_channels[i];
+      const std::string name = "h_tot_vs_spill_" + SafeName(result.config.label) + "_ch" + std::to_string(ch);
+      TH2D *hist = nullptr;
+      for (const auto &owned : result.histograms2d) {
+        if (std::string(owned->GetName()) == name) {
+          hist = owned.get();
+          break;
+        }
+      }
+      canvas.cd(static_cast<int>(i + 1));
+      set_linear_profile_pad();
+      if (!hist || hist->GetEntries() <= 0.0) {
+        continue;
+      }
+      auto profile = MakeTotVsSpillProfile(*hist);
+      if (!profile) {
+        continue;
+      }
+      has_profile_group = true;
+      profile->SetTitle(("[PROFILE ONLY] " + result.config.label +
+                         " I=" + std::to_string(result.config.intensity) + " ToT vs spill ch" +
+                         std::to_string(ch) + ";spill;mean ToT [ns]")
+                            .c_str());
+      set_profile_y_range(profile.get(), *hist);
+      profile->Draw("E1");
+      tot_vs_spill_profiles.push_back(std::move(profile));
+    }
+    if (has_profile_group) {
+      canvas.Print(out_pdf.c_str());
+    }
   }
 
   auto draw_sensor_tot_vs_spill_group = [&](const std::string &prefix, const std::string &label) {
@@ -3744,6 +3913,38 @@ void DrawRunHistograms(TCanvas &canvas,
     canvas.SetRightMargin(0.05);
     canvas.Divide(static_cast<int>(sensor_channels.size()), 1, 0.001, 0.001);
     bool has_group = false;
+    for (size_t i = 0; i < sensor_channels.size(); ++i) {
+      const int ch = sensor_channels[i];
+      const std::string name = prefix + SafeName(result.config.label) + "_ch" + std::to_string(ch);
+      TH2D *hist = nullptr;
+      for (const auto &owned : result.histograms2d) {
+        if (std::string(owned->GetName()) == name) {
+          hist = owned.get();
+          break;
+        }
+      }
+      canvas.cd(static_cast<int>(i + 1));
+      set_linear_2d_pad();
+      if (!hist || hist->GetEntries() <= 0.0) {
+        continue;
+      }
+      has_group = true;
+      hist->SetTitle((result.config.label + " I=" + std::to_string(result.config.intensity) + " " + label +
+                      " ToT vs spill ch" + std::to_string(ch) + ";spill;ToT [ns];entries")
+	                         .c_str());
+      hist->Draw("colz");
+    }
+    if (has_group) {
+      canvas.Print(out_pdf.c_str());
+    }
+    if (!has_group) {
+      return;
+    }
+
+    canvas.Clear();
+    canvas.SetRightMargin(0.05);
+    canvas.Divide(static_cast<int>(sensor_channels.size()), 1, 0.001, 0.001);
+    bool has_profile_group = false;
     std::vector<std::unique_ptr<TProfile>> profiles;
     profiles.reserve(sensor_channels.size());
     for (size_t i = 0; i < sensor_channels.size(); ++i) {
@@ -3757,24 +3958,24 @@ void DrawRunHistograms(TCanvas &canvas,
         }
       }
       canvas.cd(static_cast<int>(i + 1));
-      if (auto *pad = gPad) {
-        pad->SetRightMargin(0.14);
-      }
+      set_linear_profile_pad();
       if (!hist || hist->GetEntries() <= 0.0) {
         continue;
       }
-      has_group = true;
-      hist->SetTitle((result.config.label + " I=" + std::to_string(result.config.intensity) + " " + label +
-                      " ToT vs spill ch" + std::to_string(ch) + ";spill;ToT [ns];entries")
-                         .c_str());
-      hist->Draw("colz");
       auto profile = MakeTotVsSpillProfile(*hist);
-      if (profile) {
-        profile->Draw("E1 same");
-        profiles.push_back(std::move(profile));
+      if (!profile) {
+        continue;
       }
+      has_profile_group = true;
+      profile->SetTitle(("[PROFILE ONLY] " + result.config.label +
+                         " I=" + std::to_string(result.config.intensity) + " " + label +
+                         " ToT vs spill ch" + std::to_string(ch) + ";spill;mean ToT [ns]")
+                            .c_str());
+      set_profile_y_range(profile.get(), *hist);
+      profile->Draw("E1");
+      profiles.push_back(std::move(profile));
     }
-    if (has_group) {
+    if (has_profile_group) {
       canvas.Print(out_pdf.c_str());
     }
   };
@@ -3787,6 +3988,39 @@ void DrawRunHistograms(TCanvas &canvas,
     canvas.SetRightMargin(0.05);
     canvas.Divide(static_cast<int>(sensor_channels.size()), 1, 0.001, 0.001);
     bool has_group = false;
+    for (size_t i = 0; i < sensor_channels.size(); ++i) {
+      const int ch = sensor_channels[i];
+      const std::string name = prefix + SafeName(result.config.label) + "_ch" + std::to_string(ch);
+      TH2D *hist = nullptr;
+      for (const auto &owned : result.histograms2d) {
+        if (std::string(owned->GetName()) == name) {
+          hist = owned.get();
+          break;
+        }
+      }
+      canvas.cd(static_cast<int>(i + 1));
+      set_linear_2d_pad();
+      if (!hist || hist->GetEntries() <= 0.0) {
+        continue;
+      }
+      has_group = true;
+      hist->SetTitle((result.config.label + " I=" + std::to_string(result.config.intensity) + " " + label +
+                      " #Deltat vs spill ch" + std::to_string(ch) +
+                      ";spill;" + dt_axis_title + ";entries")
+	                         .c_str());
+      hist->Draw("colz");
+    }
+    if (has_group) {
+      canvas.Print(out_pdf.c_str());
+    }
+    if (!has_group) {
+      return;
+    }
+
+    canvas.Clear();
+    canvas.SetRightMargin(0.05);
+    canvas.Divide(static_cast<int>(sensor_channels.size()), 1, 0.001, 0.001);
+    bool has_profile_group = false;
     std::vector<std::unique_ptr<TProfile>> profiles;
     profiles.reserve(sensor_channels.size());
     for (size_t i = 0; i < sensor_channels.size(); ++i) {
@@ -3800,25 +4034,25 @@ void DrawRunHistograms(TCanvas &canvas,
         }
       }
       canvas.cd(static_cast<int>(i + 1));
-      if (auto *pad = gPad) {
-        pad->SetRightMargin(0.14);
-      }
+      set_linear_profile_pad();
       if (!hist || hist->GetEntries() <= 0.0) {
         continue;
       }
-      has_group = true;
-      hist->SetTitle((result.config.label + " I=" + std::to_string(result.config.intensity) + " " + label +
-                      " #Deltat vs spill ch" + std::to_string(ch) +
-                      ";spill;" + dt_axis_title + ";entries")
-                         .c_str());
-      hist->Draw("colz");
       auto profile = MakeDtVsSpillProfile(*hist);
-      if (profile) {
-        profile->Draw("E1 same");
-        profiles.push_back(std::move(profile));
+      if (!profile) {
+        continue;
       }
+      has_profile_group = true;
+      profile->SetTitle(("[PROFILE ONLY] " + result.config.label +
+                         " I=" + std::to_string(result.config.intensity) + " " + label +
+                         " #Deltat vs spill ch" + std::to_string(ch) +
+                         ";spill;mean " + dt_axis_title)
+                            .c_str());
+      set_profile_y_range(profile.get(), *hist);
+      profile->Draw("E1");
+      profiles.push_back(std::move(profile));
     }
-    if (has_group) {
+    if (has_profile_group) {
       canvas.Print(out_pdf.c_str());
     }
   };
@@ -3828,35 +4062,62 @@ void DrawRunHistograms(TCanvas &canvas,
   draw_sensor_dt_vs_spill_group("h_rejected_dt_vs_spill_", "[CUT DIAGNOSTIC: rejected by dt/ToT cut]");
   canvas.Clear();
 
-  if (sensor_channels.size() >= 2) {
-    const int ch_a = sensor_channels[0];
-    const int ch_b = sensor_channels[1];
-    const std::string name = "h_dt_corr_ch" + std::to_string(ch_a) + "_ch" + std::to_string(ch_b) + "_" +
-                             SafeName(result.config.label);
-    TH1D *hist = nullptr;
-    for (const auto &owned : result.histograms) {
-      if (std::string(owned->GetName()) == name) {
-        hist = owned.get();
-        break;
-      }
-    }
-    if (hist) {
-      canvas.Clear();
-      canvas.SetRightMargin(0.05);
-      auto *stack = new THStack(("stack_" + name).c_str(), hist->GetTitle());
-      stack->SetBit(kCanDelete);
-      auto *draw_hist = static_cast<TH1D *>(hist->Clone());
-      draw_hist->SetDirectory(nullptr);
-      draw_hist->SetLineColor(kBlack);
-      draw_hist->SetLineWidth(2);
-      stack->Add(draw_hist, "hist");
-      if (stack->GetHists()) {
-        stack->GetHists()->SetOwner(kTRUE);
-      }
-      stack->Draw("hist");
-      canvas.Print(out_pdf.c_str());
-    }
-  }
+	  if (sensor_channels.size() >= 2) {
+	    const int ch_a = sensor_channels[0];
+	    const int ch_b = sensor_channels[1];
+	    const std::string safe_label = SafeName(result.config.label);
+	    const std::string raw_name =
+	        "h_dt_uncorr_ch" + std::to_string(ch_a) + "_ch" + std::to_string(ch_b) + "_" + safe_label;
+	    const std::string corr_name =
+	        "h_dt_corr_ch" + std::to_string(ch_a) + "_ch" + std::to_string(ch_b) + "_" + safe_label;
+	    TH1D *raw_hist = nullptr;
+	    TH1D *corr_hist = nullptr;
+	    for (const auto &owned : result.histograms) {
+	      const std::string hist_name = owned ? std::string(owned->GetName()) : "";
+	      if (hist_name == raw_name) {
+	        raw_hist = owned.get();
+	      } else if (hist_name == corr_name) {
+	        corr_hist = owned.get();
+	      }
+	    }
+	    if (raw_hist || corr_hist) {
+	      canvas.Clear();
+	      canvas.SetRightMargin(0.05);
+	      auto *stack = new THStack(("stack_dt_timewalk_compare_ch" + std::to_string(ch_a) + "_ch" +
+	                                 std::to_string(ch_b) + "_" + safe_label)
+	                                    .c_str(),
+	                                (result.config.label + " I=" + std::to_string(result.config.intensity) +
+	                                 " coincidence ch" + std::to_string(ch_a) + "-ch" + std::to_string(ch_b) +
+	                                 " before/after timewalk;t_{" + std::to_string(ch_a) + "} - t_{" +
+	                                 std::to_string(ch_b) + "} [ns];entries")
+	                                    .c_str());
+	      stack->SetBit(kCanDelete);
+	      auto *legend = new TLegend(0.62, 0.74, 0.92, 0.90);
+	      legend->SetBit(kCanDelete);
+	      legend->SetBorderSize(0);
+	      legend->SetFillStyle(0);
+	      auto add_hist = [&](TH1D *hist, int color, const char *label) {
+	        if (!hist) {
+	          return;
+	        }
+	        auto *draw_hist = static_cast<TH1D *>(hist->Clone());
+	        draw_hist->SetDirectory(nullptr);
+	        draw_hist->SetStats(false);
+	        draw_hist->SetLineColor(color);
+	        draw_hist->SetLineWidth(2);
+	        stack->Add(draw_hist, "hist");
+	        legend->AddEntry(draw_hist, label, "l");
+	      };
+	      add_hist(raw_hist, kGray + 2, "before timewalk");
+	      add_hist(corr_hist, kRed + 1, "after timewalk");
+	      if (stack->GetHists()) {
+	        stack->GetHists()->SetOwner(kTRUE);
+	      }
+	      stack->Draw("nostack hist");
+	      legend->Draw();
+	      canvas.Print(out_pdf.c_str());
+	    }
+	  }
   canvas.SetRightMargin(0.05);
 }
 
@@ -3950,11 +4211,20 @@ void DrawAccumulatedTimewalkFits(TCanvas &canvas,
                                  const std::string &out_pdf)
 {
   canvas.SetRightMargin(0.14);
+  auto set_linear_canvas = [&]() {
+    canvas.SetRightMargin(0.14);
+    if (auto *pad = static_cast<TPad *>(canvas.cd())) {
+      pad->SetLogx(false);
+      pad->SetLogy(false);
+      pad->SetLogz(false);
+    }
+  };
   for (int ch : sensor_channels) {
     const DtTotCut cut = DtTotCutForChannel(dt_tot_cuts, ch);
     auto raw_accumulated = MakeAccumulatedRawTimewalkHist(results, ch);
     if (cut.enabled && raw_accumulated && raw_accumulated->GetEntries() > 0.0) {
       canvas.Clear();
+      set_linear_canvas();
       auto *draw_raw = static_cast<TH2D *>(raw_accumulated->Clone());
       draw_raw->SetDirectory(nullptr);
       draw_raw->SetBit(kCanDelete);
@@ -3968,6 +4238,7 @@ void DrawAccumulatedTimewalkFits(TCanvas &canvas,
       auto rejected = MakeAccumulatedRejectedTimewalkHist(results, ch);
       if (cut.enabled && rejected && rejected->GetEntries() > 0.0) {
         canvas.Clear();
+        set_linear_canvas();
         auto *draw_rejected = static_cast<TH2D *>(rejected->Clone());
         draw_rejected->SetDirectory(nullptr);
         draw_rejected->SetBit(kCanDelete);
@@ -3979,24 +4250,24 @@ void DrawAccumulatedTimewalkFits(TCanvas &canvas,
     }
 
     canvas.Clear();
-    auto *draw_hist = static_cast<TH2D *>(accumulated->Clone());
-    draw_hist->SetDirectory(nullptr);
-    draw_hist->SetBit(kCanDelete);
-    auto profile = MakeTimewalkProfile(*draw_hist);
-    auto fit = FitTimewalkProfile(profile.get(), FitRangeForChannel(fit_ranges, ch), fit_model);
-    draw_hist->Draw("colz");
-    if (profile) {
-      profile->Draw("E1 same");
-    }
-    if (fit) {
-      fit->Draw("same");
-    }
-    DrawDtTotCutLine(cut, draw_hist);
-    canvas.Print(out_pdf.c_str());
+    set_linear_canvas();
+	    auto *draw_hist = static_cast<TH2D *>(accumulated->Clone());
+	    draw_hist->SetDirectory(nullptr);
+	    draw_hist->SetBit(kCanDelete);
+	    draw_hist->Draw("colz");
+	    DrawDtTotCutLine(cut, draw_hist);
+	    canvas.Print(out_pdf.c_str());
 
-    if (profile) {
-      canvas.Clear();
-      canvas.SetRightMargin(0.05);
+	    auto profile = MakeTimewalkProfile(*draw_hist);
+	    auto fit = FitTimewalkProfile(profile.get(), FitRangeForChannel(fit_ranges, ch), fit_model);
+	    if (profile) {
+	      canvas.Clear();
+	      canvas.SetRightMargin(0.05);
+      if (auto *pad = static_cast<TPad *>(canvas.cd())) {
+        pad->SetLogx(false);
+        pad->SetLogy(false);
+        pad->SetLogz(false);
+      }
       profile->SetMinimum(draw_hist->GetYaxis()->GetXmin());
       profile->SetMaximum(draw_hist->GetYaxis()->GetXmax());
       profile->Draw("E1");
@@ -4010,6 +4281,7 @@ void DrawAccumulatedTimewalkFits(TCanvas &canvas,
     auto rejected = MakeAccumulatedRejectedTimewalkHist(results, ch);
     if (cut.enabled && rejected && rejected->GetEntries() > 0.0) {
       canvas.Clear();
+      set_linear_canvas();
       auto *draw_rejected = static_cast<TH2D *>(rejected->Clone());
       draw_rejected->SetDirectory(nullptr);
       draw_rejected->SetBit(kCanDelete);
@@ -4114,8 +4386,8 @@ void WriteTextSummary(const std::string &path,
 	  out << "# Plot stages: [CUT DIAGNOSTIC] isolates an intermediate selection or rejection step\n";
 	  out << "# h_dt_vs_tot ProfileX objects are fitted with the configured timewalk model and written as *_pfx plus TF1\n";
 	  out << "# h_dt_vs_tot_accum_ch* objects sum all intensities per channel and are fitted in the same way\n";
-	  out << "# h_tot_vs_spill_* histograms show ToT versus spill for each channel, with *_pfx mean-ToT profiles\n";
-	  out << "# h_*dt_vs_spill_* histograms show matched dt versus spill for raw/selected/rejected sensor events, with *_pfx mean-dt profiles\n";
+		  out << "# h_tot_vs_spill_* histograms show ToT versus spill for each channel; PDF pages separate TH2 maps from *_pfx mean-ToT profiles\n";
+		  out << "# h_*dt_vs_spill_* histograms show matched dt versus spill for raw/selected/rejected sensor events; PDF pages separate TH2 maps from *_pfx mean-dt profiles\n";
 	  out << "# h_edge_time_* histograms show leading/trailing edge times within one spill for channels "
 	      << edge_channels_csv << "; requested spill=" << edge_spill
 	      << " (-1 means first selected spill), initial fraction=" << edge_spill_fraction << "\n";
@@ -4128,9 +4400,9 @@ void WriteTextSummary(const std::string &path,
 	  out << "# trigger_veto_ns: " << trigger_deadtime_ns
 	      << " ns, applied after each accepted trigger candidate before period cleanup\n";
 	  out << "# h_dt_corr_vs_tot_accum_ch* histograms use all corrected events accumulated over all intensities\n";
-	  out << "# h_dt_corr_ch*_ch* histograms are corrected channel-channel coincidences in ["
-	      << kCorrectedCoincidenceDtMinNs << ", " << kCorrectedCoincidenceDtMaxNs
-	      << "] ns, matched through the same clean trigger\n";
+		  out << "# h_dt_uncorr_ch*_ch* and h_dt_corr_ch*_ch* histograms compare channel-channel coincidences before/after timewalk in ["
+		      << kCorrectedCoincidenceDtMinNs << ", " << kCorrectedCoincidenceDtMaxNs
+		      << "] ns, matched through the same clean trigger/event selection and overlaid in a THStack in the PDF\n";
 	  out << "# trigger ToT statistics use the cleaned channel-" << trigger_channel << " trigger candidates\n";
 	  out << "# trigger veto/dead-time is applied only to channel " << trigger_channel << "\n";
   out << "# trigger22 period cleanup keeps only candidates compatible with the expected trigger period\n";
@@ -4154,16 +4426,16 @@ void WriteTextSummary(const std::string &path,
     }
     const auto &correction = correction_it->second;
     out << "# timewalk_correction_ch" << ch << ": model=" << TimewalkFitModelName(correction.model);
-    if (correction.model == TimewalkFitModel::Pol1Plateau) {
-      out << " correction_ns=(linear-to-plateau)-baseline"
-          << " p0=" << correction.p0 << " p1=" << correction.p1 << " x0=" << correction.p2
-          << " plateau=" << correction.p4;
-    } else if (correction.model == TimewalkFitModel::LinExpPlateau) {
-      out << " correction_ns=(linear/exponential-plateau)-baseline"
-          << " p0=" << correction.p0 << " p1=" << correction.p1 << " x0=" << correction.p2
-          << " tau=" << correction.p3 << " plateau=" << correction.p4;
-    } else {
-      out << " correction_ns=(" << correction.p0 << " + " << correction.p1 << "*ToT)-baseline";
+	    if (correction.model == TimewalkFitModel::Pol1Plateau) {
+	      out << " correction_ns=linear-to-plateau"
+	          << " p0=" << correction.p0 << " p1=" << correction.p1 << " x0=" << correction.p2
+	          << " plateau=" << correction.p4;
+	    } else if (correction.model == TimewalkFitModel::LinExpPlateau) {
+	      out << " correction_ns=linear/exponential-plateau"
+	          << " p0=" << correction.p0 << " p1=" << correction.p1 << " x0=" << correction.p2
+	          << " tau=" << correction.p3 << " plateau=" << correction.p4;
+	    } else {
+	      out << " correction_ns=(" << correction.p0 << " + " << correction.p1 << "*ToT)";
     }
     if (correction.fit_range.enabled) {
       out << " fit_range_ns=[" << correction.fit_range.xmin << "," << correction.fit_range.xmax << "]";
@@ -4690,6 +4962,7 @@ void laser_intensity_scan_rdf(const char *runlist_path = "help",
 	          edge_channels,
 	          reference_mode,
 	          timewalk_fit_ranges,
+	          dt_tot_cuts,
 	          timewalk_fit_model,
 	          out_pdf);
 	    }

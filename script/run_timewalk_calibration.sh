@@ -74,6 +74,7 @@ USAGE
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 qa_dir="${ALCOR_ANA_GE:-$(cd "${script_dir}/.." && pwd)}"
 source "${script_dir}/lib/logbook.sh"
+source "${script_dir}/lib/root_tools.sh"
 
 inputs=()
 mode="trigger"
@@ -520,18 +521,28 @@ fi
 
 channels_to_csv() {
   local value="$1"
-  value="${value//_/ }"
-  value="${value//,/ }"
-  awk -v value="${value}" 'BEGIN {
-    n = split(value, a, /[[:space:]]+/)
-    out = ""
-    for (i = 1; i <= n; ++i) {
-      if (a[i] == "") continue
-      if (out != "") out = out ","
-      out = out a[i]
-    }
-    print out
-  }'
+  python3 - "${value}" <<'PY'
+import re
+import sys
+
+value = sys.argv[1]
+out = []
+seen = set()
+for token in re.split(r"[,\s_]+", value.strip()):
+    if not token:
+        continue
+    try:
+        channel = int(token)
+    except ValueError:
+        raise SystemExit(f"invalid channel token: {token}")
+    if channel < 0 or channel >= 32:
+        raise SystemExit(f"channel out of range: {channel}")
+    if channel in seen:
+        continue
+    seen.add(channel)
+    out.append(str(channel))
+print(",".join(out))
+PY
 }
 
 remove_channel_from_csv() {
@@ -637,13 +648,23 @@ if [ "${mode}" = "trigger" ] && [ "${reference_mode}" = "trigger" ] &&
 fi
 
 if [ "${mode}" = "trigger" ]; then
-  macro_path="${qa_dir}/macro/laser_intensity_scan_rdf.cxx"
   log_path="${qa_dir}/output/log_timewalk_correction_macro.txt"
-  cmd=(root -l -b -q "${macro_path}(\"${runlist}\",\"${tdc_calib}\",\"\",\"${out_pdf}\",\"${out_root}\",\"${out_txt}\",${trigger_channel},\"${sensor_channels}\",${match_window_ns},${duration_ns},${clock_mhz},${use_fine},${use_lut},${fine_cut},${require_tot},${trigger_deadtime_ns},${trigger_period_ns},${trigger_period_tolerance_ns},${signed_dt},\"${timewalk_fit_ranges}\",\"${timewalk_fit_model}\",\"${dt_tot_cut}\",\"${trigger_tot_window}\",\"${spill_range}\",\"${channel_tot_windows}\",${edge_spill},\"${edge_channels}\",${edge_phase_period_ns},${edge_spill_fraction},\"${tdc_selection}\",\"${reference_mode}\",${reference_min_channels},${event_window_ns},\"${dt_tot_cut_direction}\")")
+  tool_source="${qa_dir}/macro/run_timewalk_calibration_main.cxx"
+  if [ "${dry_run}" -eq 1 ]; then
+    tool_exe="$(root_tool_path "${qa_dir}" "run_timewalk_calibration")"
+  else
+    tool_exe="$(root_tool_build "${qa_dir}" "run_timewalk_calibration" "${tool_source}")"
+  fi
+  cmd=("${tool_exe}" "${runlist}" "${tdc_calib}" "" "${out_pdf}" "${out_root}" "${out_txt}" "${trigger_channel}" "${sensor_channels}" "${match_window_ns}" "${duration_ns}" "${clock_mhz}" "${use_fine}" "${use_lut}" "${fine_cut}" "${require_tot}" "${trigger_deadtime_ns}" "${trigger_period_ns}" "${trigger_period_tolerance_ns}" "${signed_dt}" "${timewalk_fit_ranges}" "${timewalk_fit_model}" "${dt_tot_cut}" "${trigger_tot_window}" "${spill_range}" "${channel_tot_windows}" "${edge_spill}" "${edge_channels}" "${edge_phase_period_ns}" "${edge_spill_fraction}" "${tdc_selection}" "${reference_mode}" "${reference_min_channels}" "${event_window_ns}" "${dt_tot_cut_direction}")
 else
-  macro_path="${qa_dir}/macro/tot_intensity_scan_rdf.cxx"
   log_path="${qa_dir}/output/log_tot_intensity_scan_macro.txt"
-  cmd=(root -l -b -q "${macro_path}(\"${runlist}\",\"${tdc_calib}\",\"${out_pdf}\",\"${out_root}\",\"${out_txt}\",${duration_ns},${clock_mhz},${use_fine},${use_lut},${fine_cut})")
+  tool_source="${qa_dir}/macro/run_tot_intensity_scan_main.cxx"
+  if [ "${dry_run}" -eq 1 ]; then
+    tool_exe="$(root_tool_path "${qa_dir}" "run_tot_intensity_scan")"
+  else
+    tool_exe="$(root_tool_build "${qa_dir}" "run_tot_intensity_scan" "${tool_source}")"
+  fi
+  cmd=("${tool_exe}" "${runlist}" "${tdc_calib}" "${out_pdf}" "${out_root}" "${out_txt}" "${duration_ns}" "${clock_mhz}" "${use_fine}" "${use_lut}" "${fine_cut}")
 fi
 
 echo "== Timewalk/ToT mode: ${mode}"

@@ -45,6 +45,7 @@ script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 qa_dir="${ALCOR_ANA_GE:-$(cd "${script_dir}/.." && pwd)}"
 source "${script_dir}/lib/logbook.sh"
 source "${script_dir}/lib/inputs.sh"
+source "${script_dir}/lib/root_tools.sh"
 
 inputs=()
 logbook="$(logbook_default_path)"
@@ -359,8 +360,13 @@ else
   inputs_write_root_list "${list_file}" "${inputs[@]}"
 fi
 
-macro_path="${qa_dir}/macro/TDC_calibration_rdf.cxx"
-cmd=(root -l -b -q "${macro_path}(\"${list_file}\",\"${out_root}\",${q_low},${q_high},${min_entries},\"${out_pdf}\",${duration_ns},${match_coincidence},${clock_mhz},${offset_study},${offset_reference_arg},${offset_window_ns},${offset_min_channels},\"${offset_channels_arg}\",${offset_event_window_ns})")
+tool_source="${qa_dir}/macro/run_tdc_calibration_main.cxx"
+if [ "${dry_run}" -eq 1 ]; then
+  tool_exe="$(root_tool_path "${qa_dir}" "run_tdc_calibration")"
+else
+  tool_exe="$(root_tool_build "${qa_dir}" "run_tdc_calibration" "${tool_source}")"
+fi
+cmd=("${tool_exe}" "${list_file}" "${out_root}" "${q_low}" "${q_high}" "${min_entries}" "${out_pdf}" "${duration_ns}" "${match_coincidence}" "${clock_mhz}" "${offset_study}" "${offset_reference_arg}" "${offset_window_ns}" "${offset_min_channels}" "${offset_channels_arg}" "${offset_event_window_ns}")
 
 echo "== TDC calibration inputs:"
 printf '   %s\n' "${inputs[@]}"

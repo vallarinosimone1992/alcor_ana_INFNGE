@@ -1,392 +1,101 @@
-\documentclass[11pt]{article}
+\documentclass[10pt]{article}
 \usepackage[T1]{fontenc}
-\usepackage[margin=1in]{geometry}
-\usepackage{hyperref}
-\usepackage{graphicx}
-\usepackage{enumitem}
+\usepackage[margin=0.65in]{geometry}
 \usepackage{amsmath}
+\usepackage{enumitem}
+\usepackage{hyperref}
 
-\title{ALCOR Timing Calibration Report}
-\author{}
-\date{}
+\setlength{\parindent}{0pt}
+\setlength{\parskip}{2pt}
+\setlist{leftmargin=*,nosep,itemsep=1pt,topsep=2pt}
 
 \begin{document}
-\maketitle
+\sloppy
 
-\section{Scope and Objective}
-This document summarizes the timing model, calibration chain, validation logic, and main interpretation caveats for the ALCOR timing analysis. It is intended as the technical note for the calibration procedure and for reading the produced outputs.
+{\Large \textbf{ALCOR timing calibration: operational recap}}\hfill
+{\small updated for the current TDC/offset/timewalk chain}
+\vspace{0.5em}
 
-The goal of the calibration chain is to improve timing resolution by correcting:
-\begin{itemize}[leftmargin=*]
-  \item fine-time non-linearity,
-  \item time-walk through a ToT-dependent correction,
-  \item residual channel-to-channel offsets.
-\end{itemize}
-
-The target is sub-nanosecond timing, with an aspirational scale of a few hundred picoseconds if the detector response and the dataset quality support it.
-
-\section{Experimental Setup}
-\subsection{Calibration setup}
-The calibration uses a Hamamatsu picosecond light pulser (PLP-10 system) controlled by the C10196 controller. The PLP-10 provides laser pulses with typical width of about 70~ps full width at half maximum (FWHM) and repetition rates up to 100~MHz, with external trigger capability up to about 50~MHz.\footnote{Hamamatsu PLP-10 datasheet, \url{https://www.hamamatsu.com/content/dam/hamamatsu-photonics/sites/documents/99_SALES_LIBRARY/sys/SOCS0003E_PLP-10.pdf}.} During calibration it was operated at 100~kHz.
-
-The light pulser illuminates two SiPMs from the onsemi Micro-J series (4$\times$4~mm$^2$ package, active area 3.93$\times$3.93~mm$^2$). The sensors provide a fast output obtained by capacitive coupling, used here for timing.\footnote{onsemi Micro-J series datasheet, \url{https://www.onsemi.com/download/data-sheet/pdf/microj-series-d.pdf}.}
-
-\begin{figure}[ht]
-  \centering
-  \begin{minipage}{0.32\linewidth}
-    \centering
-    \includegraphics[width=\linewidth]{images/Laser_source.jpg}
-    \vspace{2mm}
-    \textbf{Laser source}
-  \end{minipage}
-  \hfill
-  \begin{minipage}{0.32\linewidth}
-    \centering
-    \includegraphics[width=\linewidth]{images/Laser_emitter.jpg}
-    \vspace{2mm}
-    \textbf{Emitter}
-  \end{minipage}
-  \hfill
-  \begin{minipage}{0.32\linewidth}
-    \centering
-    \includegraphics[width=\linewidth]{images/Sensori.jpg}
-    \vspace{2mm}
-    \textbf{SiPM sensors}
-  \end{minipage}
-  \caption{Calibration setup photographs.}
-  \label{fig:setup_photos}
-\end{figure}
-
-\subsection{Scintillating fiber setup}
-The second setup uses a 1~m scintillating fiber, with both ends coupled to the same two SiPMs. A $^{90}$Sr beta source (10~kBq) is placed at the midpoint of the fiber to generate signals.
-
-\section{Dataset Roles and Analysis Flow}
-Two dataset roles are assumed:
-\begin{itemize}[leftmargin=*]
-  \item \textbf{Calibration run}: used to build the fine and channel calibration constants.
-  \item \textbf{Golden run}: used as an independent validation sample.
-\end{itemize}
-
-Recommended rule:
-\begin{itemize}[leftmargin=*]
-  \item build the calibrations on the calibration run,
-  \item validate them on a distinct golden run.
-\end{itemize}
-
-Using the same dataset both to build and validate the calibration can hide overfitting or dataset-specific biases.
-
-The intended flow is:
-\begin{enumerate}[leftmargin=*]
-  \item decode raw data into ROOT files,
-  \item build the fine-time calibration,
-  \item build the channel-level ToT and offset calibration,
-  \item run coincidence analysis with and without calibration,
-  \item compare calibration-run and golden-run behavior.
-\end{enumerate}
-
-The analysis works on decoded ROOT files under \texttt{data/<run>/kc705-196/decoded/alcdaq.fifo\_*.root}.
-
-\section{Timing Representation}
-The raw timestamp is represented as
+\section*{Reconstructed Time}
+For each hit, the coarse and fine timestamp is converted to ns as:
 \begin{align*}
-  \mathrm{time\_tick} &= \mathrm{rollover} \cdot 32768 + \mathrm{coarse}, \\
-  \mathrm{tick\_ns} &= \frac{1000}{\mathrm{clock\_mhz}}.
+  T_\mathrm{tick} &= 32768\,\mathrm{rollover} + \mathrm{coarse}, &
+  \Delta t_\mathrm{clk} &= \frac{1000}{\mathrm{clock\_MHz}}, \\
+  i_\mathrm{TDC} &= \mathrm{tdc} + 4\,\mathrm{pixel} + 16\,\mathrm{column} + 128\,\mathrm{fifo}, &
+  t_0 &= \left(T_\mathrm{tick} - \phi(\mathrm{fine}, i_\mathrm{TDC})\right)\Delta t_\mathrm{clk}.
 \end{align*}
+\(\phi\) is the calibrated fine-time fraction. It is read from the \texttt{hFineLut} LUT; if the LUT is disabled or missing, the code falls back to the linear min/max map for that TDC. With \texttt{--no-fine}, \(\phi=0\).
 
-When fine correction is enabled, the calibrated time is
-\begin{align*}
-  \mathrm{time\_ns} = \left(\mathrm{time\_tick} - \mathrm{fine\_fraction}\right)\mathrm{tick\_ns}.
-\end{align*}
+The TDC/channel-offset calibration applied while reading hits is:
+\[
+  t = t_0 - O_{\mathrm{ch},\mathrm{tdc}} .
+\]
+\(O_{\mathrm{ch},\mathrm{tdc}}\) is the relative channel/TDC offset stored in \texttt{hChannelTdcOffset}. By default it is extracted relative to channel 22; alternatively, an event-median reference can be used.
 
-When fine correction is disabled, the code uses
-\begin{align*}
-  \mathrm{time\_ns} = \mathrm{time\_tick}\,\mathrm{tick\_ns}.
-\end{align*}
+The ToT is computed within the same spill and channel by pairing each leading TDC with its trailing partner:
+\[
+  \mathrm{ToT}=t_{\mathrm{trailing},0}-t_{\mathrm{leading},0},\qquad 0 < \mathrm{ToT} \le \texttt{--duration}.
+\]
+The ToT uses the fine-calibrated raw time \(t_0\), not the time already corrected for offsets.
 
-\subsection{Global TDC index}
-Fine calibration is performed per physical TDC, not only per local \texttt{tdc=0..3}. The code uses the global TDC index
-\begin{align*}
-  \mathrm{tdc\_index} = \mathrm{tdc} + 4 \cdot \mathrm{pixel} + 16 \cdot \mathrm{column} + 128 \cdot \mathrm{fifo}.
-\end{align*}
+\section*{TDC and Offset Calibration}
+Basic command:
+\begin{verbatim}
+./script/run_tdc_calibration.sh -i ../data/RUN -d 50
+\end{verbatim}
+It produces \texttt{calibration/TDC\_calibration.root} and \texttt{output/TDC\_calibration.pdf}. The script checks from the logbook that the run is in opmode 1 unless \texttt{--skip-logbook-check} is passed.
 
-This matters because:
-\begin{itemize}[leftmargin=*]
-  \item each FIFO contains 128 physical TDCs,
-  \item different columns and pixels must not be merged into the same calibration entry,
-  \item any change in the TDC indexing convention requires the fine and channel calibrations to be regenerated.
+Main options:
+\begin{itemize}
+  \item \texttt{--q-low}, \texttt{--q-high}, \texttt{--min-entries}: quantiles and minimum statistics for the fine LUT.
+  \item \texttt{--match-coincidence} and \texttt{-d NS}: build the LUT using leading hits with valid ToT within the requested duration; default: use all leading hits.
+  \item \texttt{--offset-study}/\texttt{--no-offset-study}: enable or disable the offset study, enabled by default.
+  \item \texttt{--offset-reference 22}: default, reference offsets to channel 22.
+  \item \texttt{--offset-reference event-median --offset-min-channels N}: use the event median as reference.
+  \item \texttt{--offset-window NS} and \texttt{--offset-event-window NS}: windows used to associate hits from the same laser event.
+  \item \texttt{--offset-channels logbook|all|CSV}: channels included in the offset study; default \texttt{logbook}.
 \end{itemize}
 
-\section{Fine-Time Calibration}
-\subsection{Motivation}
-The raw fine counter is not linearly proportional to time. The measured fine-code distribution reflects the phase relation between an asynchronous discriminator crossing and the TDC clock, and the conversion can be distorted across the 512 fine bins.
+\section*{TimeWalk Correction}
+The calibration uses the relation between sensor ToT and:
+\[
+  \Delta t = t_\mathrm{sensor} - t_\mathrm{ref}.
+\]
+By default \(t_\mathrm{ref}\) is the cleaned channel-22 laser trigger; \texttt{--reference-mode event-median} is available for event-reference studies. The fit gives a function \(f_\mathrm{ch}(\mathrm{ToT})\), and the applied correction is:
+\[
+  t_\mathrm{TW} = t - f_\mathrm{ch}(\mathrm{ToT}).
+\]
+This aligns the corrected sensor time to the chosen reference. The default model is \texttt{pol1-plateau}:
+\[
+  f(\mathrm{ToT}) = p_0 + p_1 \min(\mathrm{ToT}, x_0).
+\]
+The alternatives are \texttt{pol1} and \texttt{lin-exp-plateau}.
 
-\subsection{CDF LUT method}
-For each physical TDC:
-\begin{itemize}[leftmargin=*]
-  \item build a 512-bin histogram of \texttt{fine\_raw},
-  \item compute the cumulative distribution,
-  \item convert the cumulative distribution into a fine-time lookup table.
+Basic command:
+\begin{verbatim}
+./script/run_timewalk_calibration.sh -i ../data/RUN -d 50 --signed-dt
+\end{verbatim}
+It produces \texttt{calibration/timewalk\_correction.root}. The macro applies the correction for closure plots and writes the \texttt{timewalk\_corr\_*} parameters. The standard analysis automatically uses this file when present; disable it with:
+\begin{verbatim}
+./script/run_analysis.sh -i ../data/RUN --no-timewalk
+\end{verbatim}
+
+\section*{Available Cuts and Selections}
+\begin{itemize}
+  \item Active channels: read from the logbook; override with \texttt{--channels CSV} or \texttt{--sensors CSV}. In trigger mode, \texttt{--trigger 22} is removed from the sensor list.
+  \item Fine wrap: \texttt{--fine-cut N} rejects hits with \(\mathrm{fine}\) close to the TDC cut; \texttt{--no-fine} disables fine correction; \texttt{--no-lut} uses the linear min/max map.
+  \item Valid ToT: required by default in timewalk mode; \texttt{--no-require-tot} allows leading hits without valid ToT. \texttt{-d NS} sets the maximum accepted ToT; \texttt{run\_analysis.sh} also supports \texttt{--min-duration NS}.
+  \item Spill range: \texttt{--spill-range MIN:MAX} reads only the selected inclusive spill range.
+  \item Channel-22 trigger: \texttt{--trigger-tot-window MIN:MAX} cuts on trigger ToT; \texttt{--trigger-veto NS} rejects rebounds within NS after an accepted trigger; \texttt{--trigger-period NS} and \texttt{--trigger-period-tol NS} keep only triggers compatible with the expected period.
+  \item Event/matching window: \texttt{--window NS} is the coincidence window; \texttt{--event-window NS} defines event building and defaults to \texttt{--window}; \texttt{--signed-dt} uses the nearest trigger and keeps the sign.
+  \item TDC selection: \texttt{--tdc-selection 0} or \texttt{--tdc-selection 17:0,19:2,22:0}; the leading TDC is selected while the trailing partner is kept for ToT.
+  \item Per-channel ToT window: \texttt{--channel-tot-window CH:MIN:MAX[,CH:MIN:MAX]}.
+  \item Diagonal \(\Delta t\)/ToT cut: \texttt{--dt-tot-cut CH:DT0:SLOPE[:TOT\_MIN:TOT\_MAX]}. With the default \texttt{--dt-tot-cut-direction below}, the accepted region is \(\Delta t \le DT0 + SLOPE\cdot\mathrm{ToT}\); \texttt{above} keeps the opposite side.
+  \item Timewalk fit: \texttt{--timewalk-fit-ranges CH:MIN:MAX[,CH:MIN:MAX]} limits the TProfile points used by the fit; \texttt{--timewalk-fit-model} selects \texttt{pol1}, \texttt{pol1-plateau}, or \texttt{lin-exp-plateau}.
+  \item Final analysis: \texttt{run\_analysis.sh} applies TDC/offset calibration with \texttt{-k calibration/TDC\_calibration.root}; it applies timewalk with \texttt{--timewalk-calib FILE}, or automatically if \texttt{calibration/timewalk\_correction.root} exists. \texttt{--window}, \texttt{-d}, \texttt{--min-duration}, and \texttt{--fine-cut} remain operational overrides.
 \end{itemize}
 
-For bin $b$ with count $c_b$ and total entries $N$:
-\begin{align*}
-  \mathrm{cum}_b &= \sum_{k \le b} c_k, \\
-  \mathrm{frac}_b &= \mathrm{clamp}\!\left(\frac{\mathrm{cum}_b - 0.5\,c_b}{N}, 0, 1\right), \\
-  \mathrm{fine\_fraction} &= \mathrm{frac}_b - 0.5.
-\end{align*}
-
-The LUT is stored in \texttt{hFineLut} with:
-\begin{itemize}[leftmargin=*]
-  \item X: global TDC index,
-  \item Y: raw fine code,
-  \item Z: calibrated fine fraction.
-\end{itemize}
-
-\subsection{Min/max and linear fallback}
-The same calibration step also extracts \texttt{min} and \texttt{max} values from configurable quantiles. If the LUT is disabled or unavailable, the code falls back to a linear mapping:
-\begin{align*}
-  \mathrm{fine\_fraction} &= \frac{\mathrm{fine\_raw} - \mathrm{min}}{\mathrm{max} - \mathrm{min}}, \\
-  \text{if } \mathrm{fine\_raw} &> \mathrm{cut}, \text{ then } \mathrm{fine\_fraction} \mathrel{-}= 1,
-\end{align*}
-with
-\begin{align*}
-  \mathrm{cut} = \frac{\mathrm{min} + \mathrm{max}}{2}.
-\end{align*}
-
-\subsection{When the LUT assumption is valid}
-The CDF LUT approach is appropriate when the arrival phase relative to the clock is effectively random. Typical good cases are:
-\begin{itemize}[leftmargin=*]
-  \item dark counts,
-  \item asynchronous detector signals,
-  \item calibration pulses not phase-locked to the TDC clock.
-\end{itemize}
-
-In that case the fine histogram should look roughly like a plateau with edge roll-off. If the fine code instead collapses into narrow peaks, the LUT can become biased and a different calibration strategy may be needed.
-
-\subsection{Uniformity diagnostics}
-Differential non-linearity (DNL) quantifies the bin-to-bin deviation from a uniform population:
-\begin{align*}
-  \mathrm{DNL}(b) = \frac{c_b}{\langle c \rangle} - 1.
-\end{align*}
-
-Integral non-linearity (INL) is the cumulative deviation from the ideal CDF:
-\begin{align*}
-  \mathrm{INL}(b) = F_{\mathrm{emp}}(b) - \frac{b - 0.5}{B}.
-\end{align*}
-
-Figures~\ref{fig:fine_validation_dnl} and~\ref{fig:fine_validation_inl} show typical examples used to check that the LUT improves the fine-to-time mapping.
-
-\begin{figure}[ht]
-  \centering
-  \includegraphics[width=0.95\linewidth]{figs/calibration_fine_validation_p15.png}
-  \caption{DNL example for one channel. The LUT-corrected curve is closer to the ideal uniform response than the raw and simple linear cases.}
-  \label{fig:fine_validation_dnl}
-\end{figure}
-
-\begin{figure}[ht]
-  \centering
-  \includegraphics[width=0.95\linewidth]{figs/calibration_fine_validation_p16.png}
-  \caption{INL example for one channel. The LUT reduces the cumulative non-linearity compared to the raw and simple linear cases.}
-  \label{fig:fine_validation_inl}
-\end{figure}
-
-\section{Channel Calibration}
-The channel calibration has two parts:
-\begin{itemize}[leftmargin=*]
-  \item a ToT-dependent correction,
-  \item a residual static offset per channel.
-\end{itemize}
-
-\subsection{Time-walk correction}
-Leading-edge timing depends on pulse amplitude. Time-over-Threshold (ToT) is used as a proxy for amplitude, so the calibration builds a correction as a function of ToT.
-
-Procedure:
-\begin{enumerate}[leftmargin=*]
-  \item choose a reference channel,
-  \item build $\Delta t$ versus ToT for each channel,
-  \item estimate the correction using the median in each ToT bin,
-  \item apply the correction once and recompute,
-  \item use the refined curve as the final channel correction.
-\end{enumerate}
-
-Important details:
-\begin{itemize}[leftmargin=*]
-  \item the correction is applied only to leading edges,
-  \item a valid trailing edge must exist so that ToT is defined,
-  \item if \texttt{max\_duration <= 0}, the ToT correction is skipped.
-\end{itemize}
-
-Application convention:
-\begin{align*}
-  t_{\mathrm{lead}} \mathrel{-}= \mathrm{CorrectionNs}(\mathrm{channel}, \mathrm{ToT}).
-\end{align*}
-
-\subsection{Channel offsets}
-After the ToT-dependent part is applied, a residual fixed offset may remain. The channel calibration stores a static offset for each channel to absorb this remaining shift.
-
-The current ROOT output stores both:
-\begin{itemize}[leftmargin=*]
-  \item \texttt{hChanCalib\_chN}: ToT-dependent correction histogram,
-  \item \texttt{hChanOffset}: global per-channel offset summary.
-\end{itemize}
-
-\subsection{Symmetric reference mode}
-In symmetric mode, the correction is split between the calibrated channel and the reference channel, rather than keeping the reference artificially fixed.
-
-This is often useful for two-channel datasets, but it should be interpreted carefully once more channels contribute to the same reference scale.
-
-\section{Coincidence Analysis}
-\subsection{Configuration and outputs}
-Coincidence studies are configured through \texttt{config/*.txt}. Supported line formats are:
-\begin{itemize}[leftmargin=*]
-  \item pair line: \texttt{chA chB [window\_ns]},
-  \item group line: \texttt{group ch1 ch2 ch3 [window=ns]}.
-\end{itemize}
-
-Typical outputs include:
-\begin{itemize}[leftmargin=*]
-  \item search histograms,
-  \item coincidence histograms,
-  \item FWHM estimates,
-  \item $\Delta t$ versus fine 2D plots,
-  \item ROOT and TXT summaries.
-\end{itemize}
-
-For a simple pair configuration, the main coincidence summary in the TXT output is usually the line that reports \texttt{fwhm\_bkg\_sub=...}.
-
-\subsection{Important implementation caveat}
-The current \texttt{coincidence\_rdf.cxx} implementation does not enforce unique or nearest-neighbour matching for pair coincidences. Instead, it fills all hit pairs found inside the coincidence window.
-
-Implications:
-\begin{itemize}[leftmargin=*]
-  \item coincidence counts can be inflated when multiple hits are present in the same window,
-  \item the width of the coincidence peak can be biased by combinatorial matches,
-  \item dataset-to-dataset comparisons must be interpreted with this in mind.
-\end{itemize}
-
-This behavior is especially important when pair multiplicity is not negligible.
-
-\subsection{Fine cut}
-An optional fine cut rejects hits near the wrap point:
-\begin{align*}
-  \left|\mathrm{fine\_raw} - \mathrm{cut}\right| \le \mathrm{fine\_cut},
-\end{align*}
-where \texttt{cut} is derived from the calibrated \texttt{min} and \texttt{max} for the corresponding TDC.
-
-\section{Validation Metrics for Fine Calibration}
-\texttt{fine\_validation\_rdf} reports several metrics to assess how well the calibrated fine fraction approaches a uniform distribution on $[-0.5, 0.5]$.
-
-Main metrics:
-\begin{itemize}[leftmargin=*]
-  \item KS $D$: Kolmogorov-Smirnov distance to uniform,
-  \item KS p-value: larger is better,
-  \item AD ($A^2$): Anderson-Darling statistic,
-  \item mean: should be close to 0,
-  \item std: should be close to $0.288675$ for a uniform distribution on $[-0.5, 0.5]$.
-\end{itemize}
-
-Reported categories:
-\begin{itemize}[leftmargin=*]
-  \item \texttt{raw}: no LUT correction,
-  \item \texttt{intrinsic}: LUT evaluated on the same sample used to build it,
-  \item \texttt{cross}: LUT evaluated on a held-out split.
-\end{itemize}
-
-Typical supporting plots include CDF residuals, DNL, and INL.
-
-\section{Reading the Output Files}
-\subsection{Fine calibration output}
-\texttt{fine\_calibration.root} typically contains:
-\begin{itemize}[leftmargin=*]
-  \item \texttt{hFineMin},
-  \item \texttt{hFineMax},
-  \item \texttt{hFineEntries},
-  \item \texttt{hFineLut},
-  \item the \texttt{fine\_calib} tree.
-\end{itemize}
-
-Useful checks:
-\begin{itemize}[leftmargin=*]
-  \item number of valid TDCs,
-  \item \texttt{min} and \texttt{max} values for the active TDCs,
-  \item whether the active TDC set matches the channels actually used in the run.
-\end{itemize}
-
-\subsection{Channel calibration output}
-\texttt{channel\_calibration.root} typically contains:
-\begin{itemize}[leftmargin=*]
-  \item \texttt{hChanOffset},
-  \item \texttt{hChanCalib\_ch0..31},
-  \item metadata such as reference channel, window, ToT range, and symmetric-reference mode.
-\end{itemize}
-
-Useful checks:
-\begin{itemize}[leftmargin=*]
-  \item per-channel offset magnitudes,
-  \item number of nonzero ToT bins per active channel,
-  \item whether most of the correction is a static offset or a real ToT-dependent shape.
-\end{itemize}
-
-\subsection{Coincidence output}
-The coincidence TXT output is the fastest place to compare runs. For a simple pair analysis, check:
-\begin{itemize}[leftmargin=*]
-  \item pair definition,
-  \item coincidence count,
-  \item \texttt{fwhm\_bkg\_sub},
-  \item background estimate,
-  \item left and right half-maximum crossings.
-\end{itemize}
-
-The PDF is then used to inspect whether the peak shape and $\Delta t$ versus fine behavior are physically sensible.
-
-\section{Practical Validation Strategy}
-Recommended comparison sequence:
-\begin{enumerate}[leftmargin=*]
-  \item build fine and channel calibration on the calibration run,
-  \item compare the calibration run without calibration versus with calibration,
-  \item compare the golden run without calibration versus with calibration,
-  \item inspect $\Delta t$ versus fine and, if relevant, $\Delta t$ versus ToT,
-  \item confirm that the calibrated result improves, or at least does not degrade, the independent golden run.
-\end{enumerate}
-
-If the calibration run improves but the golden run worsens, likely explanations include:
-\begin{itemize}[leftmargin=*]
-  \item overfitting to the calibration sample,
-  \item unstable ToT or offset extraction,
-  \item coincidence-window combinatorics,
-  \item a mismatch between the calibration sample and the golden sample.
-\end{itemize}
-
-\subsection{Example comparison plot}
-Figure~\ref{fig:laser_calib_page3} shows an example visual comparison from the calibration sample. Such plots are illustrative and should always be interpreted together with the current numeric outputs for the active run identifiers.
-
-\begin{figure}[ht]
-  \centering
-  \begin{minipage}{0.49\linewidth}
-    \centering
-    \includegraphics[width=\linewidth]{figs/calibration_no_calib_page3-03.png}
-    \vspace{2mm}
-    \textbf{No calibration}
-  \end{minipage}
-  \hfill
-  \begin{minipage}{0.49\linewidth}
-    \centering
-    \includegraphics[width=\linewidth]{figs/calibration_with_calib_page3-03.png}
-    \vspace{2mm}
-    \textbf{With calibration}
-  \end{minipage}
-  \caption{Example calibration-run comparison using the coincidence summary page.}
-  \label{fig:laser_calib_page3}
-\end{figure}
-
-\section{Documentation Policy}
-Performance statements should be tied to specific generated outputs and run identifiers, not kept as timeless claims in this document.
-
-In particular:
-\begin{itemize}[leftmargin=*]
-  \item do not assume a fixed ToT-correction amplitude across datasets,
-  \item do not assume a fixed resolution improvement,
-  \item always quote the relevant output artifact or regenerate the result on the current calibration and golden runs.
-\end{itemize}
+\section*{Minimal Diagnostics}
+In the timewalk PDF, TH2 maps and TProfiles are printed on separate pages: use TH2 maps to inspect populations and cuts, and TProfiles to inspect the fit. The coincidence peak for the first sensor pair, normally 17--19, is saved before and after timewalk (\texttt{h\_dt\_uncorr\_*}, \texttt{h\_dt\_corr\_*}) and overlaid in a \texttt{THStack} in the PDF.
 
 \end{document}

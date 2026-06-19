@@ -621,7 +621,7 @@ struct TimewalkCorrection {
     if (!valid || !std::isfinite(tot)) {
       return 0.0;
     }
-    const double value = EvalNs(tot) - baseline;
+    const double value = EvalNs(tot);
     return std::isfinite(value) ? value : 0.0;
   }
 };

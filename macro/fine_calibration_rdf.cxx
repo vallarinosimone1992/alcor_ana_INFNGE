@@ -1,4 +1,5 @@
 #include <ROOT/RDataFrame.hxx>
+#include <ROOT/RDFHelpers.hxx>
 #include <TCanvas.h>
 #include <TF1.h>
 #include <TFile.h>
@@ -1723,30 +1724,34 @@ void fine_calibration_rdf(const char *input = "../data/calibration",
                                       const std::string &stack_name,
                                       const std::string &title) {
       auto stack = std::make_unique<THStack>(stack_name.c_str(), title.c_str());
-      if (raw_hist) {
+      auto legend = std::make_unique<TLegend>(0.68, 0.76, 0.9, 0.9);
+      legend->SetBorderSize(0);
+      legend->SetFillStyle(0);
+      auto has_content = [](const TH1D *hist) {
+        return hist && (hist->GetEntries() > 0.0 || hist->Integral(0, hist->GetNbinsX() + 1) > 0.0);
+      };
+      int added = 0;
+      if (has_content(raw_hist)) {
         raw_hist->SetLineColor(kRed + 1);
         raw_hist->SetLineWidth(2);
         raw_hist->SetStats(false);
         stack->Add(raw_hist, "hist");
+        legend->AddEntry(raw_hist, "raw", "l");
+        ++added;
       }
-      if (lut_hist) {
+      if (has_content(lut_hist)) {
         lut_hist->SetLineColor(kBlue + 1);
         lut_hist->SetLineWidth(2);
         lut_hist->SetStats(false);
         stack->Add(lut_hist, "hist");
+        legend->AddEntry(lut_hist, "LUT corrected", "l");
+        ++added;
+      }
+      if (added == 0) {
+        gPad->DrawFrame(-0.5, 0.0, 0.5, 1.0, title.c_str());
+        return std::make_pair(std::move(stack), std::move(legend));
       }
       stack->Draw("nostack hist");
-      stack->GetXaxis()->SetTitle("fine fraction");
-      stack->GetYaxis()->SetTitle("entries");
-      auto legend = std::make_unique<TLegend>(0.68, 0.76, 0.9, 0.9);
-      legend->SetBorderSize(0);
-      legend->SetFillStyle(0);
-      if (raw_hist) {
-        legend->AddEntry(raw_hist, "raw", "l");
-      }
-      if (lut_hist) {
-        legend->AddEntry(lut_hist, "LUT corrected", "l");
-      }
       legend->Draw();
       return std::make_pair(std::move(stack), std::move(legend));
     };
