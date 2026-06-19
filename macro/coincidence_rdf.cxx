@@ -613,6 +613,13 @@ struct TimewalkCorrection {
     if (model == 2) {
       return p0 + p1 * std::min(tot, p2);
     }
+    if (model == 3) {
+      const double base = tot - p2;
+      if (base <= 0.0 || p3 <= 0.0) {
+        return 0.0;
+      }
+      return p0 + p1 / std::pow(base, p3);
+    }
     return p0 + p1 * tot;
   }
 
@@ -665,9 +672,12 @@ std::unordered_map<int, TimewalkCorrection> LoadTimewalkCorrections(const char *
     ReadTParameter(*file, "timewalk_corr_p2_ch" + std::to_string(ch), correction.p2);
     ReadTParameter(*file, "timewalk_corr_p3_ch" + std::to_string(ch), correction.p3);
     ReadTParameter(*file, "timewalk_corr_p4_ch" + std::to_string(ch), correction.p4);
-    if (!ReadTParameter(*file, "timewalk_corr_baseline_ch" + std::to_string(ch), correction.baseline) &&
-        (correction.model == 1 || correction.model == 2)) {
-      correction.baseline = correction.p4;
+    if (!ReadTParameter(*file, "timewalk_corr_baseline_ch" + std::to_string(ch), correction.baseline)) {
+      if (correction.model == 1 || correction.model == 2) {
+        correction.baseline = correction.p4;
+      } else if (correction.model == 3) {
+        correction.baseline = correction.p0;
+      }
     }
     correction.valid = true;
     corrections[ch] = correction;

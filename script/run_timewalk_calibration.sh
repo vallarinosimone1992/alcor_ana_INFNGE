@@ -48,9 +48,10 @@ Trigger-mode options:
                            tolerance for trigger-period cleanup (default: 50000)
       --signed-dt         match nearest trigger and keep signed time differences
       --timewalk-fit-ranges CSV
-                           fit ranges per channel (default: 17:0:30,19:0:30)
+                           fit ranges per channel (default: 17:10:30,19:10:30)
       --timewalk-fit-model MODEL
-                           pol1, pol1-plateau, or lin-exp-plateau (default: pol1-plateau)
+                           inverse-power, pol1, pol1-plateau, or lin-exp-plateau
+                           (default: inverse-power)
       --dt-tot-cut CSV    diagonal cut CH:DT0:SLOPE[:TOT_MIN:TOT_MAX]
       --dt-tot-cut-direction below|above
                            below keeps dt <= line; above keeps dt >= line (default: below)
@@ -103,8 +104,8 @@ trigger_period_tolerance_ns=50000
 trigger_period_set=0
 trigger_period_tolerance_set=0
 signed_dt=0
-timewalk_fit_ranges="17:0:30,19:0:30"
-timewalk_fit_model="pol1-plateau"
+timewalk_fit_ranges="17:10:30,19:10:30"
+timewalk_fit_model="inverse-power"
 dt_tot_cut=""
 dt_tot_cut_direction="below"
 trigger_tot_window=""
