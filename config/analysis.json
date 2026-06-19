@@ -4,7 +4,7 @@
     "clock_mhz": 320,
     "use_fine": true,
     "use_lut": true,
-    "max_duration_ns": 15,
+    "max_duration_ns": 40,
     "min_duration_ns": 0,
     "fine_cut": 0
   },
@@ -15,7 +15,7 @@
     {
       "name": "ch17_ch19",
       "channels": [17, 19],
-      "window_ns": 20
+      "window_ns": 10
     }
   ],
   "duration_min_by_channel": {}

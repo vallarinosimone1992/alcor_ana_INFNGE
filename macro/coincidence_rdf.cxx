@@ -913,6 +913,36 @@ bool HasTreeBranch(TTree *tree, const char *name)
   return tree && tree->GetBranch(name) != nullptr;
 }
 
+void BindTreeCursorBranches(TreeCursor &cursor)
+{
+  cursor.tree->SetBranchAddress("type", &cursor.type);
+  cursor.tree->SetBranchAddress("fifo", &cursor.fifo);
+  cursor.tree->SetBranchAddress("column", &cursor.column);
+  cursor.tree->SetBranchAddress("pixel", &cursor.pixel);
+  cursor.tree->SetBranchAddress("tdc", &cursor.tdc);
+  cursor.tree->SetBranchAddress("rollover", &cursor.rollover);
+  cursor.tree->SetBranchAddress("coarse", &cursor.coarse);
+  cursor.tree->SetBranchAddress("fine", &cursor.fine);
+  if (cursor.has_device) {
+    cursor.tree->SetBranchAddress("device", &cursor.device);
+  }
+  if (cursor.has_counter) {
+    cursor.tree->SetBranchAddress("counter", &cursor.counter);
+  }
+  if (cursor.has_spill) {
+    cursor.tree->SetBranchAddress("spill", &cursor.spill);
+  }
+  if (cursor.has_run_id) {
+    cursor.tree->SetBranchAddress("run_id", &cursor.run_id);
+  }
+  if (cursor.has_channel) {
+    cursor.tree->SetBranchAddress("channel", &cursor.channel);
+  }
+  if (cursor.has_time_tick) {
+    cursor.tree->SetBranchAddress("time_tick", &cursor.time_tick);
+  }
+}
+
 bool OpenTreeCursor(const std::string &path, const std::string &tree_name, TreeCursor &cursor)
 {
   cursor = TreeCursor{};
@@ -966,32 +996,7 @@ bool OpenTreeCursor(const std::string &path, const std::string &tree_name, TreeC
     enable(name);
   }
 
-  cursor.tree->SetBranchAddress("type", &cursor.type);
-  cursor.tree->SetBranchAddress("fifo", &cursor.fifo);
-  cursor.tree->SetBranchAddress("column", &cursor.column);
-  cursor.tree->SetBranchAddress("pixel", &cursor.pixel);
-  cursor.tree->SetBranchAddress("tdc", &cursor.tdc);
-  cursor.tree->SetBranchAddress("rollover", &cursor.rollover);
-  cursor.tree->SetBranchAddress("coarse", &cursor.coarse);
-  cursor.tree->SetBranchAddress("fine", &cursor.fine);
-  if (cursor.has_device) {
-    cursor.tree->SetBranchAddress("device", &cursor.device);
-  }
-  if (cursor.has_counter) {
-    cursor.tree->SetBranchAddress("counter", &cursor.counter);
-  }
-  if (cursor.has_spill) {
-    cursor.tree->SetBranchAddress("spill", &cursor.spill);
-  }
-  if (cursor.has_run_id) {
-    cursor.tree->SetBranchAddress("run_id", &cursor.run_id);
-  }
-  if (cursor.has_channel) {
-    cursor.tree->SetBranchAddress("channel", &cursor.channel);
-  }
-  if (cursor.has_time_tick) {
-    cursor.tree->SetBranchAddress("time_tick", &cursor.time_tick);
-  }
+  BindTreeCursorBranches(cursor);
 
   cursor.entries = cursor.tree->GetEntries();
   return true;
@@ -3040,8 +3045,9 @@ void coincidence_rdf(const char *decoded_dir = "../raw_data/latest/kc705-196/dec
     if (!OpenTreeCursor(file, input_spec.tree_name, cursor)) {
       return;
     }
-    AdvanceCursor(cursor, channels, fine_calib, tdc_offset_calib, tick_ns, use_fine, fine_cut);
     cursors.push_back(std::move(cursor));
+    BindTreeCursorBranches(cursors.back());
+    AdvanceCursor(cursors.back(), channels, fine_calib, tdc_offset_calib, tick_ns, use_fine, fine_cut);
   }
 
   long long selected_hits = 0;
