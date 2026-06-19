@@ -131,6 +131,11 @@ enum class TimeReferenceMode {
   Trigger = 1,
 };
 
+enum class RunPlotGroup {
+  Results = 0,
+  Diagnostics = 1,
+};
+
 std::string TimeReferenceModeName(TimeReferenceMode mode)
 {
   switch (mode) {
@@ -1709,6 +1714,16 @@ TH1D *FindRunHist1D(const RunResult &result, const std::string &prefix, int chan
   const std::string name = prefix + SafeName(result.config.label) + "_ch" + std::to_string(channel);
   for (const auto &owned : result.histograms) {
     if (std::string(owned->GetName()) == name) {
+      return owned.get();
+    }
+  }
+  return nullptr;
+}
+
+TH1D *FindRunHist1DByName(const RunResult &result, const std::string &name)
+{
+  for (const auto &owned : result.histograms) {
+    if (owned && std::string(owned->GetName()) == name) {
       return owned.get();
     }
   }
@@ -3385,13 +3400,16 @@ void DrawRunHistograms(TCanvas &canvas,
                        const RunResult &result,
                        const std::vector<int> &sensor_channels,
                        int trigger_channel,
-                       const std::vector<int> &edge_channels,
-	                       TimeReferenceMode reference_mode,
-	                       const std::map<int, FitRange> &fit_ranges,
-	                       const std::map<int, DtTotCut> &dt_tot_cuts,
-	                       TimewalkFitModel fit_model,
-	                       const std::string &out_pdf)
+	                       const std::vector<int> &edge_channels,
+		                       TimeReferenceMode reference_mode,
+		                       const std::map<int, FitRange> &fit_ranges,
+		                       const std::map<int, DtTotCut> &dt_tot_cuts,
+		                       TimewalkFitModel fit_model,
+                         RunPlotGroup plot_group,
+		                       const std::string &out_pdf)
 {
+  const bool draw_results = plot_group == RunPlotGroup::Results;
+  const bool draw_diagnostics = plot_group == RunPlotGroup::Diagnostics;
   const std::string dt_axis_title = DtAxisTitle(reference_mode, trigger_channel);
   auto set_linear_2d_pad = []() {
     if (auto *pad = gPad) {
@@ -3416,95 +3434,103 @@ void DrawRunHistograms(TCanvas &canvas,
     profile->SetMinimum(hist.GetYaxis()->GetXmin());
     profile->SetMaximum(hist.GetYaxis()->GetXmax());
   };
-  DrawSectionPage(canvas,
-                  "FULL SELECTION",
-                  "Plots used as timewalk inputs after the configured trigger/reference, ToT, TDC, spill, and dt/ToT selections.",
-                  out_pdf);
+  if (draw_results) {
+    DrawSectionPage(
+        canvas,
+        "FULL SELECTION",
+        "Plots used as timewalk inputs after the configured trigger/reference, ToT, TDC, spill, and dt/ToT selections.",
+        out_pdf);
 
-  canvas.Clear();
-  canvas.SetRightMargin(0.05);
-  auto *legend_dt = new TLegend(0.72, 0.72, 0.92, 0.90);
-  legend_dt->SetBit(kCanDelete);
-  legend_dt->SetBorderSize(0);
-  legend_dt->SetFillStyle(0);
-  auto *stack_dt = new THStack(("stack_dt_" + SafeName(result.config.label)).c_str(),
-	                               ("[FULL SELECTION] " + result.config.label + " I=" + std::to_string(result.config.intensity) +
-	                                " time difference;" + dt_axis_title + ";entries")
-	                                   .c_str());
-  stack_dt->SetBit(kCanDelete);
-  double max_dt = 0.0;
-  for (size_t i = 0; i < sensor_channels.size(); ++i) {
-    const std::string name = "h_dt_" + SafeName(result.config.label) + "_ch" + std::to_string(sensor_channels[i]);
-    TH1D *hist = nullptr;
-    for (const auto &owned : result.histograms) {
-      if (std::string(owned->GetName()) == name) {
-        hist = owned.get();
-        break;
+    canvas.Clear();
+    canvas.SetRightMargin(0.05);
+    auto *legend_dt = new TLegend(0.72, 0.72, 0.92, 0.90);
+    legend_dt->SetBit(kCanDelete);
+    legend_dt->SetBorderSize(0);
+    legend_dt->SetFillStyle(0);
+    auto *stack_dt = new THStack(("stack_dt_" + SafeName(result.config.label)).c_str(),
+                                 ("[FULL SELECTION] " + result.config.label + " I=" +
+                                  std::to_string(result.config.intensity) + " time difference;" + dt_axis_title +
+                                  ";entries")
+                                     .c_str());
+    stack_dt->SetBit(kCanDelete);
+    double max_dt = 0.0;
+    for (size_t i = 0; i < sensor_channels.size(); ++i) {
+      const std::string name =
+          "h_dt_" + SafeName(result.config.label) + "_ch" + std::to_string(sensor_channels[i]);
+      TH1D *hist = nullptr;
+      for (const auto &owned : result.histograms) {
+        if (std::string(owned->GetName()) == name) {
+          hist = owned.get();
+          break;
+        }
       }
+      if (!hist) {
+        continue;
+      }
+      hist->SetLineColor(ColorForIndex(i));
+      hist->SetLineWidth(2);
+      max_dt = std::max(max_dt, hist->GetMaximum());
+      auto *draw_hist = static_cast<TH1D *>(hist->Clone());
+      draw_hist->SetDirectory(nullptr);
+      stack_dt->Add(draw_hist, "hist");
+      legend_dt->AddEntry(draw_hist, ("ch " + std::to_string(sensor_channels[i])).c_str(), "l");
     }
-    if (!hist) {
-      continue;
+    if (stack_dt->GetHists()) {
+      stack_dt->GetHists()->SetOwner(kTRUE);
     }
-    hist->SetLineColor(ColorForIndex(i));
-    hist->SetLineWidth(2);
-    max_dt = std::max(max_dt, hist->GetMaximum());
-    auto *draw_hist = static_cast<TH1D *>(hist->Clone());
-    draw_hist->SetDirectory(nullptr);
-    stack_dt->Add(draw_hist, "hist");
-    legend_dt->AddEntry(draw_hist, ("ch " + std::to_string(sensor_channels[i])).c_str(), "l");
+    stack_dt->SetMaximum(max_dt * 1.2 + 1.0);
+    stack_dt->Draw("nostack hist");
+    legend_dt->Draw();
+    canvas.Print(out_pdf.c_str());
   }
-  if (stack_dt->GetHists()) {
-    stack_dt->GetHists()->SetOwner(kTRUE);
-  }
-  stack_dt->SetMaximum(max_dt * 1.2 + 1.0);
-  stack_dt->Draw("nostack hist");
-  legend_dt->Draw();
-  canvas.Print(out_pdf.c_str());
 
-  canvas.Clear();
-  canvas.SetRightMargin(0.05);
-  auto *legend_tot = new TLegend(0.72, 0.72, 0.92, 0.90);
-  legend_tot->SetBit(kCanDelete);
-  legend_tot->SetBorderSize(0);
-  legend_tot->SetFillStyle(0);
-  auto *stack_tot = new THStack(("stack_tot_" + SafeName(result.config.label)).c_str(),
-                                ("[FULL SELECTION] " + result.config.label + " I=" + std::to_string(result.config.intensity) +
-                                 " ToT;ToT [ns];entries")
-                                    .c_str());
-  stack_tot->SetBit(kCanDelete);
   std::vector<int> tot_channels = sensor_channels;
   tot_channels.push_back(trigger_channel);
   std::sort(tot_channels.begin(), tot_channels.end());
   tot_channels.erase(std::unique(tot_channels.begin(), tot_channels.end()), tot_channels.end());
-  double max_tot = 0.0;
-  for (size_t i = 0; i < tot_channels.size(); ++i) {
-    const std::string name =
-        "h_tot_full_selection_" + SafeName(result.config.label) + "_ch" + std::to_string(tot_channels[i]);
-    TH1D *hist = nullptr;
-    for (const auto &owned : result.histograms) {
-      if (std::string(owned->GetName()) == name) {
-        hist = owned.get();
-        break;
+
+  if (draw_results) {
+    canvas.Clear();
+    canvas.SetRightMargin(0.05);
+    auto *legend_tot = new TLegend(0.72, 0.72, 0.92, 0.90);
+    legend_tot->SetBit(kCanDelete);
+    legend_tot->SetBorderSize(0);
+    legend_tot->SetFillStyle(0);
+    auto *stack_tot = new THStack(("stack_tot_" + SafeName(result.config.label)).c_str(),
+                                  ("[FULL SELECTION] " + result.config.label + " I=" +
+                                   std::to_string(result.config.intensity) + " ToT;ToT [ns];entries")
+                                      .c_str());
+    stack_tot->SetBit(kCanDelete);
+    double max_tot = 0.0;
+    for (size_t i = 0; i < tot_channels.size(); ++i) {
+      const std::string name =
+          "h_tot_full_selection_" + SafeName(result.config.label) + "_ch" + std::to_string(tot_channels[i]);
+      TH1D *hist = nullptr;
+      for (const auto &owned : result.histograms) {
+        if (std::string(owned->GetName()) == name) {
+          hist = owned.get();
+          break;
+        }
       }
+      if (!hist) {
+        continue;
+      }
+      hist->SetLineColor(ColorForIndex(i));
+      hist->SetLineWidth(2);
+      max_tot = std::max(max_tot, hist->GetMaximum());
+      auto *draw_hist = static_cast<TH1D *>(hist->Clone());
+      draw_hist->SetDirectory(nullptr);
+      stack_tot->Add(draw_hist, "hist");
+      legend_tot->AddEntry(draw_hist, ("ch " + std::to_string(tot_channels[i])).c_str(), "l");
     }
-    if (!hist) {
-      continue;
+    if (stack_tot->GetHists()) {
+      stack_tot->GetHists()->SetOwner(kTRUE);
     }
-    hist->SetLineColor(ColorForIndex(i));
-    hist->SetLineWidth(2);
-    max_tot = std::max(max_tot, hist->GetMaximum());
-    auto *draw_hist = static_cast<TH1D *>(hist->Clone());
-    draw_hist->SetDirectory(nullptr);
-    stack_tot->Add(draw_hist, "hist");
-    legend_tot->AddEntry(draw_hist, ("ch " + std::to_string(tot_channels[i])).c_str(), "l");
+    stack_tot->SetMaximum(max_tot * 1.2 + 1.0);
+    stack_tot->Draw("nostack hist");
+    legend_tot->Draw();
+    canvas.Print(out_pdf.c_str());
   }
-  if (stack_tot->GetHists()) {
-    stack_tot->GetHists()->SetOwner(kTRUE);
-  }
-  stack_tot->SetMaximum(max_tot * 1.2 + 1.0);
-  stack_tot->Draw("nostack hist");
-  legend_tot->Draw();
-  canvas.Print(out_pdf.c_str());
 
   auto draw_timewalk_2d_group = [&](const std::string &prefix,
                                     const std::string &label,
@@ -3585,14 +3611,28 @@ void DrawRunHistograms(TCanvas &canvas,
 	    }
 	  };
 
-  draw_timewalk_2d_group("h_raw_dt_vs_tot_", "[CUT DIAGNOSTIC: before dt/ToT cut]", false, true);
-  draw_timewalk_2d_group("h_dt_vs_tot_", "[FULL SELECTION] #Deltat vs ToT", true, true);
-  draw_timewalk_2d_group("h_rejected_dt_vs_tot_", "[CUT DIAGNOSTIC: rejected by dt/ToT cut]", false, true);
+  if (draw_diagnostics) {
+    DrawSectionPage(
+        canvas,
+        "CUT DIAGNOSTICS",
+        "Intermediate views that isolate one selection step, such as trigger veto/period cleanup or dt/ToT rejection.",
+        out_pdf);
+    draw_timewalk_2d_group("h_raw_dt_vs_tot_", "[CUT DIAGNOSTIC: before dt/ToT cut]", false, true);
+  }
+  if (draw_results) {
+    draw_timewalk_2d_group("h_dt_vs_tot_", "[FULL SELECTION] #Deltat vs ToT", true, true);
+  }
+  if (draw_diagnostics) {
+    draw_timewalk_2d_group("h_rejected_dt_vs_tot_", "[CUT DIAGNOSTIC: rejected by dt/ToT cut]", false, true);
+  }
 
-  DrawSectionPage(canvas,
-                  "NO ANALYSIS CUTS",
-                  "Timing and ToT diagnostics before trigger veto, trigger-period cleanup, matching windows, ToT windows, and dt/ToT cuts.",
-                  out_pdf);
+  if (draw_diagnostics) {
+    DrawSectionPage(
+        canvas,
+        "NO ANALYSIS CUTS",
+        "Timing and ToT diagnostics before trigger veto, trigger-period cleanup, matching windows, ToT windows, and dt/ToT cuts.",
+        out_pdf);
+  }
 
   auto draw_edge_pair = [&](const std::string &leading_prefix,
                             const std::string &trailing_prefix) {
@@ -3622,8 +3662,10 @@ void DrawRunHistograms(TCanvas &canvas,
     canvas.Print(out_pdf.c_str());
   };
 
-  draw_edge_pair("h_edge_time_leading_", "h_edge_time_trailing_");
-  draw_edge_pair("h_edge_phase_leading_", "h_edge_phase_trailing_");
+  if (draw_diagnostics) {
+    draw_edge_pair("h_edge_time_leading_", "h_edge_time_trailing_");
+    draw_edge_pair("h_edge_phase_leading_", "h_edge_phase_trailing_");
+  }
 
   std::vector<int> timing_diagnostic_channels = edge_channels;
   for (int ch : tot_channels) {
@@ -3791,21 +3833,18 @@ void DrawRunHistograms(TCanvas &canvas,
     }
   };
 
-  draw_no_selection_tot_pages();
-  draw_interhit_overlay_pages();
-  draw_duration_vs_interhit_pages();
-
-  DrawSectionPage(canvas,
-                  "CUT DIAGNOSTICS",
-                  "Intermediate views that isolate one selection step, such as trigger veto/period cleanup or dt/ToT rejection.",
-                  out_pdf);
+  if (draw_diagnostics) {
+    draw_no_selection_tot_pages();
+    draw_interhit_overlay_pages();
+    draw_duration_vs_interhit_pages();
+  }
 
   TH1D *trigger_candidates = FindRunHist1D(result, "h_trigger_candidate_interhit_", trigger_channel);
   TH1D *trigger_after_veto = FindRunHist1D(result, "h_trigger_after_veto_interhit_", trigger_channel);
   TH1D *trigger_clean = FindRunHist1D(result, "h_trigger_clean_interhit_", trigger_channel);
-  if ((trigger_candidates && trigger_candidates->GetEntries() > 0.0) ||
-      (trigger_after_veto && trigger_after_veto->GetEntries() > 0.0) ||
-      (trigger_clean && trigger_clean->GetEntries() > 0.0)) {
+  if (draw_diagnostics && ((trigger_candidates && trigger_candidates->GetEntries() > 0.0) ||
+                           (trigger_after_veto && trigger_after_veto->GetEntries() > 0.0) ||
+                           (trigger_clean && trigger_clean->GetEntries() > 0.0))) {
     canvas.Clear();
     canvas.SetRightMargin(0.05);
     if (auto *pad = static_cast<TPad *>(canvas.cd())) {
@@ -3843,38 +3882,11 @@ void DrawRunHistograms(TCanvas &canvas,
     canvas.Print(out_pdf.c_str());
   }
 
-  canvas.Clear();
-  canvas.SetRightMargin(0.05);
-  canvas.Divide(static_cast<int>(tot_channels.size()), 1, 0.001, 0.001);
   bool has_tot_vs_spill = false;
-  for (size_t i = 0; i < tot_channels.size(); ++i) {
-    const int ch = tot_channels[i];
-    const std::string name = "h_tot_vs_spill_" + SafeName(result.config.label) + "_ch" + std::to_string(ch);
-    TH2D *hist = nullptr;
-    for (const auto &owned : result.histograms2d) {
-      if (std::string(owned->GetName()) == name) {
-        hist = owned.get();
-        break;
-      }
-    }
-    canvas.cd(static_cast<int>(i + 1));
-    set_linear_2d_pad();
-    if (!hist || hist->GetEntries() <= 0.0) {
-      continue;
-    }
-    has_tot_vs_spill = true;
-    hist->Draw("colz");
-  }
-  if (has_tot_vs_spill) {
-    canvas.Print(out_pdf.c_str());
-  }
-  if (has_tot_vs_spill) {
+  if (draw_diagnostics) {
     canvas.Clear();
     canvas.SetRightMargin(0.05);
     canvas.Divide(static_cast<int>(tot_channels.size()), 1, 0.001, 0.001);
-    bool has_profile_group = false;
-    std::vector<std::unique_ptr<TProfile>> tot_vs_spill_profiles;
-    tot_vs_spill_profiles.reserve(tot_channels.size());
     for (size_t i = 0; i < tot_channels.size(); ++i) {
       const int ch = tot_channels[i];
       const std::string name = "h_tot_vs_spill_" + SafeName(result.config.label) + "_ch" + std::to_string(ch);
@@ -3886,25 +3898,54 @@ void DrawRunHistograms(TCanvas &canvas,
         }
       }
       canvas.cd(static_cast<int>(i + 1));
-      set_linear_profile_pad();
+      set_linear_2d_pad();
       if (!hist || hist->GetEntries() <= 0.0) {
         continue;
       }
-      auto profile = MakeTotVsSpillProfile(*hist);
-      if (!profile) {
-        continue;
-      }
-      has_profile_group = true;
-      profile->SetTitle(("[PROFILE ONLY] " + result.config.label +
-                         " I=" + std::to_string(result.config.intensity) + " ToT vs spill ch" +
-                         std::to_string(ch) + ";spill;mean ToT [ns]")
-                            .c_str());
-      set_profile_y_range(profile.get(), *hist);
-      profile->Draw("E1");
-      tot_vs_spill_profiles.push_back(std::move(profile));
+      has_tot_vs_spill = true;
+      hist->Draw("colz");
     }
-    if (has_profile_group) {
+    if (has_tot_vs_spill) {
       canvas.Print(out_pdf.c_str());
+    }
+    if (has_tot_vs_spill) {
+      canvas.Clear();
+      canvas.SetRightMargin(0.05);
+      canvas.Divide(static_cast<int>(tot_channels.size()), 1, 0.001, 0.001);
+      bool has_profile_group = false;
+      std::vector<std::unique_ptr<TProfile>> tot_vs_spill_profiles;
+      tot_vs_spill_profiles.reserve(tot_channels.size());
+      for (size_t i = 0; i < tot_channels.size(); ++i) {
+        const int ch = tot_channels[i];
+        const std::string name = "h_tot_vs_spill_" + SafeName(result.config.label) + "_ch" + std::to_string(ch);
+        TH2D *hist = nullptr;
+        for (const auto &owned : result.histograms2d) {
+          if (std::string(owned->GetName()) == name) {
+            hist = owned.get();
+            break;
+          }
+        }
+        canvas.cd(static_cast<int>(i + 1));
+        set_linear_profile_pad();
+        if (!hist || hist->GetEntries() <= 0.0) {
+          continue;
+        }
+        auto profile = MakeTotVsSpillProfile(*hist);
+        if (!profile) {
+          continue;
+        }
+        has_profile_group = true;
+        profile->SetTitle(("[PROFILE ONLY] " + result.config.label +
+                           " I=" + std::to_string(result.config.intensity) + " ToT vs spill ch" +
+                           std::to_string(ch) + ";spill;mean ToT [ns]")
+                              .c_str());
+        set_profile_y_range(profile.get(), *hist);
+        profile->Draw("E1");
+        tot_vs_spill_profiles.push_back(std::move(profile));
+      }
+      if (has_profile_group) {
+        canvas.Print(out_pdf.c_str());
+      }
     }
   }
 
@@ -3980,8 +4021,12 @@ void DrawRunHistograms(TCanvas &canvas,
     }
   };
 
-  draw_sensor_tot_vs_spill_group("h_tot_vs_spill_selected_", "[FULL SELECTION]");
-  draw_sensor_tot_vs_spill_group("h_tot_vs_spill_rejected_", "[CUT DIAGNOSTIC: rejected by dt/ToT cut]");
+  if (draw_results) {
+    draw_sensor_tot_vs_spill_group("h_tot_vs_spill_selected_", "[FULL SELECTION]");
+  }
+  if (draw_diagnostics) {
+    draw_sensor_tot_vs_spill_group("h_tot_vs_spill_rejected_", "[CUT DIAGNOSTIC: rejected by dt/ToT cut]");
+  }
 
   auto draw_sensor_dt_vs_spill_group = [&](const std::string &prefix, const std::string &label) {
     canvas.Clear();
@@ -4057,12 +4102,18 @@ void DrawRunHistograms(TCanvas &canvas,
     }
   };
 
-  draw_sensor_dt_vs_spill_group("h_raw_dt_vs_spill_", "[CUT DIAGNOSTIC: before dt/ToT cut]");
-  draw_sensor_dt_vs_spill_group("h_dt_vs_spill_", "[FULL SELECTION]");
-  draw_sensor_dt_vs_spill_group("h_rejected_dt_vs_spill_", "[CUT DIAGNOSTIC: rejected by dt/ToT cut]");
+  if (draw_diagnostics) {
+    draw_sensor_dt_vs_spill_group("h_raw_dt_vs_spill_", "[CUT DIAGNOSTIC: before dt/ToT cut]");
+  }
+  if (draw_results) {
+    draw_sensor_dt_vs_spill_group("h_dt_vs_spill_", "[FULL SELECTION]");
+  }
+  if (draw_diagnostics) {
+    draw_sensor_dt_vs_spill_group("h_rejected_dt_vs_spill_", "[CUT DIAGNOSTIC: rejected by dt/ToT cut]");
+  }
   canvas.Clear();
 
-	  if (sensor_channels.size() >= 2) {
+		  if (draw_results && sensor_channels.size() >= 2) {
 	    const int ch_a = sensor_channels[0];
 	    const int ch_b = sensor_channels[1];
 	    const std::string safe_label = SafeName(result.config.label);
@@ -4080,10 +4131,15 @@ void DrawRunHistograms(TCanvas &canvas,
 	        corr_hist = owned.get();
 	      }
 	    }
-	    if (raw_hist || corr_hist) {
-	      canvas.Clear();
-	      canvas.SetRightMargin(0.05);
-	      auto *stack = new THStack(("stack_dt_timewalk_compare_ch" + std::to_string(ch_a) + "_ch" +
+		    if (raw_hist || corr_hist) {
+		      canvas.Clear();
+		      canvas.SetRightMargin(0.05);
+		      if (auto *pad = static_cast<TPad *>(canvas.cd())) {
+		        pad->SetLogx(false);
+		        pad->SetLogy(false);
+		        pad->SetLogz(false);
+		      }
+		      auto *stack = new THStack(("stack_dt_timewalk_compare_ch" + std::to_string(ch_a) + "_ch" +
 	                                 std::to_string(ch_b) + "_" + safe_label)
 	                                    .c_str(),
 	                                (result.config.label + " I=" + std::to_string(result.config.intensity) +
@@ -4119,6 +4175,151 @@ void DrawRunHistograms(TCanvas &canvas,
 	    }
 	  }
   canvas.SetRightMargin(0.05);
+}
+
+void DrawAccumulatedCoincidenceBeforeAfter(TCanvas &canvas,
+                                           const std::vector<RunResult> &results,
+                                           const std::vector<int> &sensor_channels,
+                                           const std::string &out_pdf)
+{
+  if (sensor_channels.size() < 2) {
+    return;
+  }
+  const int ch_a = sensor_channels[0];
+  const int ch_b = sensor_channels[1];
+  std::unique_ptr<TH1D> raw_sum;
+  std::unique_ptr<TH1D> corr_sum;
+
+  auto add_to_sum = [](std::unique_ptr<TH1D> &sum, const TH1D *hist, const std::string &name) {
+    if (!hist || hist->GetEntries() <= 0.0) {
+      return;
+    }
+    if (!sum) {
+      sum.reset(static_cast<TH1D *>(hist->Clone(name.c_str())));
+      sum->SetDirectory(nullptr);
+      return;
+    }
+    sum->Add(hist);
+  };
+
+  for (const auto &result : results) {
+    const std::string safe_label = SafeName(result.config.label);
+    const std::string raw_name =
+        "h_dt_uncorr_ch" + std::to_string(ch_a) + "_ch" + std::to_string(ch_b) + "_" + safe_label;
+    const std::string corr_name =
+        "h_dt_corr_ch" + std::to_string(ch_a) + "_ch" + std::to_string(ch_b) + "_" + safe_label;
+    add_to_sum(raw_sum,
+               FindRunHist1DByName(result, raw_name),
+               "h_dt_uncorr_ch" + std::to_string(ch_a) + "_ch" + std::to_string(ch_b) + "_accumulated");
+    add_to_sum(corr_sum,
+               FindRunHist1DByName(result, corr_name),
+               "h_dt_corr_ch" + std::to_string(ch_a) + "_ch" + std::to_string(ch_b) + "_accumulated");
+  }
+
+  if (!raw_sum && !corr_sum) {
+    return;
+  }
+
+  canvas.Clear();
+  canvas.SetRightMargin(0.05);
+  if (auto *pad = static_cast<TPad *>(canvas.cd())) {
+    pad->SetLogx(false);
+    pad->SetLogy(false);
+    pad->SetLogz(false);
+  }
+  auto *stack = new THStack(("stack_dt_timewalk_compare_ch" + std::to_string(ch_a) + "_ch" +
+                             std::to_string(ch_b) + "_accumulated")
+                                .c_str(),
+                            ("Accumulated coincidence ch" + std::to_string(ch_a) + "-ch" +
+                             std::to_string(ch_b) + " before/after timewalk;t_{" +
+                             std::to_string(ch_a) + "} - t_{" + std::to_string(ch_b) +
+                             "} [ns];entries")
+                                .c_str());
+  stack->SetBit(kCanDelete);
+  auto *legend = new TLegend(0.62, 0.74, 0.92, 0.90);
+  legend->SetBit(kCanDelete);
+  legend->SetBorderSize(0);
+  legend->SetFillStyle(0);
+  auto add_hist = [&](TH1D *hist, int color, const char *label) {
+    if (!hist || hist->GetEntries() <= 0.0) {
+      return;
+    }
+    auto *draw_hist = static_cast<TH1D *>(hist->Clone());
+    draw_hist->SetDirectory(nullptr);
+    draw_hist->SetStats(false);
+    draw_hist->SetLineColor(color);
+    draw_hist->SetLineWidth(3);
+    stack->Add(draw_hist, "hist");
+    legend->AddEntry(draw_hist, label, "l");
+  };
+  add_hist(raw_sum.get(), kGray + 2, "before timewalk");
+  add_hist(corr_sum.get(), kRed + 1, "after timewalk");
+  if (stack->GetHists()) {
+    stack->GetHists()->SetOwner(kTRUE);
+  }
+  stack->Draw("nostack hist");
+  legend->Draw();
+  canvas.Print(out_pdf.c_str());
+}
+
+void DrawAccumulatedCorrectionOverlay(TCanvas &canvas,
+                                      const std::map<int, TimewalkCorrection> &timewalk_corrections,
+                                      const std::vector<int> &sensor_channels,
+                                      double max_duration_ns,
+                                      const std::string &out_pdf)
+{
+  const double xmax = std::max(1.0, max_duration_ns);
+  auto *multi = new TMultiGraph();
+  multi->SetBit(kCanDelete);
+  multi->SetTitle("Accumulated timewalk correction;ToT [ns];correction f_{ch}(ToT) [ns]");
+  auto *legend = new TLegend(0.68, 0.68, 0.92, 0.90);
+  legend->SetBit(kCanDelete);
+  legend->SetBorderSize(0);
+  legend->SetFillStyle(0);
+
+  int ngraphs = 0;
+  for (size_t i = 0; i < sensor_channels.size(); ++i) {
+    const int ch = sensor_channels[i];
+    auto correction_it = timewalk_corrections.find(ch);
+    if (correction_it == timewalk_corrections.end() || !correction_it->second.valid) {
+      continue;
+    }
+    auto graph = std::make_unique<TGraph>();
+    graph->SetName(("g_accumulated_timewalk_correction_ch" + std::to_string(ch)).c_str());
+    graph->SetLineColor(ColorForIndex(i));
+    graph->SetLineWidth(3);
+    constexpr int npoints = 200;
+    for (int point = 0; point < npoints; ++point) {
+      const double frac = npoints > 1 ? static_cast<double>(point) / static_cast<double>(npoints - 1) : 0.0;
+      const double tot = frac * xmax;
+      graph->SetPoint(point, tot, correction_it->second.CorrectionNs(tot));
+    }
+    legend->AddEntry(graph.get(), ("ch " + std::to_string(ch)).c_str(), "l");
+    multi->Add(graph.release(), "L");
+    ++ngraphs;
+  }
+
+  if (ngraphs <= 0) {
+    delete multi;
+    delete legend;
+    return;
+  }
+  if (multi->GetListOfGraphs()) {
+    multi->GetListOfGraphs()->SetOwner(kTRUE);
+  }
+  canvas.Clear();
+  canvas.SetRightMargin(0.05);
+  if (auto *pad = static_cast<TPad *>(canvas.cd())) {
+    pad->SetLogx(false);
+    pad->SetLogy(false);
+    pad->SetLogz(false);
+  }
+  multi->Draw("A");
+  if (multi->GetXaxis()) {
+    multi->GetXaxis()->SetLimits(0.0, xmax);
+  }
+  legend->Draw();
+  canvas.Print(out_pdf.c_str());
 }
 
 void DrawTimewalkFitSummaries(TCanvas &canvas,
@@ -4208,8 +4409,11 @@ void DrawAccumulatedTimewalkFits(TCanvas &canvas,
                                  const std::map<int, FitRange> &fit_ranges,
                                  TimewalkFitModel fit_model,
                                  const std::map<int, DtTotCut> &dt_tot_cuts,
+                                 RunPlotGroup plot_group,
                                  const std::string &out_pdf)
 {
+  const bool draw_results = plot_group == RunPlotGroup::Results;
+  const bool draw_diagnostics = plot_group == RunPlotGroup::Diagnostics;
   canvas.SetRightMargin(0.14);
   auto set_linear_canvas = [&]() {
     canvas.SetRightMargin(0.14);
@@ -4222,7 +4426,7 @@ void DrawAccumulatedTimewalkFits(TCanvas &canvas,
   for (int ch : sensor_channels) {
     const DtTotCut cut = DtTotCutForChannel(dt_tot_cuts, ch);
     auto raw_accumulated = MakeAccumulatedRawTimewalkHist(results, ch);
-    if (cut.enabled && raw_accumulated && raw_accumulated->GetEntries() > 0.0) {
+    if (draw_diagnostics && cut.enabled && raw_accumulated && raw_accumulated->GetEntries() > 0.0) {
       canvas.Clear();
       set_linear_canvas();
       auto *draw_raw = static_cast<TH2D *>(raw_accumulated->Clone());
@@ -4236,7 +4440,7 @@ void DrawAccumulatedTimewalkFits(TCanvas &canvas,
     auto accumulated = MakeAccumulatedTimewalkHist(results, ch);
     if (!accumulated || accumulated->GetEntries() <= 0.0) {
       auto rejected = MakeAccumulatedRejectedTimewalkHist(results, ch);
-      if (cut.enabled && rejected && rejected->GetEntries() > 0.0) {
+      if (draw_diagnostics && cut.enabled && rejected && rejected->GetEntries() > 0.0) {
         canvas.Clear();
         set_linear_canvas();
         auto *draw_rejected = static_cast<TH2D *>(rejected->Clone());
@@ -4249,37 +4453,39 @@ void DrawAccumulatedTimewalkFits(TCanvas &canvas,
       continue;
     }
 
-    canvas.Clear();
-    set_linear_canvas();
-	    auto *draw_hist = static_cast<TH2D *>(accumulated->Clone());
-	    draw_hist->SetDirectory(nullptr);
-	    draw_hist->SetBit(kCanDelete);
-	    draw_hist->Draw("colz");
-	    DrawDtTotCutLine(cut, draw_hist);
-	    canvas.Print(out_pdf.c_str());
-
-	    auto profile = MakeTimewalkProfile(*draw_hist);
-	    auto fit = FitTimewalkProfile(profile.get(), FitRangeForChannel(fit_ranges, ch), fit_model);
-	    if (profile) {
-	      canvas.Clear();
-	      canvas.SetRightMargin(0.05);
-      if (auto *pad = static_cast<TPad *>(canvas.cd())) {
-        pad->SetLogx(false);
-        pad->SetLogy(false);
-        pad->SetLogz(false);
-      }
-      profile->SetMinimum(draw_hist->GetYaxis()->GetXmin());
-      profile->SetMaximum(draw_hist->GetYaxis()->GetXmax());
-      profile->Draw("E1");
-      if (fit) {
-        fit->Draw("same");
-      }
+    if (draw_results) {
+      canvas.Clear();
+      set_linear_canvas();
+      auto *draw_hist = static_cast<TH2D *>(accumulated->Clone());
+      draw_hist->SetDirectory(nullptr);
+      draw_hist->SetBit(kCanDelete);
+      draw_hist->Draw("colz");
+      DrawDtTotCutLine(cut, draw_hist);
       canvas.Print(out_pdf.c_str());
-      canvas.SetRightMargin(0.14);
+
+      auto profile = MakeTimewalkProfile(*draw_hist);
+      auto fit = FitTimewalkProfile(profile.get(), FitRangeForChannel(fit_ranges, ch), fit_model);
+      if (profile) {
+        canvas.Clear();
+        canvas.SetRightMargin(0.05);
+        if (auto *pad = static_cast<TPad *>(canvas.cd())) {
+          pad->SetLogx(false);
+          pad->SetLogy(false);
+          pad->SetLogz(false);
+        }
+        profile->SetMinimum(draw_hist->GetYaxis()->GetXmin());
+        profile->SetMaximum(draw_hist->GetYaxis()->GetXmax());
+        profile->Draw("E1");
+        if (fit) {
+          fit->Draw("same");
+        }
+        canvas.Print(out_pdf.c_str());
+        canvas.SetRightMargin(0.14);
+      }
     }
 
     auto rejected = MakeAccumulatedRejectedTimewalkHist(results, ch);
-    if (cut.enabled && rejected && rejected->GetEntries() > 0.0) {
+    if (draw_diagnostics && cut.enabled && rejected && rejected->GetEntries() > 0.0) {
       canvas.Clear();
       set_linear_canvas();
       auto *draw_rejected = static_cast<TH2D *>(rejected->Clone());
@@ -4953,32 +5159,55 @@ void laser_intensity_scan_rdf(const char *runlist_path = "help",
                out_pdf);
 	    DrawGraphs(canvas, tot_mean_graphs, tot_labels, "Mean ToT", "mean ToT [ns]", out_pdf);
 	    DrawGraphs(canvas, tot_rms_graphs, tot_labels, "ToT RMS", "RMS ToT [ns]", out_pdf);
-	    for (const auto &result : results) {
-	      DrawRunHistograms(
-	          canvas,
-	          result,
-	          sensor_channels,
-	          trigger_channel,
-	          edge_channels,
-	          reference_mode,
-	          timewalk_fit_ranges,
-	          dt_tot_cuts,
-	          timewalk_fit_model,
-	          out_pdf);
-	    }
-	    DrawAccumulatedTimewalkFits(
-	        canvas, results, sensor_channels, timewalk_fit_ranges, timewalk_fit_model, dt_tot_cuts, out_pdf);
+	    DrawAccumulatedCorrectionOverlay(canvas, timewalk_corrections, sensor_channels, max_duration_ns, out_pdf);
+	    DrawAccumulatedTimewalkFits(canvas,
+	                                results,
+	                                sensor_channels,
+	                                timewalk_fit_ranges,
+	                                timewalk_fit_model,
+	                                dt_tot_cuts,
+	                                RunPlotGroup::Results,
+	                                out_pdf);
 	    DrawCorrectedAccumulatedTimewalk(canvas, corrected_accumulated_timewalk_histograms, out_pdf);
-	    DrawTimewalkFitSummaries(
-	        canvas,
-	        results,
-	        sensor_channels,
-	        timewalk_fit_ranges,
-	        timewalk_fit_model,
-	        max_duration_ns,
-	        match_window_ns,
-	        signed_dt,
-	        out_pdf);
+	    DrawAccumulatedCoincidenceBeforeAfter(canvas, results, sensor_channels, out_pdf);
+	    for (const auto &result : results) {
+	      DrawRunHistograms(canvas,
+	                        result,
+	                        sensor_channels,
+	                        trigger_channel,
+	                        edge_channels,
+	                        reference_mode,
+	                        timewalk_fit_ranges,
+	                        dt_tot_cuts,
+	                        timewalk_fit_model,
+	                        RunPlotGroup::Results,
+	                        out_pdf);
+	    }
+	    DrawSectionPage(canvas,
+	                    "DIAGNOSTICS",
+	                    "Diagnostic pages are collected at the end: no-cut views, cut rejection checks, and trigger timing structure.",
+	                    out_pdf);
+	    DrawAccumulatedTimewalkFits(canvas,
+	                                results,
+	                                sensor_channels,
+	                                timewalk_fit_ranges,
+	                                timewalk_fit_model,
+	                                dt_tot_cuts,
+	                                RunPlotGroup::Diagnostics,
+	                                out_pdf);
+	    for (const auto &result : results) {
+	      DrawRunHistograms(canvas,
+	                        result,
+	                        sensor_channels,
+	                        trigger_channel,
+	                        edge_channels,
+	                        reference_mode,
+	                        timewalk_fit_ranges,
+	                        dt_tot_cuts,
+	                        timewalk_fit_model,
+	                        RunPlotGroup::Diagnostics,
+	                        out_pdf);
+	    }
     canvas.Print((std::string(out_pdf) + "]").c_str());
     std::cout << "Wrote PDF output: " << out_pdf << std::endl;
   }
