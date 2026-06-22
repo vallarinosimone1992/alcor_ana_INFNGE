@@ -126,6 +126,15 @@ need_arg() {
   fi
 }
 
+reject_directory_output() {
+  local option="$1"
+  local path="$2"
+  if [[ "${path}" == */ ]] || [ -d "${path}" ]; then
+    echo "${option} expects a file path, not a directory: ${path}" >&2
+    exit 1
+  fi
+}
+
 while [ "$#" -gt 0 ]; do
   case "$1" in
     -h|--help)
@@ -171,28 +180,34 @@ while [ "$#" -gt 0 ]; do
     -o|--output)
       need_arg "$@"
       out_root=${2:-}
+      reject_directory_output "$1" "${out_root}"
       shift 2
       ;;
     --output=*)
       out_root=${1#*=}
+      reject_directory_output "--output" "${out_root}"
       shift
       ;;
     -P|--pdf)
       need_arg "$@"
       out_pdf=${2:-}
+      reject_directory_output "$1" "${out_pdf}"
       shift 2
       ;;
     --pdf=*)
       out_pdf=${1#*=}
+      reject_directory_output "--pdf" "${out_pdf}"
       shift
       ;;
     -T|--txt)
       need_arg "$@"
       out_txt=${2:-}
+      reject_directory_output "$1" "${out_txt}"
       shift 2
       ;;
     --txt=*)
       out_txt=${1#*=}
+      reject_directory_output "--txt" "${out_txt}"
       shift
       ;;
     --channels)

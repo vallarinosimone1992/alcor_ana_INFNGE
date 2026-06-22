@@ -23,7 +23,9 @@
 
 #include "analysis_events.h"
 #include "analysis_io.h"
+#include "analysis_tdc.h"
 #include "analysis_time.h"
+#include "analysis_timewalk.h"
 
 #include <algorithm>
 #include <array>
@@ -50,6 +52,15 @@ constexpr int kNumAlcorChannels = 32;
 constexpr double kTimewalkDtLimitNs = 20.0;
 constexpr double kCorrectedCoincidenceDtMinNs = -3.0;
 constexpr double kCorrectedCoincidenceDtMaxNs = 3.0;
+
+using analysis_tdc::GetTrailingPartner;
+using analysis_tdc::IsLeadingTdc;
+using analysis_tdc::IsTrailingTdc;
+using analysis_tdc::TdcPairIndex;
+using analysis_timewalk::ParseTimewalkFitModel;
+using analysis_timewalk::TimewalkFitModel;
+using analysis_timewalk::TimewalkFitModelId;
+using analysis_timewalk::TimewalkFitModelName;
 
 struct FitRange {
   bool enabled = false;
@@ -122,13 +133,6 @@ struct SpillRange {
   }
 };
 
-enum class TimewalkFitModel {
-  Pol1 = 0,
-  LinExpPlateau = 1,
-  Pol1Plateau = 2,
-  InversePower = 3,
-};
-
 enum class TimeReferenceMode {
   EventMedian = 0,
   Trigger = 1,
@@ -176,41 +180,6 @@ std::string DtAxisTitle(TimeReferenceMode mode, int trigger_channel)
   return DtExpressionTitle(mode, trigger_channel) + " [ns]";
 }
 
-std::string TimewalkFitModelName(TimewalkFitModel model)
-{
-  switch (model) {
-    case TimewalkFitModel::Pol1:
-      return "pol1";
-    case TimewalkFitModel::LinExpPlateau:
-      return "lin-exp-plateau";
-    case TimewalkFitModel::Pol1Plateau:
-      return "pol1-plateau";
-    case TimewalkFitModel::InversePower:
-      return "inverse-power";
-  }
-  return "unknown";
-}
-
-TimewalkFitModel ParseTimewalkFitModel(const std::string &value)
-{
-  if (value == "pol1" || value == "linear") {
-    return TimewalkFitModel::Pol1;
-  }
-  if (value == "lin-exp-plateau" || value == "lin_exp_plateau" || value == "piecewise") {
-    return TimewalkFitModel::LinExpPlateau;
-  }
-  if (value == "pol1-plateau" || value == "pol1_plateau" || value == "linear-plateau" ||
-      value == "linear_plateau" || value == "piecewise-linear" || value == "piecewise_linear") {
-    return TimewalkFitModel::Pol1Plateau;
-  }
-  if (value == "inverse-power" || value == "inverse_power" || value == "power" || value == "threshold-power" ||
-      value == "threshold_power") {
-    return TimewalkFitModel::InversePower;
-  }
-  std::cerr << "Unknown timewalk fit model '" << value << "', using inverse-power" << std::endl;
-  return TimewalkFitModel::InversePower;
-}
-
 bool WantsHelp(const char *arg)
 {
   if (!arg) {
@@ -248,24 +217,9 @@ void PrintHelp()
             << "The PDF also includes per-channel leading-hit inter-arrival and ToT-vs-previous-hit diagnostics.\n";
 }
 
-bool IsLeadingTdc(int tdc)
-{
-  return (tdc & 0x1) == 0;
-}
-
-bool IsTrailingTdc(int tdc)
-{
-  return (tdc & 0x1) == 1;
-}
-
 bool IsValidTdcId(int tdc)
 {
   return tdc >= 0 && tdc <= 3;
-}
-
-int TdcPairIndex(int tdc)
-{
-  return tdc >> 1;
 }
 
 std::string SafeName(std::string value)
@@ -334,7 +288,7 @@ struct TdcSelection {
     if (selected < 0) {
       return true;
     }
-    return tdc == selected || tdc == (selected ^ 0x1);
+    return tdc == selected || tdc == GetTrailingPartner(selected);
   }
 
   std::string Description(const std::vector<int> &channels) const
@@ -1022,7 +976,7 @@ void ComputeTot(std::vector<Hit> &hits, double max_duration_ns)
       if (leading_index == std::numeric_limits<size_t>::max()) {
         continue;
       }
-      if (hit.tdc != (leading_tdc ^ 0x1)) {
+      if (hit.tdc != GetTrailingPartner(leading_tdc)) {
         continue;
       }
       const double dt = hit.time_ns_raw - hits[leading_index].time_ns_raw;
@@ -1222,6 +1176,8 @@ struct TimewalkCorrection {
     if (model == TimewalkFitModel::InversePower) {
       const double base = tot - p2;
       if (base <= 0.0 || p3 <= 0.0) {
+        // Outside the fitted inverse-power domain the correction is disabled,
+        // rather than extrapolated through the threshold singularity.
         return 0.0;
       }
       return p0 + p1 / std::pow(base, p3);
@@ -5217,7 +5173,7 @@ void laser_intensity_scan_rdf(const char *runlist_path = "help",
 	      const auto &correction = kv.second;
 	      TParameter<int>(("timewalk_corr_valid_ch" + std::to_string(ch)).c_str(), correction.valid ? 1 : 0).Write();
 	      TParameter<int>(("timewalk_corr_model_ch" + std::to_string(ch)).c_str(),
-	                      static_cast<int>(correction.model))
+	                      TimewalkFitModelId(correction.model))
 	          .Write();
 	      TParameter<double>(("timewalk_corr_p0_ch" + std::to_string(ch)).c_str(), correction.p0).Write();
 	      TParameter<double>(("timewalk_corr_p1_ch" + std::to_string(ch)).c_str(), correction.p1).Write();

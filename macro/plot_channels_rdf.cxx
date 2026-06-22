@@ -8,6 +8,7 @@
 #include <THStack.h>
 
 #include "analysis_io.h"
+#include "analysis_tdc.h"
 #include "analysis_time.h"
 
 #include <algorithm>
@@ -23,6 +24,11 @@
 #include <vector>
 
 namespace {
+using analysis_tdc::GetTrailingPartner;
+using analysis_tdc::IsLeadingTdc;
+using analysis_tdc::IsTrailingTdc;
+using analysis_tdc::TdcPairIndex;
+
 template <typename... Ts>
 void RunGraphsCompat(Ts &...results)
 {
@@ -124,24 +130,9 @@ void GridForCount(size_t count, int &cols, int &rows)
   rows = static_cast<int>(std::ceil(static_cast<double>(count) / cols));
 }
 
-bool IsLeadingTdc(int tdc)
-{
-  return (tdc & 0x1) == 0;
-}
-
-bool IsTrailingTdc(int tdc)
-{
-  return (tdc & 0x1) == 1;
-}
-
 bool IsValidTdcId(int tdc)
 {
   return tdc >= 0 && tdc <= 3;
-}
-
-int TdcPairIndex(int tdc)
-{
-  return tdc >> 1;
 }
 
 struct ScopedTimer {
@@ -484,7 +475,7 @@ struct PlotGroup {
         if (!have_leading[pair]) {
           continue;
         }
-        if (leading_tdc[pair] < 0 || hit.tdc != (leading_tdc[pair] ^ 0x1)) {
+        if (leading_tdc[pair] < 0 || hit.tdc != GetTrailingPartner(leading_tdc[pair])) {
           continue;
         }
         double dt_ns = hit.time_ns_raw - leading_time_ns[pair];

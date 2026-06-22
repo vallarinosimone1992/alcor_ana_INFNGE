@@ -33,6 +33,8 @@ inline double TickNs(double clock_mhz)
 
 inline Long64_t TimeTick(int rollover, int coarse)
 {
+  // Absolute coarse time in ALCOR clock ticks; calibrated fine time is applied
+  // later as a fractional-bin subtraction before conversion to ns.
   return static_cast<Long64_t>(rollover) * kRolloverToCoarse + static_cast<Long64_t>(coarse);
 }
 
@@ -258,6 +260,11 @@ struct ChannelTdcOffsetCalib {
       return false;
     }
     auto *hentries = dynamic_cast<TH2 *>(file->Get("hChannelTdcOffsetEntries"));
+    if (!hentries) {
+      std::cerr << "Warning: hChannelTdcOffset found in " << path
+                << " but companion hChannelTdcOffsetEntries is missing; channel/TDC offsets are disabled"
+                << std::endl;
+    }
     if (auto *p_ref = dynamic_cast<TParameter<int> *>(file->Get("channel_offset_ref_channel"))) {
       reference_channel = p_ref->GetVal();
     }

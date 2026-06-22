@@ -18,7 +18,9 @@
 #include <TTree.h>
 
 #include "analysis_io.h"
+#include "analysis_tdc.h"
 #include "analysis_time.h"
+#include "analysis_timewalk.h"
 
 #include <algorithm>
 #include <array>
@@ -39,6 +41,15 @@
 #include <vector>
 
 namespace {
+using analysis_tdc::GetTrailingPartner;
+using analysis_tdc::IsLeadingTdc;
+using analysis_tdc::IsTrailingTdc;
+using analysis_tdc::TdcPairIndex;
+using analysis_timewalk::TimewalkFitModel;
+using analysis_timewalk::TimewalkFitModelFromId;
+using analysis_timewalk::TimewalkFitModelId;
+using analysis_timewalk::TimewalkFitModelName;
+
 bool WantsHelp(const char *arg)
 {
   if (!arg) {
@@ -492,24 +503,9 @@ void GridForCount(size_t count, int &cols, int &rows)
   rows = static_cast<int>(std::ceil(static_cast<double>(count) / cols));
 }
 
-bool IsLeadingTdc(int tdc)
-{
-  return (tdc & 0x1) == 0;
-}
-
-bool IsTrailingTdc(int tdc)
-{
-  return (tdc & 0x1) == 1;
-}
-
 bool IsValidTdcId(int tdc)
 {
   return tdc >= 0 && tdc <= 3;
-}
-
-int TdcPairIndex(int tdc)
-{
-  return tdc >> 1;
 }
 
 struct ScopedTimer {
@@ -590,7 +586,7 @@ double ChannelMinDurationNs(const std::unordered_map<int, double> &per_channel_m
 
 struct TimewalkCorrection {
   bool valid = false;
-  int model = 0;
+  TimewalkFitModel model = TimewalkFitModel::Pol1;
   double p0 = 0.0;
   double p1 = 0.0;
   double p2 = 0.0;
@@ -603,19 +599,21 @@ struct TimewalkCorrection {
     if (!std::isfinite(tot)) {
       return 0.0;
     }
-    if (model == 1) {
+    if (model == TimewalkFitModel::LinExpPlateau) {
       if (tot <= p2 || p3 <= 0.0) {
         return p0 + p1 * tot;
       } else {
         return p4 + (p0 + p1 * p2 - p4) * std::exp(-(tot - p2) / p3);
       }
     }
-    if (model == 2) {
+    if (model == TimewalkFitModel::Pol1Plateau) {
       return p0 + p1 * std::min(tot, p2);
     }
-    if (model == 3) {
+    if (model == TimewalkFitModel::InversePower) {
       const double base = tot - p2;
       if (base <= 0.0 || p3 <= 0.0) {
+        // Keep the calibration domain explicit: below p2 the inverse-power
+        // model is not extrapolated and contributes no timewalk correction.
         return 0.0;
       }
       return p0 + p1 / std::pow(base, p3);
@@ -664,7 +662,15 @@ std::unordered_map<int, TimewalkCorrection> LoadTimewalkCorrections(const char *
     if (!ReadTParameter(*file, "timewalk_corr_valid_ch" + std::to_string(ch), valid) || valid == 0) {
       continue;
     }
-    ReadTParameter(*file, "timewalk_corr_model_ch" + std::to_string(ch), correction.model);
+    int model_id = TimewalkFitModelId(correction.model);
+    if (ReadTParameter(*file, "timewalk_corr_model_ch" + std::to_string(ch), model_id)) {
+      bool known_model = false;
+      correction.model = TimewalkFitModelFromId(model_id, &known_model);
+      if (!known_model) {
+        std::cout << "Warning: unknown timewalk model id " << model_id << " for ch" << ch
+                  << " in " << path << "; using pol1 compatibility fallback" << std::endl;
+      }
+    }
     if (!ReadTParameter(*file, "timewalk_corr_p0_ch" + std::to_string(ch), correction.p0) ||
         !ReadTParameter(*file, "timewalk_corr_p1_ch" + std::to_string(ch), correction.p1)) {
       continue;
@@ -673,16 +679,18 @@ std::unordered_map<int, TimewalkCorrection> LoadTimewalkCorrections(const char *
     ReadTParameter(*file, "timewalk_corr_p3_ch" + std::to_string(ch), correction.p3);
     ReadTParameter(*file, "timewalk_corr_p4_ch" + std::to_string(ch), correction.p4);
     if (!ReadTParameter(*file, "timewalk_corr_baseline_ch" + std::to_string(ch), correction.baseline)) {
-      if (correction.model == 1 || correction.model == 2) {
+      if (correction.model == TimewalkFitModel::LinExpPlateau ||
+          correction.model == TimewalkFitModel::Pol1Plateau) {
         correction.baseline = correction.p4;
-      } else if (correction.model == 3) {
+      } else if (correction.model == TimewalkFitModel::InversePower) {
         correction.baseline = correction.p0;
       }
     }
     correction.valid = true;
     corrections[ch] = correction;
 
-    std::cout << "Loaded timewalk correction ch" << ch << " model=" << correction.model << " p0="
+    std::cout << "Loaded timewalk correction ch" << ch << " model=" << TimewalkFitModelName(correction.model)
+              << " id=" << TimewalkFitModelId(correction.model) << " p0="
               << correction.p0 << " p1=" << correction.p1 << " p2=" << correction.p2 << " p3="
               << correction.p3 << " p4=" << correction.p4 << " baseline=" << correction.baseline << std::endl;
   }
@@ -813,7 +821,7 @@ DurationInfo ComputeDurationInfo(const std::vector<Hit> &hits,
       if (!have_leading[pair]) {
         continue;
       }
-      if (leading_tdc[pair] < 0 || edge.tdc != (leading_tdc[pair] ^ 0x1)) {
+      if (leading_tdc[pair] < 0 || edge.tdc != GetTrailingPartner(leading_tdc[pair])) {
         continue;
       }
       double dt_ns = time_ns - leading_time_ns[pair];

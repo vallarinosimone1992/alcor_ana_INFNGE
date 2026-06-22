@@ -74,6 +74,15 @@ need_arg() {
   fi
 }
 
+reject_directory_output() {
+  local option="$1"
+  local path="$2"
+  if [[ "${path}" == */ ]] || [ -d "${path}" ]; then
+    echo "${option} expects a file path, not a directory: ${path}" >&2
+    exit 1
+  fi
+}
+
 channels_to_csv() {
   local value="$1"
   python3 - "${value}" <<'PY'
@@ -127,19 +136,23 @@ while [ "$#" -gt 0 ]; do
     -o|--output)
       need_arg "$@"
       out_root=${2:-}
+      reject_directory_output "$1" "${out_root}"
       shift 2
       ;;
     --output=*)
       out_root=${1#*=}
+      reject_directory_output "--output" "${out_root}"
       shift
       ;;
     -P|--pdf)
       need_arg "$@"
       out_pdf=${2:-}
+      reject_directory_output "$1" "${out_pdf}"
       shift 2
       ;;
     --pdf=*)
       out_pdf=${1#*=}
+      reject_directory_output "--pdf" "${out_pdf}"
       shift
       ;;
     --skip-logbook-check)

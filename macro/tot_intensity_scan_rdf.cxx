@@ -10,6 +10,7 @@
 #include <TStyle.h>
 
 #include "analysis_io.h"
+#include "analysis_tdc.h"
 #include "analysis_time.h"
 
 #include <algorithm>
@@ -26,6 +27,10 @@
 #include <vector>
 
 namespace {
+using analysis_tdc::GetTrailingPartner;
+using analysis_tdc::IsLeadingTdc;
+using analysis_tdc::IsTrailingTdc;
+
 bool WantsHelp(const char *arg)
 {
   if (!arg) {
@@ -135,16 +140,6 @@ struct Hit {
   double time_ns = 0.0;
 };
 
-bool IsLeading(int tdc)
-{
-  return (tdc & 1) == 0;
-}
-
-bool IsTrailing(int tdc)
-{
-  return (tdc & 1) == 1;
-}
-
 std::vector<double> ExtractTot(const RunEntry &entry,
                                int channel,
                                const analysis_time::FineCalib &fine_calib,
@@ -229,10 +224,10 @@ std::vector<double> ExtractTot(const RunEntry &entry,
   std::vector<double> tots;
   std::vector<char> used(hits.size(), 0);
   for (size_t i = 0; i < hits.size(); ++i) {
-    if (!IsLeading(hits[i].tdc)) {
+    if (!IsLeadingTdc(hits[i].tdc)) {
       continue;
     }
-    const int trailing_tdc = hits[i].tdc ^ 1;
+    const int trailing_tdc = GetTrailingPartner(hits[i].tdc);
     for (size_t j = i + 1; j < hits.size(); ++j) {
       if (hits[j].spill != hits[i].spill) {
         break;
@@ -244,7 +239,7 @@ std::vector<double> ExtractTot(const RunEntry &entry,
       if (max_duration_ns > 0.0 && dt > max_duration_ns) {
         break;
       }
-      if (used[j] || !IsTrailing(hits[j].tdc) || hits[j].tdc != trailing_tdc) {
+      if (used[j] || !IsTrailingTdc(hits[j].tdc) || hits[j].tdc != trailing_tdc) {
         continue;
       }
       used[j] = 1;

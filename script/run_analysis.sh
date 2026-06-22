@@ -14,7 +14,8 @@ Options:
   -c, --config FILE       JSON analysis config (default: config/analysis.json)
   -l, --logbook FILE      JSON logbook (default: config/logbook.json)
       --channels LIST     override active channels (default: config/logbook)
-  -o, --output-prefix STR output prefix (default: derived from input run)
+  -o, --output STR        output basename/path (default: output/<input run>)
+      --output-prefix STR compatibility alias for --output
   -k, --tdc-calib FILE    TDC calibration ROOT file with fine timing and channel/TDC offsets
                            (default: calibration/TDC_calibration.root)
       --calib FILE        alias for --tdc-calib
@@ -47,7 +48,7 @@ input=""
 config_file="${qa_dir}/config/analysis.json"
 logbook="$(logbook_default_path)"
 channels_override=""
-output_prefix=""
+output_target=""
 tdc_calib="${qa_dir}/calibration/TDC_calibration.root"
 timewalk_calib=""
 timewalk_set=0
@@ -113,13 +114,13 @@ while [ "$#" -gt 0 ]; do
       channels_override=${1#*=}
       shift
       ;;
-    -o|--output-prefix)
+    -o|--output|--output-prefix)
       need_arg "$@"
-      output_prefix=${2:-}
+      output_target=${2:-}
       shift 2
       ;;
-    --output-prefix=*)
-      output_prefix=${1#*=}
+    --output=*|--output-prefix=*)
+      output_target=${1#*=}
       shift
       ;;
     -k|--tdc-calib|--calib)
@@ -278,17 +279,59 @@ derive_output_base() {
   echo "${token}"
 }
 
+strip_output_extension() {
+  local name="$1"
+  case "${name}" in
+    *.pdf|*.root|*.txt)
+      name="${name%.*}"
+      ;;
+  esac
+  printf '%s\n' "${name}"
+}
+
+resolve_output_target() {
+  local target="$1"
+  local default_prefix="$2"
+
+  if [ -z "${target}" ]; then
+    output_dir="${qa_dir}/output"
+    output_prefix="${default_prefix}"
+    return
+  fi
+
+  if [[ "${target}" == */ ]] || [ -d "${target}" ]; then
+    output_dir="${target%/}"
+    output_prefix="${default_prefix}"
+    return
+  fi
+
+  local dir
+  local base
+  dir="$(dirname "${target}")"
+  base="$(basename "${target}")"
+  base="$(strip_output_extension "${base}")"
+  if [ -z "${base}" ] || [ "${base}" = "." ]; then
+    echo "Invalid output target: ${target}" >&2
+    exit 1
+  fi
+  output_prefix="${base}"
+  if [ "${dir}" = "." ]; then
+    output_dir="${qa_dir}/output"
+  else
+    output_dir="${dir}"
+  fi
+}
+
 run="$(logbook_run_from_path "${input}")"
 logbook_channels=""
 if [ -f "${logbook}" ] && logbook_has_run "${logbook}" "${run}"; then
   logbook_channels="$(logbook_channels_csv "${logbook}" "${run}")"
 fi
 
-if [ -z "${output_prefix}" ]; then
-  output_prefix="$(derive_output_base "${input}")"
-fi
-output_prefix="${output_prefix%.pdf}"
-output_dir="${qa_dir}/output"
+default_output_prefix="$(derive_output_base "${input}")"
+output_dir=""
+output_prefix=""
+resolve_output_target "${output_target}" "${default_output_prefix}"
 tmp_dir="${output_dir}/.analysis_tmp"
 mkdir -p "${output_dir}" "${tmp_dir}"
 
@@ -397,6 +440,8 @@ echo "== Coincidence config: ${config_file}"
 echo "== Generated coincidence file: ${pairs_file}"
 echo "== TDC calibration: ${tdc_calib}"
 echo "== Timewalk calibration: ${timewalk_calib:-disabled}"
+echo "== Output directory: ${output_dir}"
+echo "== Output prefix: ${output_prefix}"
 
 if [ "${dry_run}" -eq 1 ]; then
   if [ "${coincidence_only}" -eq 0 ]; then

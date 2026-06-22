@@ -17,6 +17,7 @@
 
 #include "analysis_io.h"
 #include "analysis_events.h"
+#include "analysis_tdc.h"
 #include "analysis_time.h"
 
 #include <algorithm>
@@ -37,6 +38,11 @@
 #include <vector>
 
 namespace {
+using analysis_tdc::GetTrailingPartner;
+using analysis_tdc::IsLeadingTdc;
+using analysis_tdc::IsTrailingTdc;
+using analysis_tdc::TdcPairIndex;
+
 bool WantsHelp(const char *arg)
 {
   if (!arg) {
@@ -64,21 +70,6 @@ struct ScopedTimer {
 bool HasBranch(const std::vector<std::string> &cols, const std::string &name)
 {
   return std::find(cols.begin(), cols.end(), name) != cols.end();
-}
-
-bool IsLeadingTdc(int tdc)
-{
-  return (tdc & 0x1) == 0;
-}
-
-bool IsTrailingTdc(int tdc)
-{
-  return (tdc & 0x1) == 1;
-}
-
-int TdcPairIndex(int tdc)
-{
-  return tdc >> 1;
 }
 
 uint64_t RunSpillKey(int run_id, int spill)
@@ -1190,7 +1181,7 @@ void fine_calibration_rdf(const char *input = "../data/calibration",
         if (!have_leading[pair]) {
           continue;
         }
-        if (leading_tdc[pair] < 0 || edge.tdc != (leading_tdc[pair] ^ 0x1)) {
+        if (leading_tdc[pair] < 0 || edge.tdc != GetTrailingPartner(leading_tdc[pair])) {
           continue;
         }
         double dt_ns = time_ns - leading_time_ns[pair];

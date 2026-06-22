@@ -52,6 +52,8 @@ std::vector<Event> BuildReferenceEvents(const std::vector<Hit> &hits,
                                         bool signed_window,
                                         bool one_hit_per_channel = true)
 {
+  // Callers must pass hits from one run/spill. This helper sorts only by time
+  // and does not protect against accidental cross-spill event construction.
   std::vector<Event> events;
   if (hits.empty() || reference_indices.empty() || candidate_indices.empty() || event_window_ns <= 0.0) {
     return events;
@@ -205,6 +207,8 @@ std::vector<Event> BuildClusterEvents(const std::vector<Hit> &hits,
                                       double event_window_ns,
                                       int min_channels)
 {
+  // Event clusters are bounded relative to the first hit in the cluster, not by
+  // a sliding nearest-neighbor chain. This matches the coincidence-window use.
   std::vector<Event> events;
   if (hits.empty() || candidate_indices.empty() || event_window_ns <= 0.0) {
     return events;

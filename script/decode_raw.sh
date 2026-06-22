@@ -122,6 +122,9 @@ fail_or_continue() {
   if [ "${keep_going}" = false ]; then
     exit "${status}"
   fi
+  if [ "${status}" -ne 0 ]; then
+    status=1
+  fi
 }
 
 run_decoder() {

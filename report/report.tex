@@ -65,11 +65,11 @@ By default \(t_\mathrm{ref}\) is the cleaned channel-22 laser trigger; \texttt{-
 \[
   t_\mathrm{TW} = t - f_\mathrm{ch}(\mathrm{ToT}).
 \]
-This aligns the corrected sensor time to the chosen reference. The default model is \texttt{pol1-plateau}:
+This aligns the corrected sensor time to the chosen reference. The default model is now \texttt{inverse-power}:
 \[
-  f(\mathrm{ToT}) = p_0 + p_1 \min(\mathrm{ToT}, x_0).
+  f(\mathrm{ToT}) = p_0 + \frac{p_1}{(\mathrm{ToT}-p_2)^{p_3}} .
 \]
-The alternatives are \texttt{pol1} and \texttt{lin-exp-plateau}.
+Here \(p_0\) is the asymptotic plateau, \(p_1\) is the amplitude, \(p_2\) is an effective threshold shift, and \(p_3\) is a free exponent. The macro fills a raw TH2D \(\Delta t\) vs ToT, builds a TProfile along ToT, and fits the TProfile. If the free-exponent fit fails or has poor covariance quality, it retries with \(p_3=1\). The older \texttt{pol1}, \texttt{pol1-plateau}, and \texttt{lin-exp-plateau} models remain selectable for comparison.
 
 Basic command:
 \begin{verbatim}
@@ -91,11 +91,11 @@ It produces \texttt{calibration/timewalk\_correction.root}. The macro applies th
   \item TDC selection: \texttt{--tdc-selection 0} or \texttt{--tdc-selection 17:0,19:2,22:0}; the leading TDC is selected while the trailing partner is kept for ToT.
   \item Per-channel ToT window: \texttt{--channel-tot-window CH:MIN:MAX[,CH:MIN:MAX]}.
   \item Diagonal \(\Delta t\)/ToT cut: \texttt{--dt-tot-cut CH:DT0:SLOPE[:TOT\_MIN:TOT\_MAX]}. With the default \texttt{--dt-tot-cut-direction below}, the accepted region is \(\Delta t \le DT0 + SLOPE\cdot\mathrm{ToT}\); \texttt{above} keeps the opposite side.
-  \item Timewalk fit: \texttt{--timewalk-fit-ranges CH:MIN:MAX[,CH:MIN:MAX]} limits the TProfile points used by the fit; \texttt{--timewalk-fit-model} selects \texttt{pol1}, \texttt{pol1-plateau}, or \texttt{lin-exp-plateau}.
+  \item Timewalk fit: \texttt{--timewalk-fit-ranges CH:MIN:MAX[,CH:MIN:MAX]} limits the TProfile points used by the fit; default \texttt{17:10:30,19:10:30}. \texttt{--timewalk-fit-model} selects \texttt{inverse-power}, \texttt{pol1}, \texttt{pol1-plateau}, or \texttt{lin-exp-plateau}.
   \item Final analysis: \texttt{run\_analysis.sh} applies TDC/offset calibration with \texttt{-k calibration/TDC\_calibration.root}; it applies timewalk with \texttt{--timewalk-calib FILE}, or automatically if \texttt{calibration/timewalk\_correction.root} exists. \texttt{--window}, \texttt{-d}, \texttt{--min-duration}, and \texttt{--fine-cut} remain operational overrides.
 \end{itemize}
 
 \section*{Minimal Diagnostics}
-In the timewalk PDF, TH2 maps and TProfiles are printed on separate pages: use TH2 maps to inspect populations and cuts, and TProfiles to inspect the fit. The coincidence peak for the first sensor pair, normally 17--19, is saved before and after timewalk (\texttt{h\_dt\_uncorr\_*}, \texttt{h\_dt\_corr\_*}) and overlaid in a \texttt{THStack} in the PDF.
+In the timewalk PDF, TH2 maps and TProfiles are printed on separate pages: use TH2 maps to inspect populations and cuts, and TProfiles to inspect the fit. The ROOT output stores the raw TH2D, TProfile, TF1 fit, corrected TH2D, and \(\Delta t\) projections before/after correction. The coincidence peak for the first sensor pair, normally 17--19, is saved before and after timewalk (\texttt{h\_dt\_uncorr\_*}, \texttt{h\_dt\_corr\_*}) and overlaid in a \texttt{THStack} in the PDF.
 
 \end{document}
