@@ -16,7 +16,7 @@ void Usage(const char *program)
             << " TRIGGER_TOT_WINDOW SPILL_RANGE CHANNEL_TOT_WINDOWS EDGE_SPILL"
             << " EDGE_CHANNELS EDGE_PHASE_PERIOD_NS EDGE_SPILL_FRACTION"
             << " TDC_SELECTION REFERENCE_MODE REFERENCE_MIN_CHANNELS"
-            << " EVENT_WINDOW_NS DT_TOT_CUT_DIRECTION\n";
+            << " EVENT_WINDOW_NS DT_TOT_CUT_DIRECTION OPMODE SENSOR_DURATION_NS\n";
 }
 
 bool ToBool(const char *value)
@@ -27,7 +27,7 @@ bool ToBool(const char *value)
 
 int main(int argc, char **argv)
 {
-  if (argc != 35) {
+  if (argc != 37) {
     Usage(argv[0]);
     return 2;
   }
@@ -66,7 +66,9 @@ int main(int argc, char **argv)
                              argv[31],
                              std::stoi(argv[32]),
                              std::stod(argv[33]),
-                             argv[34]);
+                             argv[34],
+                             argv[35],
+                             std::stod(argv[36]));
   } catch (const std::exception &error) {
     std::cerr << "run_timewalk_calibration_main: " << error.what() << std::endl;
     return 1;
