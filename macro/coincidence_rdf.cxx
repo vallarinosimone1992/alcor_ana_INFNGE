@@ -856,6 +856,13 @@ struct PairConfig {
   std::unique_ptr<TH2D> hist_dt_fine_coinc_b_tdc2;
   std::array<std::unique_ptr<TH2D>, 4> hist_tot_fine_a{};
   std::array<std::unique_ptr<TH2D>, 4> hist_tot_fine_b{};
+  std::unique_ptr<TH2D> hist_dt_slew_avg;
+  std::unique_ptr<TH2D> hist_dt_slew_a;
+  std::unique_ptr<TH2D> hist_dt_slew_b;
+  // Wide-range (whole search window) versions of the per-channel dt-vs-slew
+  // plots, so the coincidence peak can be seen against the full search window.
+  std::unique_ptr<TH2D> hist_dt_slew_a_wide;
+  std::unique_ptr<TH2D> hist_dt_slew_b_wide;
   std::vector<char> coincident_hits;
 };
 
@@ -1445,6 +1452,22 @@ void ProcessSpill(std::unordered_map<int, std::vector<HitRef>> &hits_by_channel,
               }
             }
           }
+          if (pair.hist_dt_slew_a_wide || pair.hist_dt_slew_b_wide) {
+            const size_t idx_a = times_a[i].index;
+            const size_t idx_b = times_b[k].index;
+            if (idx_a < hits.size() && idx_b < hits.size() &&
+                idx_a < tot_per_hit.size() && idx_b < tot_per_hit.size()) {
+              const double dt_ab = t - times_b[k].time_ns;  // t_chA - t_chB
+              const double slew_a = tot_per_hit[idx_a];
+              const double slew_b = tot_per_hit[idx_b];
+              if (slew_a > 0.0 && pair.hist_dt_slew_a_wide) {
+                pair.hist_dt_slew_a_wide->Fill(slew_a, dt_ab);
+              }
+              if (slew_b > 0.0 && pair.hist_dt_slew_b_wide) {
+                pair.hist_dt_slew_b_wide->Fill(slew_b, dt_ab);
+              }
+            }
+          }
           ++k;
         }
       }
@@ -1504,6 +1527,22 @@ void ProcessSpill(std::unordered_map<int, std::vector<HitRef>> &hits_by_channel,
               if (hist_b) {
                 hist_b->Fill(hits[idx_b].fine, tot_b);
               }
+            }
+          }
+        }
+        if (pair.hist_dt_slew_avg || pair.hist_dt_slew_a || pair.hist_dt_slew_b) {
+          if (idx_valid && idx_a < tot_per_hit.size() && idx_b < tot_per_hit.size()) {
+            const double dt_ab = t - times_b[k].time_ns;  // t_chA - t_chB
+            const double slew_a = tot_per_hit[idx_a];
+            const double slew_b = tot_per_hit[idx_b];
+            if (slew_a > 0.0 && pair.hist_dt_slew_a) {
+              pair.hist_dt_slew_a->Fill(slew_a, dt_ab);
+            }
+            if (slew_b > 0.0 && pair.hist_dt_slew_b) {
+              pair.hist_dt_slew_b->Fill(slew_b, dt_ab);
+            }
+            if (slew_a > 0.0 && slew_b > 0.0 && pair.hist_dt_slew_avg) {
+              pair.hist_dt_slew_avg->Fill(0.5 * (slew_a + slew_b), dt_ab);
             }
           }
         }
@@ -2610,6 +2649,21 @@ void WriteCoincidenceRoot(const char *out_root,
         hist->Write();
       }
     }
+    if (pair.hist_dt_slew_avg) {
+      pair.hist_dt_slew_avg->Write();
+    }
+    if (pair.hist_dt_slew_a) {
+      pair.hist_dt_slew_a->Write();
+    }
+    if (pair.hist_dt_slew_b) {
+      pair.hist_dt_slew_b->Write();
+    }
+    if (pair.hist_dt_slew_a_wide) {
+      pair.hist_dt_slew_a_wide->Write();
+    }
+    if (pair.hist_dt_slew_b_wide) {
+      pair.hist_dt_slew_b_wide->Write();
+    }
   }
   if (pair_mean_hist) {
     pair_mean_hist->Write();
@@ -2973,6 +3027,80 @@ void coincidence_rdf(const char *decoded_dir = "../raw_data/latest/kc705-196/dec
         }
       }
     }
+
+    if (max_duration_ns > 0.0) {
+      int slew_bins = static_cast<int>(std::ceil(max_duration_ns * 4.0));
+      if (slew_bins < 20) {
+        slew_bins = 20;
+      }
+      if (slew_bins > 400) {
+        slew_bins = 400;
+      }
+      struct SlewSpec {
+        std::unique_ptr<TH2D> *dest;
+        std::string suffix;
+        std::string source;
+      };
+      SlewSpec slew_specs[] = {
+          {&pair.hist_dt_slew_avg, "avg",
+           "mean(ch" + std::to_string(pair.channel_a) + ",ch" + std::to_string(pair.channel_b) + ")"},
+          {&pair.hist_dt_slew_a, "a", "ch" + std::to_string(pair.channel_a)},
+          {&pair.hist_dt_slew_b, "b", "ch" + std::to_string(pair.channel_b)},
+      };
+      for (const auto &spec : slew_specs) {
+        std::ostringstream title_slew;
+        title_slew << "ch " << pair.channel_a << " vs " << pair.channel_b
+                   << " (#Deltat vs slew " << spec.source << ", coinc window " << pair.window_ns << " ns);"
+                   << "slew (" << spec.source << ") [ns]; t_ch" << pair.channel_a << " - t_ch"
+                   << pair.channel_b << " [ns]; pairs";
+        std::string name_slew = "h_dt_slew_ch" + std::to_string(pair.channel_a) + "_ch" +
+                                std::to_string(pair.channel_b) + "_" + spec.suffix;
+        auto hist_slew = std::make_unique<TH2D>(name_slew.c_str(),
+                                                title_slew.str().c_str(),
+                                                slew_bins,
+                                                0.0,
+                                                max_duration_ns,
+                                                bins,
+                                                -hist_window_ns,
+                                                hist_window_ns);
+        hist_slew->SetDirectory(nullptr);
+        *spec.dest = std::move(hist_slew);
+      }
+
+      // Wide-range companions: same slew (x) binning, but dt (y) spans the whole
+      // search window (+/- kWideDtNs) so the coincidence peak is visible against
+      // the full background. Mean-slew version is intentionally omitted.
+      const double kWideDtNs = 100.0;
+      const int wide_dt_bins = 400;  // 0.5 ns bins over +/- 100 ns
+      struct SlewWideSpec {
+        std::unique_ptr<TH2D> *dest;
+        std::string suffix;
+        std::string source;
+      };
+      SlewWideSpec slew_wide_specs[] = {
+          {&pair.hist_dt_slew_a_wide, "a", "ch" + std::to_string(pair.channel_a)},
+          {&pair.hist_dt_slew_b_wide, "b", "ch" + std::to_string(pair.channel_b)},
+      };
+      for (const auto &spec : slew_wide_specs) {
+        std::ostringstream title_slew;
+        title_slew << "ch " << pair.channel_a << " vs " << pair.channel_b
+                   << " (#Deltat vs slew " << spec.source << ", search window #pm" << kWideDtNs << " ns);"
+                   << "slew (" << spec.source << ") [ns]; t_ch" << pair.channel_a << " - t_ch"
+                   << pair.channel_b << " [ns]; pairs";
+        std::string name_slew = "h_dt_slew_wide_ch" + std::to_string(pair.channel_a) + "_ch" +
+                                std::to_string(pair.channel_b) + "_" + spec.suffix;
+        auto hist_slew = std::make_unique<TH2D>(name_slew.c_str(),
+                                                title_slew.str().c_str(),
+                                                slew_bins,
+                                                0.0,
+                                                max_duration_ns,
+                                                wide_dt_bins,
+                                                -kWideDtNs,
+                                                kWideDtNs);
+        hist_slew->SetDirectory(nullptr);
+        *spec.dest = std::move(hist_slew);
+      }
+    }
   }
 
   InitGroupHists(groups);
@@ -3056,16 +3184,22 @@ void coincidence_rdf(const char *decoded_dir = "../raw_data/latest/kc705-196/dec
   std::vector<CoincPlotSet> pair_plot_sets = InitStreamingCoincidentPlotSets(pairs, max_duration_ns);
   PreviewStore preview(static_cast<size_t>(preview_hits));
 
-  std::vector<TreeCursor> cursors;
+  // NOTE: OpenTreeCursor binds TTree branch addresses to the TreeCursor's
+  // members via SetBranchAddress(&cursor.<field>). Those pointers must remain
+  // valid for the lifetime of the read, so the TreeCursor objects must never
+  // move. We therefore store them as heap-allocated objects with stable
+  // addresses (a plain std::vector<TreeCursor> would invalidate the bound
+  // pointers on push_back/move, freezing every hit at the first read's values).
+  std::vector<std::unique_ptr<TreeCursor>> cursors;
   cursors.reserve(input_spec.files.size());
   for (const auto &file : input_spec.files) {
-    TreeCursor cursor;
+    auto cursor_ptr = std::make_unique<TreeCursor>();
+    TreeCursor &cursor = *cursor_ptr;
     if (!OpenTreeCursor(file, input_spec.tree_name, cursor)) {
       return;
     }
-    cursors.push_back(std::move(cursor));
-    BindTreeCursorBranches(cursors.back());
-    AdvanceCursor(cursors.back(), channels, fine_calib, tdc_offset_calib, tick_ns, use_fine, fine_cut);
+    AdvanceCursor(cursor, channels, fine_calib, tdc_offset_calib, tick_ns, use_fine, fine_cut);
+    cursors.push_back(std::move(cursor_ptr));
   }
 
   long long selected_hits = 0;
@@ -3075,7 +3209,8 @@ void coincidence_rdf(const char *decoded_dir = "../raw_data/latest/kc705-196/dec
   while (true) {
     bool found = false;
     uint64_t min_key = std::numeric_limits<uint64_t>::max();
-    for (const auto &cursor : cursors) {
+    for (const auto &cursor_ptr : cursors) {
+      const TreeCursor &cursor = *cursor_ptr;
       if (!cursor.has_pending) {
         continue;
       }
@@ -3090,7 +3225,8 @@ void coincidence_rdf(const char *decoded_dir = "../raw_data/latest/kc705-196/dec
     }
 
     std::vector<Hit> spill_hits;
-    for (auto &cursor : cursors) {
+    for (auto &cursor_ptr : cursors) {
+      TreeCursor &cursor = *cursor_ptr;
       while (cursor.has_pending && HitRunSpillKey(cursor.pending) == min_key) {
         spill_hits.push_back(cursor.pending);
         AdvanceCursor(cursor, channels, fine_calib, tdc_offset_calib, tick_ns, use_fine, fine_cut);
@@ -3355,6 +3491,41 @@ void coincidence_rdf(const char *decoded_dir = "../raw_data/latest/kc705-196/dec
         }
       }
       c_tot_b.Print(out_pdf);
+    }
+
+    // Per-channel dt-vs-slew within the coincidence window. The mean-slew
+    // (avg) panel is intentionally not drawn.
+    if (pair.hist_dt_slew_a || pair.hist_dt_slew_b) {
+      TCanvas c_slew("c_dt_slew", "c_dt_slew", 1200, 600);
+      c_slew.Divide(2, 1, 0.001, 0.001);
+      TH2D *slew_hists[] = {pair.hist_dt_slew_a.get(), pair.hist_dt_slew_b.get()};
+      for (int s = 0; s < 2; ++s) {
+        c_slew.cd(s + 1);
+        gPad->SetLogz(1);
+        gPad->SetRightMargin(0.14);
+        if (slew_hists[s]) {
+          slew_hists[s]->Draw("COLZ");
+        }
+      }
+      c_slew.Print(out_pdf);
+    }
+
+    // Same per-channel dt-vs-slew but over the whole search window (+/-100 ns),
+    // so the coincidence peak can be seen against the full background.
+    if (pair.hist_dt_slew_a_wide || pair.hist_dt_slew_b_wide) {
+      TCanvas c_slew_wide("c_dt_slew_wide", "c_dt_slew_wide", 1200, 600);
+      c_slew_wide.Divide(2, 1, 0.001, 0.001);
+      TH2D *slew_hists_wide[] = {pair.hist_dt_slew_a_wide.get(),
+                                 pair.hist_dt_slew_b_wide.get()};
+      for (int s = 0; s < 2; ++s) {
+        c_slew_wide.cd(s + 1);
+        gPad->SetLogz(1);
+        gPad->SetRightMargin(0.14);
+        if (slew_hists_wide[s]) {
+          slew_hists_wide[s]->Draw("COLZ");
+        }
+      }
+      c_slew_wide.Print(out_pdf);
     }
   }
   if (pair_mean_hist) {

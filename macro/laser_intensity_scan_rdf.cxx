@@ -180,6 +180,108 @@ std::string DtAxisTitle(TimeReferenceMode mode, int trigger_channel)
   return DtExpressionTitle(mode, trigger_channel) + " [ns]";
 }
 
+std::string TimewalkFitModelName(TimewalkFitModel model)
+{
+  switch (model) {
+    case TimewalkFitModel::Pol1:
+      return "pol1";
+    case TimewalkFitModel::LinExpPlateau:
+      return "lin-exp-plateau";
+    case TimewalkFitModel::Pol1Plateau:
+      return "pol1-plateau";
+  }
+  return "unknown";
+}
+
+TimewalkFitModel ParseTimewalkFitModel(const std::string &value)
+{
+  if (value == "pol1" || value == "linear") {
+    return TimewalkFitModel::Pol1;
+  }
+  if (value == "lin-exp-plateau" || value == "lin_exp_plateau" || value == "piecewise") {
+    return TimewalkFitModel::LinExpPlateau;
+  }
+  if (value == "pol1-plateau" || value == "pol1_plateau" || value == "linear-plateau" ||
+      value == "linear_plateau" || value == "piecewise-linear" || value == "piecewise_linear") {
+    return TimewalkFitModel::Pol1Plateau;
+  }
+  std::cerr << "Unknown timewalk fit model '" << value << "', using pol1-plateau" << std::endl;
+  return TimewalkFitModel::Pol1Plateau;
+}
+
+// ALCOR channels can run in ToT mode (TDC-even/TDC-odd = rising/falling edge of
+// one threshold) or Slew-Rate (SR) mode (TDC-even/TDC-odd = rising edge of the
+// first/second threshold). Both couple TDC0/TDC1 and TDC2/TDC3 identically, so
+// the leading/trailing pairing logic is unaffected, but the resulting dt is a
+// rise-time/slew proxy rather than a pulse-width ToT and typically shrinks
+// (rather than grows) with pulse amplitude. This only changes how the
+// quantity is labeled in plots/summaries below.
+enum class TdcOperatingMode {
+  Tot,
+  SlewRate,
+};
+
+std::string TdcOperatingModeName(TdcOperatingMode mode)
+{
+  return mode == TdcOperatingMode::SlewRate ? "slew-rate" : "tot";
+}
+
+TdcOperatingMode ParseTdcOperatingMode(const std::string &value)
+{
+  if (value == "slew-rate" || value == "slew_rate" || value == "slew" || value == "sr") {
+    return TdcOperatingMode::SlewRate;
+  }
+  if (!value.empty() && value != "tot") {
+    std::cerr << "Unknown TDC operating mode '" << value << "', using tot" << std::endl;
+  }
+  return TdcOperatingMode::Tot;
+}
+
+std::string g_tot_quantity_label = "ToT";
+std::string g_tot_axis_label = "ToT [ns]";
+TdcOperatingMode g_tdc_operating_mode = TdcOperatingMode::Tot;
+
+void ConfigureTotLabels(TdcOperatingMode mode)
+{
+  g_tdc_operating_mode = mode;
+  if (mode == TdcOperatingMode::SlewRate) {
+    g_tot_quantity_label = "slew dt";
+    g_tot_axis_label = "slew #Deltat [ns]";
+  } else {
+    g_tot_quantity_label = "ToT";
+    g_tot_axis_label = "ToT [ns]";
+  }
+}
+
+// Slew-rate dt is a rise-time proxy that is typically much smaller than the
+// booked [0, max_duration_ns] axis range (which is tuned for ToT pulse widths),
+// so the populated region can be a tiny sliver of the plotted range. Zoom the
+// given axis to the histogram's actual non-empty range (with padding) so the
+// plotted data is visible; a no-op in ToT mode where the booked range already
+// roughly matches the data.
+void AutoZoomTotAxis(TH1 *hist, TAxis *axis, int axis_num)
+{
+  if (g_tdc_operating_mode != TdcOperatingMode::SlewRate) {
+    return;
+  }
+  if (!hist || !axis || hist->GetEntries() <= 0.0) {
+    return;
+  }
+  const int first = hist->FindFirstBinAbove(0.0, axis_num);
+  const int last = hist->FindLastBinAbove(0.0, axis_num);
+  if (first < 1 || last < first) {
+    return;
+  }
+  double lo = axis->GetBinLowEdge(first);
+  double hi = axis->GetBinUpEdge(last);
+  const double pad = std::max(0.08 * (hi - lo), 0.05);
+  lo = std::max(axis->GetXmin(), lo - pad);
+  hi = std::min(axis->GetXmax(), hi + pad);
+  if (hi > lo) {
+    axis->SetRangeUser(lo, hi);
+  }
+}
+
 bool WantsHelp(const char *arg)
 {
   if (!arg) {
@@ -201,6 +303,11 @@ void PrintHelp()
             << "Event-median reference can be selected explicitly with reference_mode=\"event-median\".\n"
             << "event_window_ns=0 uses match_window_ns for event building.\n"
             << "Timewalk corrections are fitted from t_sensor - t_reference versus sensor ToT.\n"
+            << "opmode_name selects the ALCOR pixel TDC mode: \"tot\" (default, pulse width) or\n"
+            << "\"slew-rate\" (TDC-even/TDC-odd dt is the inter-threshold rise time, not pulse width).\n"
+            << "This only changes plot/summary labeling (\"ToT\" -> \"slew dt\"); leading/trailing TDC\n"
+            << "pairing is identical in both modes. Pass fit ranges/ToT windows explicitly for\n"
+            << "slew-rate data since defaults below are tuned for ToT-mode amplitude scaling.\n"
             << "Runlist TSV columns: run_label, input_path, intensity, channels, thresholds, spill, vbias, note\n"
             << "input_path can be a decoded dir, run dir, or parent dir accepted by analysis_io::ResolveInputSpec.\n"
             << "Optional dt/ToT cuts use CH:DT0:SLOPE[:TOT_MIN:TOT_MAX]; direction below keeps dt <= line.\n"
@@ -210,7 +317,10 @@ void PrintHelp()
             << "Optional leading TDC selection uses TDC or CH:TDC CSV, e.g. 0 or 17:0,19:2,22:0.\n"
             << "  Only leading TDC 0 or 2 is accepted; the trailing partner is kept for ToT.\n"
             << "Trigger veto/dead-time is applied after an accepted trigger; default is 0 ns.\n"
-            << "Timewalk fit models: pol1, pol1-plateau, lin-exp-plateau, inverse-power.\n"
+            << "sensor_duration_ns sets the x-axis maximum of sensor dt-vs-ToT histograms independently\n"
+            << "  of max_duration_ns (which must stay large enough to cover the trigger channel ToT).\n"
+            << "  Default 0 uses max_duration_ns. Useful in slew-rate mode where sensor slew-dt << ToT.\n"
+            << "Timewalk fit models: pol1, pol1-plateau, lin-exp-plateau.\n"
             << "Optional edge diagnostic spill uses -1 for the first selected spill.\n"
             << "Optional edge diagnostic channels use all, analysis, or a CSV list.\n"
             << "Optional edge diagnostic fraction is the initial spill fraction to plot, default 0.01.\n"
@@ -1311,7 +1421,7 @@ std::unique_ptr<TProfile> MakeTimewalkProfile(const TH2D &hist)
     return nullptr;
   }
   profile->SetDirectory(nullptr);
-  profile->SetTitle((std::string(hist.GetTitle()) + " profile;ToT [ns];mean #Deltat [ns]").c_str());
+  profile->SetTitle((std::string(hist.GetTitle()) + " profile;" + g_tot_axis_label + ";mean #Deltat [ns]").c_str());
   profile->SetMarkerStyle(20);
   profile->SetMarkerSize(0.75);
   profile->SetMarkerColor(kBlack);
@@ -1328,7 +1438,7 @@ std::unique_ptr<TProfile> MakeTotVsSpillProfile(const TH2D &hist)
     return nullptr;
   }
   profile->SetDirectory(nullptr);
-  profile->SetTitle((std::string(hist.GetTitle()) + " profile;spill;mean ToT [ns]").c_str());
+  profile->SetTitle((std::string(hist.GetTitle()) + " profile;spill;mean " + g_tot_axis_label).c_str());
   profile->SetMarkerStyle(20);
   profile->SetMarkerSize(0.75);
   profile->SetMarkerColor(kBlack);
@@ -1828,8 +1938,8 @@ std::unique_ptr<TH2D> MakeAccumulatedTimewalkHist(const std::vector<RunResult> &
                                channel,
 	                               "h_dt_vs_tot_",
 	                               "h_dt_vs_tot_accum_ch" + std::to_string(channel),
-	                               "Accumulated #Deltat vs ToT ch" + std::to_string(channel) +
-	                                   ";ToT [ns];#Deltat [ns];entries");
+	                               "Accumulated #Deltat vs " + g_tot_quantity_label + " ch" + std::to_string(channel) +
+	                                   ";" + g_tot_axis_label + ";#Deltat [ns];entries");
 }
 
 std::unique_ptr<TH2D> MakeAccumulatedRawTimewalkHist(const std::vector<RunResult> &results, int channel)
@@ -1838,8 +1948,8 @@ std::unique_ptr<TH2D> MakeAccumulatedRawTimewalkHist(const std::vector<RunResult
                                channel,
                                "h_raw_dt_vs_tot_",
                                "h_raw_dt_vs_tot_accum_ch" + std::to_string(channel),
-                               "Accumulated raw #Deltat vs ToT ch" + std::to_string(channel) +
-                                   ";ToT [ns];#Deltat [ns];entries");
+                               "Accumulated raw #Deltat vs " + g_tot_quantity_label + " ch" + std::to_string(channel) +
+                                   ";" + g_tot_axis_label + ";#Deltat [ns];entries");
 }
 
 std::unique_ptr<TH2D> MakeAccumulatedRejectedTimewalkHist(const std::vector<RunResult> &results, int channel)
@@ -1848,8 +1958,8 @@ std::unique_ptr<TH2D> MakeAccumulatedRejectedTimewalkHist(const std::vector<RunR
                                channel,
                                "h_rejected_dt_vs_tot_",
                                "h_rejected_dt_vs_tot_accum_ch" + std::to_string(channel),
-                               "Accumulated rejected #Deltat vs ToT ch" + std::to_string(channel) +
-                                   ";ToT [ns];#Deltat [ns];entries");
+                               "Accumulated rejected #Deltat vs " + g_tot_quantity_label + " ch" + std::to_string(channel) +
+                                   ";" + g_tot_axis_label + ";#Deltat [ns];entries");
 }
 
 std::map<int, TimewalkCorrection> BuildTimewalkCorrections(const std::vector<RunResult> &results,
@@ -1907,12 +2017,14 @@ std::map<int, TimewalkCorrection> BuildTimewalkCorrections(const std::vector<Run
       std::cout << "p0=" << correction.p0 << " p1=" << correction.p1 << " p2=" << correction.p2
                 << " p3=" << correction.p3 << " (f(ToT)=p0+p1/(ToT-p2)^p3)";
     } else {
-      std::cout << "dt = " << correction.p0 << " + " << correction.p1 << " * ToT";
+      std::cout << "dt = " << correction.p0 << " + " << correction.p1 << " * " << g_tot_quantity_label;
     }
     if (correction.fit_range.enabled) {
-      std::cout << " fitted in ToT [" << correction.fit_range.xmin << ", " << correction.fit_range.xmax << "] ns";
+      std::cout << " fitted in " << g_tot_quantity_label << " [" << correction.fit_range.xmin << ", "
+                << correction.fit_range.xmax << "] ns";
     }
-    std::cout << "; applied correction is f(ToT); baseline/plateau=" << correction.baseline << " ns" << std::endl;
+    std::cout << "; applied correction is f(" << g_tot_quantity_label << "); baseline/plateau=" << correction.baseline
+              << " ns" << std::endl;
   }
   return corrections;
 }
@@ -2009,6 +2121,7 @@ void BuildCorrectedTimewalkAndCoincidencePlots(std::vector<RunResult> &results,
                                                double trigger_period_ns,
                                                double trigger_period_tolerance_ns,
                                                double max_duration_ns,
+                                               double sensor_duration_ns,
                                                double clock_mhz,
                                                const analysis_time::FineCalib &fine_calib,
                                                const analysis_time::ChannelTdcOffsetCalib &tdc_offset_calib,
@@ -2031,7 +2144,7 @@ void BuildCorrectedTimewalkAndCoincidencePlots(std::vector<RunResult> &results,
     return;
   }
 
-	  const double tot_max = std::max(1.0, max_duration_ns);
+	  const double tot_max = std::max(1.0, sensor_duration_ns);
 	  const double corrected_dt_min = TimewalkDtMin(signed_dt, match_window_ns);
 	  const double corrected_dt_max = TimewalkDtMax(match_window_ns);
 	  std::map<int, TH2D *> h_dt_corr_vs_tot_accum;
@@ -2039,8 +2152,8 @@ void BuildCorrectedTimewalkAndCoincidencePlots(std::vector<RunResult> &results,
     const std::string reference_label =
         reference_mode == TimeReferenceMode::EventMedian ? "event median" : "clean trigger";
     std::ostringstream title;
-    title << "Accumulated corrected #Deltat vs ToT ch" << ch << " to " << reference_label
-          << ";ToT [ns];#Deltat corrected [ns];entries";
+    title << "Accumulated corrected #Deltat vs " << g_tot_quantity_label << " ch" << ch << " to " << reference_label
+          << ";" << g_tot_axis_label << ";#Deltat corrected [ns];entries";
     h_dt_corr_vs_tot_accum[ch] = MakeHist2D(corrected_accumulated_histograms,
                                             "h_dt_corr_vs_tot_accum_ch" + std::to_string(ch),
                                             title.str(),
@@ -2613,6 +2726,7 @@ RunResult AnalyzeRun(const RunConfig &run,
                      double trigger_period_ns,
                      double trigger_period_tolerance_ns,
                      double max_duration_ns,
+                     double sensor_duration_ns,
                      double clock_mhz,
                      bool use_fine,
                      int fine_cut,
@@ -2677,22 +2791,24 @@ RunResult AnalyzeRun(const RunConfig &run,
 
     std::ostringstream corr_title;
     corr_title << "[FULL SELECTION] " << run.label << " I=" << run.intensity << " ch" << ch
-               << " #Deltat vs ToT to "
-               << reference_label << ";ToT [ns];#Deltat [ns];entries";
+               << " #Deltat vs " << g_tot_quantity_label << " to "
+               << reference_label << ";" << g_tot_axis_label << ";#Deltat [ns];entries";
     std::ostringstream raw_corr_title;
     raw_corr_title << "[CUT DIAGNOSTIC: before dt/ToT cut] " << run.label << " I=" << run.intensity
-                   << " ch" << ch << " #Deltat vs ToT to "
-                   << reference_label << ";ToT [ns];#Deltat [ns];entries";
+                   << " ch" << ch << " #Deltat vs " << g_tot_quantity_label << " to "
+                   << reference_label << ";" << g_tot_axis_label << ";#Deltat [ns];entries";
     std::ostringstream rejected_corr_title;
     rejected_corr_title << "[CUT DIAGNOSTIC: rejected by dt/ToT cut] " << run.label << " I="
                         << run.intensity << " ch" << ch
-                        << " rejected by #Deltat-ToT cut;ToT [ns];" << dt_axis_title << ";entries";
+                        << " rejected by #Deltat-" << g_tot_quantity_label << " cut;" << g_tot_axis_label << ";"
+                        << dt_axis_title << ";entries";
+    const double sensor_tot_xmax = std::max(1.0, sensor_duration_ns);
     h_raw_dt_vs_tot[ch] = MakeHist2D(result.histograms2d,
                                      "h_raw_dt_vs_tot_" + safe_label + "_ch" + std::to_string(ch),
                                      raw_corr_title.str(),
                                      200,
                                      0.0,
-                                     std::max(1.0, max_duration_ns),
+                                     sensor_tot_xmax,
                                      400,
                                      timewalk_dt_min,
                                      timewalk_dt_max);
@@ -2701,7 +2817,7 @@ RunResult AnalyzeRun(const RunConfig &run,
                                  corr_title.str(),
                                  200,
                                  0.0,
-                                 std::max(1.0, max_duration_ns),
+                                 sensor_tot_xmax,
                                  400,
                                  timewalk_dt_min,
                                  timewalk_dt_max);
@@ -2710,7 +2826,7 @@ RunResult AnalyzeRun(const RunConfig &run,
                                           rejected_corr_title.str(),
                                           200,
                                           0.0,
-                                          std::max(1.0, max_duration_ns),
+                                          sensor_tot_xmax,
                                           400,
                                           timewalk_dt_min,
                                           timewalk_dt_max);
@@ -2723,7 +2839,8 @@ RunResult AnalyzeRun(const RunConfig &run,
   tot_channels.erase(std::unique(tot_channels.begin(), tot_channels.end()), tot_channels.end());
   for (int ch : tot_channels) {
     std::ostringstream title;
-    title << run.label << " I=" << run.intensity << " ToT ch" << ch << ";ToT [ns];entries";
+    title << run.label << " I=" << run.intensity << " " << g_tot_quantity_label << " ch" << ch << ";"
+          << g_tot_axis_label << ";entries";
     h_tot[ch] = MakeHist(result.histograms,
                          "h_tot_" + safe_label + "_ch" + std::to_string(ch),
                          title.str(),
@@ -2746,8 +2863,8 @@ RunResult AnalyzeRun(const RunConfig &run,
   constexpr int duration_bins = 120;
   for (int ch : timing_diagnostic_channels) {
     std::ostringstream tot_no_selection_title;
-    tot_no_selection_title << "[NO ANALYSIS CUTS] " << run.label << " I=" << run.intensity << " ToT ch" << ch
-                           << ";ToT [ns];entries";
+    tot_no_selection_title << "[NO ANALYSIS CUTS] " << run.label << " I=" << run.intensity << " "
+                           << g_tot_quantity_label << " ch" << ch << ";" << g_tot_axis_label << ";entries";
     h_tot_no_selection[ch] = MakeHist(result.histograms,
                                       "h_tot_no_selection_" + safe_label + "_ch" + std::to_string(ch),
                                       tot_no_selection_title.str(),
@@ -2769,7 +2886,7 @@ RunResult AnalyzeRun(const RunConfig &run,
     std::ostringstream duration_title;
     duration_title << "[NO ANALYSIS CUTS] " << run.label << " I=" << run.intensity
                    << " hit duration vs previous leading hit ch" << ch
-                   << ";t_{i} - t_{i-1} [ns];ToT [ns];entries";
+                   << ";t_{i} - t_{i-1} [ns];" << g_tot_axis_label << ";entries";
     h_duration_vs_prev_interhit[ch] = MakeLogXHist2D(result.histograms2d,
                                                     "h_duration_vs_prev_interhit_" + safe_label + "_ch" +
                                                         std::to_string(ch),
@@ -2783,8 +2900,8 @@ RunResult AnalyzeRun(const RunConfig &run,
   }
   for (int ch : tot_channels) {
     std::ostringstream tot_full_selection_title;
-    tot_full_selection_title << "[FULL SELECTION] " << run.label << " I=" << run.intensity << " ToT ch" << ch
-                             << ";ToT [ns];entries";
+    tot_full_selection_title << "[FULL SELECTION] " << run.label << " I=" << run.intensity << " "
+                             << g_tot_quantity_label << " ch" << ch << ";" << g_tot_axis_label << ";entries";
     h_tot_full_selection[ch] = MakeHist(result.histograms,
                                         "h_tot_full_selection_" + safe_label + "_ch" + std::to_string(ch),
                                         tot_full_selection_title.str(),
@@ -2847,7 +2964,7 @@ RunResult AnalyzeRun(const RunConfig &run,
   for (int ch : tot_channels) {
     std::ostringstream title;
     title << "[CUT DIAGNOSTIC: before final matching] " << run.label << " I=" << run.intensity
-          << " ToT vs spill ch" << ch << ";spill;ToT [ns];entries";
+          << " " << g_tot_quantity_label << " vs spill ch" << ch << ";spill;" << g_tot_axis_label << ";entries";
     h_tot_vs_spill[ch] = MakeHist2D(result.histograms2d,
                                     "h_tot_vs_spill_" + safe_label + "_ch" + std::to_string(ch),
                                     title.str(),
@@ -2861,8 +2978,8 @@ RunResult AnalyzeRun(const RunConfig &run,
   for (int ch : sensor_channels) {
     std::ostringstream selected_title;
     selected_title << "[FULL SELECTION] " << run.label << " I=" << run.intensity
-                   << " selected ToT vs spill ch" << ch
-                   << ";spill;ToT [ns];entries";
+                   << " selected " << g_tot_quantity_label << " vs spill ch" << ch
+                   << ";spill;" << g_tot_axis_label << ";entries";
     h_tot_vs_spill_selected[ch] = MakeHist2D(result.histograms2d,
                                             "h_tot_vs_spill_selected_" + safe_label + "_ch" + std::to_string(ch),
                                             selected_title.str(),
@@ -2875,8 +2992,8 @@ RunResult AnalyzeRun(const RunConfig &run,
 
     std::ostringstream rejected_title;
     rejected_title << "[CUT DIAGNOSTIC: rejected by dt/ToT cut] " << run.label << " I=" << run.intensity
-                   << " rejected ToT vs spill ch" << ch
-                   << ";spill;ToT [ns];entries";
+                   << " rejected " << g_tot_quantity_label << " vs spill ch" << ch
+                   << ";spill;" << g_tot_axis_label << ";entries";
     h_tot_vs_spill_rejected[ch] = MakeHist2D(result.histograms2d,
                                             "h_tot_vs_spill_rejected_" + safe_label + "_ch" + std::to_string(ch),
                                             rejected_title.str(),
@@ -3490,6 +3607,38 @@ void DrawRunHistograms(TCanvas &canvas,
     profile->SetMinimum(hist.GetYaxis()->GetXmin());
     profile->SetMaximum(hist.GetYaxis()->GetXmax());
   };
+  // Like set_profile_y_range, but for profiles whose Y values are a ToT/slew-dt
+  // quantity: in slew-rate mode the booked axis range is tuned for ToT pulse
+  // widths and is typically far wider than the actual rise-time-scale data, so
+  // zoom to the profile's populated content range instead of the full axis.
+  auto set_tot_profile_y_range = [](TProfile *profile, const TH2D &hist) {
+    if (!profile || !hist.GetYaxis()) {
+      return;
+    }
+    if (g_tdc_operating_mode != TdcOperatingMode::SlewRate) {
+      profile->SetMinimum(hist.GetYaxis()->GetXmin());
+      profile->SetMaximum(hist.GetYaxis()->GetXmax());
+      return;
+    }
+    double lo = std::numeric_limits<double>::infinity();
+    double hi = -std::numeric_limits<double>::infinity();
+    for (int b = 1; b <= profile->GetNbinsX(); ++b) {
+      if (profile->GetBinEntries(b) <= 0.0) {
+        continue;
+      }
+      const double v = profile->GetBinContent(b);
+      lo = std::min(lo, v);
+      hi = std::max(hi, v);
+    }
+    if (!std::isfinite(lo) || !std::isfinite(hi) || hi <= lo) {
+      profile->SetMinimum(hist.GetYaxis()->GetXmin());
+      profile->SetMaximum(hist.GetYaxis()->GetXmax());
+      return;
+    }
+    const double pad = std::max(0.15 * (hi - lo), 0.05);
+    profile->SetMinimum(std::max(hist.GetYaxis()->GetXmin(), lo - pad));
+    profile->SetMaximum(std::min(hist.GetYaxis()->GetXmax(), hi + pad));
+  };
   if (draw_results) {
     DrawSectionPage(
         canvas,
@@ -3554,7 +3703,8 @@ void DrawRunHistograms(TCanvas &canvas,
     legend_tot->SetFillStyle(0);
     auto *stack_tot = new THStack(("stack_tot_" + SafeName(result.config.label)).c_str(),
                                   ("[FULL SELECTION] " + result.config.label + " I=" +
-                                   std::to_string(result.config.intensity) + " ToT;ToT [ns];entries")
+                                   std::to_string(result.config.intensity) + " " + g_tot_quantity_label + ";" +
+                                   g_tot_axis_label + ";entries")
                                       .c_str());
     stack_tot->SetBit(kCanDelete);
     double max_tot = 0.0;
@@ -3610,8 +3760,9 @@ void DrawRunHistograms(TCanvas &canvas,
       draw_hist->SetBit(kCanDelete);
       draw_hist->SetStats(false);
       draw_hist->SetTitle((label + " " + result.config.label + " I=" + std::to_string(result.config.intensity) +
-                           " ch" + std::to_string(ch) + ";ToT [ns];" + dt_axis_title + ";entries")
+                           " ch" + std::to_string(ch) + ";" + g_tot_axis_label + ";" + dt_axis_title + ";entries")
                               .c_str());
+      AutoZoomTotAxis(draw_hist, draw_hist->GetXaxis(), 1);
       draw_hist->Draw("colz");
 	      if (draw_cut_line) {
 	        DrawDtTotCutLine(DtTotCutForChannel(dt_tot_cuts, ch), draw_hist);
@@ -3647,12 +3798,13 @@ void DrawRunHistograms(TCanvas &canvas,
 	      has_profile_group = true;
 	      profile->SetTitle(("[PROFILE ONLY] " + label + " " + result.config.label +
 	                         " I=" + std::to_string(result.config.intensity) + " ch" + std::to_string(ch) +
-	                         ";ToT [ns];mean " + dt_axis_title)
+	                         ";" + g_tot_axis_label + ";mean " + dt_axis_title)
 	                            .c_str());
 	      profile->SetMarkerColor(kBlack);
 	      profile->SetLineColor(kBlack);
 	      set_profile_y_range(profile.get(), *hist);
 	      auto fit = FitTimewalkProfile(profile.get(), FitRangeForChannel(fit_ranges, ch), fit_model);
+	      AutoZoomTotAxis(profile.get(), profile->GetXaxis(), 1);
 	      profile->Draw("E1");
 	      if (fit) {
 	        fit->SetLineColor(kRed + 1);
@@ -3676,7 +3828,7 @@ void DrawRunHistograms(TCanvas &canvas,
     draw_timewalk_2d_group("h_raw_dt_vs_tot_", "[CUT DIAGNOSTIC: before dt/ToT cut]", false, true);
   }
   if (draw_results) {
-    draw_timewalk_2d_group("h_dt_vs_tot_", "[FULL SELECTION] #Deltat vs ToT", true, true);
+    draw_timewalk_2d_group("h_dt_vs_tot_", "[FULL SELECTION] #Deltat vs " + g_tot_quantity_label, true, true);
   }
   if (draw_diagnostics) {
     draw_timewalk_2d_group("h_rejected_dt_vs_tot_", "[CUT DIAGNOSTIC: rejected by dt/ToT cut]", false, true);
@@ -3762,9 +3914,10 @@ void DrawRunHistograms(TCanvas &canvas,
         has_page = true;
         hist->SetLineColor(ch == trigger_channel ? kRed + 1 : kBlue + 1);
         hist->SetLineWidth(ch == trigger_channel ? 3 : 2);
-        hist->SetTitle(("[NO ANALYSIS CUTS] " + result.config.label + " ToT ch" + std::to_string(ch) +
-                        ";ToT [ns];entries")
+        hist->SetTitle(("[NO ANALYSIS CUTS] " + result.config.label + " " + g_tot_quantity_label + " ch" +
+                        std::to_string(ch) + ";" + g_tot_axis_label + ";entries")
                            .c_str());
+        AutoZoomTotAxis(hist, hist->GetXaxis(), 1);
         hist->Draw("hist");
       }
       if (has_page) {
@@ -3878,9 +4031,10 @@ void DrawRunHistograms(TCanvas &canvas,
           continue;
         }
         has_page = true;
-        hist->SetTitle((result.config.label + " ToT vs previous hit interval ch" + std::to_string(ch) +
-                        ";t_{i} - t_{i-1} [ns];ToT [ns];entries")
+        hist->SetTitle((result.config.label + " " + g_tot_quantity_label + " vs previous hit interval ch" +
+                        std::to_string(ch) + ";t_{i} - t_{i-1} [ns];" + g_tot_axis_label + ";entries")
                            .c_str());
+        AutoZoomTotAxis(hist, hist->GetYaxis(), 2);
         hist->Draw("colz");
       }
       if (has_page) {
@@ -3959,7 +4113,11 @@ void DrawRunHistograms(TCanvas &canvas,
         continue;
       }
       has_tot_vs_spill = true;
-      hist->Draw("colz");
+      auto *draw_hist = static_cast<TH2D *>(hist->Clone());
+      draw_hist->SetDirectory(nullptr);
+      draw_hist->SetBit(kCanDelete);
+      AutoZoomTotAxis(draw_hist, draw_hist->GetYaxis(), 2);
+      draw_hist->Draw("colz");
     }
     if (has_tot_vs_spill) {
       canvas.Print(out_pdf.c_str());
@@ -3992,10 +4150,10 @@ void DrawRunHistograms(TCanvas &canvas,
         }
         has_profile_group = true;
         profile->SetTitle(("[PROFILE ONLY] " + result.config.label +
-                           " I=" + std::to_string(result.config.intensity) + " ToT vs spill ch" +
-                           std::to_string(ch) + ";spill;mean ToT [ns]")
+                           " I=" + std::to_string(result.config.intensity) + " " + g_tot_quantity_label +
+                           " vs spill ch" + std::to_string(ch) + ";spill;mean " + g_tot_axis_label)
                               .c_str());
-        set_profile_y_range(profile.get(), *hist);
+        set_tot_profile_y_range(profile.get(), *hist);
         profile->Draw("E1");
         tot_vs_spill_profiles.push_back(std::move(profile));
       }
@@ -4026,10 +4184,15 @@ void DrawRunHistograms(TCanvas &canvas,
         continue;
       }
       has_group = true;
-      hist->SetTitle((result.config.label + " I=" + std::to_string(result.config.intensity) + " " + label +
-                      " ToT vs spill ch" + std::to_string(ch) + ";spill;ToT [ns];entries")
+      auto *draw_hist = static_cast<TH2D *>(hist->Clone());
+      draw_hist->SetDirectory(nullptr);
+      draw_hist->SetBit(kCanDelete);
+      draw_hist->SetTitle((result.config.label + " I=" + std::to_string(result.config.intensity) + " " + label +
+                      " " + g_tot_quantity_label + " vs spill ch" + std::to_string(ch) + ";spill;" +
+                      g_tot_axis_label + ";entries")
 	                         .c_str());
-      hist->Draw("colz");
+      AutoZoomTotAxis(draw_hist, draw_hist->GetYaxis(), 2);
+      draw_hist->Draw("colz");
     }
     if (has_group) {
       canvas.Print(out_pdf.c_str());
@@ -4066,9 +4229,10 @@ void DrawRunHistograms(TCanvas &canvas,
       has_profile_group = true;
       profile->SetTitle(("[PROFILE ONLY] " + result.config.label +
                          " I=" + std::to_string(result.config.intensity) + " " + label +
-                         " ToT vs spill ch" + std::to_string(ch) + ";spill;mean ToT [ns]")
+                         " " + g_tot_quantity_label + " vs spill ch" + std::to_string(ch) + ";spill;mean " +
+                         g_tot_axis_label)
                             .c_str());
-      set_profile_y_range(profile.get(), *hist);
+      set_tot_profile_y_range(profile.get(), *hist);
       profile->Draw("E1");
       profiles.push_back(std::move(profile));
     }
@@ -4327,7 +4491,9 @@ void DrawAccumulatedCorrectionOverlay(TCanvas &canvas,
   const double xmax = std::max(1.0, max_duration_ns);
   auto *multi = new TMultiGraph();
   multi->SetBit(kCanDelete);
-  multi->SetTitle("Accumulated timewalk correction;ToT [ns];correction f_{ch}(ToT) [ns]");
+  multi->SetTitle(("Accumulated timewalk correction;" + g_tot_axis_label + ";correction f_{ch}(" +
+                   g_tot_quantity_label + ") [ns]")
+                      .c_str());
   auto *legend = new TLegend(0.68, 0.68, 0.92, 0.90);
   legend->SetBit(kCanDelete);
   legend->SetBorderSize(0);
@@ -4397,7 +4563,8 @@ void DrawTimewalkFitSummaries(TCanvas &canvas,
     canvas.SetRightMargin(0.05);
     auto *multi = new TMultiGraph();
     multi->SetBit(kCanDelete);
-    multi->SetTitle(("Timewalk correction fits ch" + std::to_string(ch) + ";ToT [ns];#Deltat fit [ns]").c_str());
+    multi->SetTitle(
+        ("Timewalk correction fits ch" + std::to_string(ch) + ";" + g_tot_axis_label + ";#Deltat fit [ns]").c_str());
     multi->SetMinimum(ymin);
     multi->SetMaximum(ymax);
 
@@ -4488,6 +4655,7 @@ void DrawAccumulatedTimewalkFits(TCanvas &canvas,
       auto *draw_raw = static_cast<TH2D *>(raw_accumulated->Clone());
       draw_raw->SetDirectory(nullptr);
       draw_raw->SetBit(kCanDelete);
+      AutoZoomTotAxis(draw_raw, draw_raw->GetXaxis(), 1);
       draw_raw->Draw("colz");
       DrawDtTotCutLine(cut, draw_raw);
       canvas.Print(out_pdf.c_str());
@@ -4515,11 +4683,12 @@ void DrawAccumulatedTimewalkFits(TCanvas &canvas,
       auto *draw_hist = static_cast<TH2D *>(accumulated->Clone());
       draw_hist->SetDirectory(nullptr);
       draw_hist->SetBit(kCanDelete);
+      AutoZoomTotAxis(draw_hist, draw_hist->GetXaxis(), 1);
       draw_hist->Draw("colz");
       DrawDtTotCutLine(cut, draw_hist);
       canvas.Print(out_pdf.c_str());
 
-      auto profile = MakeTimewalkProfile(*draw_hist);
+      auto profile = MakeTimewalkProfile(*accumulated);
       auto fit = FitTimewalkProfile(profile.get(), FitRangeForChannel(fit_ranges, ch), fit_model);
       if (profile) {
         canvas.Clear();
@@ -4531,6 +4700,7 @@ void DrawAccumulatedTimewalkFits(TCanvas &canvas,
         }
         profile->SetMinimum(draw_hist->GetYaxis()->GetXmin());
         profile->SetMaximum(draw_hist->GetYaxis()->GetXmax());
+        AutoZoomTotAxis(profile.get(), profile->GetXaxis(), 1);
         profile->Draw("E1");
         if (fit) {
           fit->Draw("same");
@@ -4547,6 +4717,7 @@ void DrawAccumulatedTimewalkFits(TCanvas &canvas,
       auto *draw_rejected = static_cast<TH2D *>(rejected->Clone());
       draw_rejected->SetDirectory(nullptr);
       draw_rejected->SetBit(kCanDelete);
+      AutoZoomTotAxis(draw_rejected, draw_rejected->GetXaxis(), 1);
       draw_rejected->Draw("colz");
       DrawDtTotCutLine(cut, draw_rejected);
       canvas.Print(out_pdf.c_str());
@@ -4568,6 +4739,7 @@ void DrawCorrectedAccumulatedTimewalk(TCanvas &canvas,
     auto *draw_hist = static_cast<TH2D *>(hist->Clone());
     draw_hist->SetDirectory(nullptr);
     draw_hist->SetBit(kCanDelete);
+    AutoZoomTotAxis(draw_hist, draw_hist->GetXaxis(), 1);
     draw_hist->Draw("colz");
     canvas.Print(out_pdf.c_str());
   }
@@ -4683,6 +4855,8 @@ void WriteTextSummary(const std::string &path,
     return;
   }
   out << "# runlist: " << runlist_path << "\n";
+  out << "# tot_quantity: " << g_tot_quantity_label
+      << " (TDC-even/TDC-odd dt; ToT mode = pulse width, slew-rate mode = inter-threshold rise time)\n";
 	  out << "# fine_calib: " << fine_calib_path << "\n";
 		  out << "# channel_calib: " << chan_calib_path << "\n";
 		  out << "# reference_mode: " << TimeReferenceModeName(reference_mode) << "\n";
@@ -4754,9 +4928,9 @@ void WriteTextSummary(const std::string &path,
       const auto &cut = cut_it->second;
       out << "# dt_tot_cut_ch" << ch << ": keep dt "
           << (cut.direction == DtTotCutDirection::KeepAbove ? ">= " : "<= ")
-          << cut.intercept << " + " << cut.slope << "*ToT";
+          << cut.intercept << " + " << cut.slope << "*" << g_tot_quantity_label;
       if (std::isfinite(cut.tot_min) || std::isfinite(cut.tot_max)) {
-        out << " for ToT in [" << cut.tot_min << "," << cut.tot_max << "] ns";
+        out << " for " << g_tot_quantity_label << " in [" << cut.tot_min << "," << cut.tot_max << "] ns";
       }
       out << "\n";
     }
@@ -4779,7 +4953,7 @@ void WriteTextSummary(const std::string &path,
 	      out << " correction_ns=(" << correction.p0 << " + " << correction.p1
 	          << "/pow(ToT-" << correction.p2 << "," << correction.p3 << "))";
 	    } else {
-	      out << " correction_ns=(" << correction.p0 << " + " << correction.p1 << "*ToT)";
+	      out << " correction_ns=(" << correction.p0 << " + " << correction.p1 << "*" << g_tot_quantity_label << ")";
     }
     if (correction.fit_range.enabled) {
       out << " fit_range_ns=[" << correction.fit_range.xmin << "," << correction.fit_range.xmax << "]";
@@ -4847,14 +5021,21 @@ void laser_intensity_scan_rdf(const char *runlist_path = "help",
                               const char *reference_mode_name = "trigger",
                               int event_reference_min_channels = 3,
                               double event_window_ns = 0.0,
-                              const char *dt_tot_cut_direction_name = "below")
+                              const char *dt_tot_cut_direction_name = "below",
+                              const char *opmode_name = "tot",
+                              double sensor_duration_ns = 0.0)
 {
   if (WantsHelp(runlist_path)) {
     PrintHelp();
     return;
   }
+  const TdcOperatingMode tdc_operating_mode = ParseTdcOperatingMode(opmode_name ? opmode_name : "tot");
+  ConfigureTotLabels(tdc_operating_mode);
   if (max_duration_ns <= 0.0) {
     max_duration_ns = 30.0;
+  }
+  if (sensor_duration_ns <= 0.0) {
+    sensor_duration_ns = max_duration_ns;
   }
   if (match_window_ns <= 0.0) {
     match_window_ns = 100.0;
@@ -4940,15 +5121,18 @@ void laser_intensity_scan_rdf(const char *runlist_path = "help",
 
   std::cout << "Run list: " << runlist_path << std::endl;
   std::cout << "Runs: " << runs.size() << std::endl;
+  std::cout << "TDC operating mode: " << TdcOperatingModeName(tdc_operating_mode) << " (" << g_tot_quantity_label
+            << ")" << std::endl;
   std::cout << "Laser trigger/reference channel: " << trigger_channel << std::endl;
   std::cout << "Sensor channels: " << ChannelsLabel(sensor_channels) << std::endl;
   std::cout << "Time reference mode: " << TimeReferenceModeName(reference_mode) << std::endl;
   if (reference_mode == TimeReferenceMode::EventMedian) {
     std::cout << "Event-median min channels: " << event_reference_min_channels << std::endl;
-    std::cout << "Timewalk observable: dt(sensor - event median excluding sensor) vs sensor ToT" << std::endl;
+    std::cout << "Timewalk observable: dt(sensor - event median excluding sensor) vs sensor " << g_tot_quantity_label
+              << std::endl;
   } else {
-    std::cout << "Timewalk observable: dt(sensor - laser ch" << trigger_channel
-              << ") vs sensor ToT" << std::endl;
+    std::cout << "Timewalk observable: dt(sensor - laser ch" << trigger_channel << ") vs sensor "
+              << g_tot_quantity_label << std::endl;
   }
   std::cout << "Match window (ns): " << match_window_ns << std::endl;
   std::cout << "Event-building window (ns): " << event_window_ns << std::endl;
@@ -4995,6 +5179,7 @@ void laser_intensity_scan_rdf(const char *runlist_path = "help",
                                  trigger_period_ns,
                                  trigger_period_tolerance_ns,
                                  max_duration_ns,
+                                 sensor_duration_ns,
                                  clock_mhz,
                                  use_fine,
                                  fine_cut,
@@ -5023,6 +5208,7 @@ void laser_intensity_scan_rdf(const char *runlist_path = "help",
                                             trigger_period_ns,
                                             trigger_period_tolerance_ns,
                                             max_duration_ns,
+                                            sensor_duration_ns,
                                             clock_mhz,
                                             fine_calib,
                                             tdc_offset_calib,
@@ -5086,7 +5272,7 @@ void laser_intensity_scan_rdf(const char *runlist_path = "help",
                                 false,
                                 false,
                                 "g_tot_mean_ch" + std::to_string(ch),
-                                "mean ToT ch" + std::to_string(ch),
+                                "mean " + g_tot_quantity_label + " ch" + std::to_string(ch),
                                 color);
     tot_mean_graphs.push_back(g_tot_mean.get());
     graphs.push_back(std::move(g_tot_mean));
@@ -5096,7 +5282,7 @@ void laser_intensity_scan_rdf(const char *runlist_path = "help",
                                false,
                                true,
                                "g_tot_rms_ch" + std::to_string(ch),
-                               "RMS ToT ch" + std::to_string(ch),
+                               "RMS " + g_tot_quantity_label + " ch" + std::to_string(ch),
                                color);
     tot_rms_graphs.push_back(g_tot_rms.get());
     graphs.push_back(std::move(g_tot_rms));
@@ -5295,8 +5481,10 @@ void laser_intensity_scan_rdf(const char *runlist_path = "help",
                dt_rms_title,
                dt_rms_axis_title,
                out_pdf);
-	    DrawGraphs(canvas, tot_mean_graphs, tot_labels, "Mean ToT", "mean ToT [ns]", out_pdf);
-	    DrawGraphs(canvas, tot_rms_graphs, tot_labels, "ToT RMS", "RMS ToT [ns]", out_pdf);
+	    DrawGraphs(canvas, tot_mean_graphs, tot_labels, "Mean " + g_tot_quantity_label, "mean " + g_tot_axis_label,
+	               out_pdf);
+	    DrawGraphs(canvas, tot_rms_graphs, tot_labels, g_tot_quantity_label + " RMS", "RMS " + g_tot_axis_label,
+	               out_pdf);
 	    DrawAccumulatedCorrectionOverlay(canvas, timewalk_corrections, sensor_channels, max_duration_ns, out_pdf);
 		    DrawAccumulatedTimewalkFits(canvas,
 		                                results,
