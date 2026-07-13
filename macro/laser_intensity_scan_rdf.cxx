@@ -2,6 +2,8 @@
 #include <TColor.h>
 #include <TF1.h>
 #include <TFile.h>
+#include <TFitResult.h>
+#include <TFitResultPtr.h>
 #include <TGraph.h>
 #include <TGraphErrors.h>
 #include <TH1D.h>
@@ -21,7 +23,9 @@
 
 #include "analysis_events.h"
 #include "analysis_io.h"
+#include "analysis_tdc.h"
 #include "analysis_time.h"
+#include "analysis_timewalk.h"
 
 #include <algorithm>
 #include <array>
@@ -48,6 +52,15 @@ constexpr int kNumAlcorChannels = 32;
 constexpr double kTimewalkDtLimitNs = 20.0;
 constexpr double kCorrectedCoincidenceDtMinNs = -3.0;
 constexpr double kCorrectedCoincidenceDtMaxNs = 3.0;
+
+using analysis_tdc::GetTrailingPartner;
+using analysis_tdc::IsLeadingTdc;
+using analysis_tdc::IsTrailingTdc;
+using analysis_tdc::TdcPairIndex;
+using analysis_timewalk::ParseTimewalkFitModel;
+using analysis_timewalk::TimewalkFitModel;
+using analysis_timewalk::TimewalkFitModelId;
+using analysis_timewalk::TimewalkFitModelName;
 
 struct FitRange {
   bool enabled = false;
@@ -118,12 +131,6 @@ struct SpillRange {
     }
     return spill >= min && spill <= max;
   }
-};
-
-enum class TimewalkFitModel {
-  Pol1 = 0,
-  LinExpPlateau = 1,
-  Pol1Plateau = 2,
 };
 
 enum class TimeReferenceMode {
@@ -289,9 +296,9 @@ void PrintHelp()
   std::cout << "laser_intensity_scan_rdf usage:\n"
             << "  laser_intensity_scan_rdf(\"runlist.tsv\", \"fine.root\", \"channel.root\","
             << " \"out.pdf\", \"out.root\", \"out.txt\", 22, \"17,19\", 100, 30, 320, true,"
-            << " true, 0, true, 0, 1000000, 50000, false, \"17:0:30,19:0:30\","
-            << " \"pol1-plateau\", \"\", \"\", \"\", \"\", -1, \"all\", 0, 0.01,"
-            << " \"17:0,19:0,22:0\", \"trigger\", 3, 0.0, \"below\", \"tot\", 0.0)\n\n"
+            << " true, 0, true, 0, 1000000, 50000, false, \"17:10:30,19:10:30\","
+            << " \"inverse-power\", \"\", \"\", \"\", \"\", -1, \"all\", 0, 0.01,"
+            << " \"17:0,19:0,22:0\", \"trigger\", 3, 0.0, \"below\")\n\n"
             << "Default reference mode uses trigger_channel, normally ch22, as laser reference.\n"
             << "Event-median reference can be selected explicitly with reference_mode=\"event-median\".\n"
             << "event_window_ns=0 uses match_window_ns for event building.\n"
@@ -320,24 +327,9 @@ void PrintHelp()
             << "The PDF also includes per-channel leading-hit inter-arrival and ToT-vs-previous-hit diagnostics.\n";
 }
 
-bool IsLeadingTdc(int tdc)
-{
-  return (tdc & 0x1) == 0;
-}
-
-bool IsTrailingTdc(int tdc)
-{
-  return (tdc & 0x1) == 1;
-}
-
 bool IsValidTdcId(int tdc)
 {
   return tdc >= 0 && tdc <= 3;
-}
-
-int TdcPairIndex(int tdc)
-{
-  return tdc >> 1;
 }
 
 std::string SafeName(std::string value)
@@ -406,7 +398,7 @@ struct TdcSelection {
     if (selected < 0) {
       return true;
     }
-    return tdc == selected || tdc == (selected ^ 0x1);
+    return tdc == selected || tdc == GetTrailingPartner(selected);
   }
 
   std::string Description(const std::vector<int> &channels) const
@@ -1094,7 +1086,7 @@ void ComputeTot(std::vector<Hit> &hits, double max_duration_ns)
       if (leading_index == std::numeric_limits<size_t>::max()) {
         continue;
       }
-      if (hit.tdc != (leading_tdc ^ 0x1)) {
+      if (hit.tdc != GetTrailingPartner(leading_tdc)) {
         continue;
       }
       const double dt = hit.time_ns_raw - hits[leading_index].time_ns_raw;
@@ -1290,6 +1282,15 @@ struct TimewalkCorrection {
     }
     if (model == TimewalkFitModel::Pol1Plateau) {
       return p0 + p1 * std::min(tot, p2);
+    }
+    if (model == TimewalkFitModel::InversePower) {
+      const double base = tot - p2;
+      if (base <= 0.0 || p3 <= 0.0) {
+        // Outside the fitted inverse-power domain the correction is disabled,
+        // rather than extrapolated through the threshold singularity.
+        return 0.0;
+      }
+      return p0 + p1 / std::pow(base, p3);
     }
     return p0 + p1 * tot;
   }
@@ -1691,6 +1692,43 @@ LinExpPlateauSeed EstimateLinExpPlateauSeed(TProfile *profile, double xmin, doub
   return seed;
 }
 
+bool FitResultIsUsable(const TFitResultPtr &result, int min_covariance_status)
+{
+  if (static_cast<int>(result) != 0) {
+    return false;
+  }
+  auto *fit_result = result.Get();
+  return fit_result && fit_result->CovMatrixStatus() >= min_covariance_status;
+}
+
+void ConfigureInversePowerFit(TF1 &fit, double xmin)
+{
+  const double p2_max = std::nextafter(xmin, 0.0);
+  fit.SetParameters(-5.0, 10.0, 10.0, 1.0);
+  fit.SetParNames("p0", "p1", "p2", "p3");
+  fit.SetParLimits(0, -10.0, 0.0);
+  fit.SetParLimits(1, 0.0, 100.0);
+  fit.SetParLimits(2, 0.0, p2_max);
+  fit.SetParLimits(3, 0.3, 3.0);
+}
+
+int CountProfileFitBins(const TProfile *profile, double xmin, double xmax)
+{
+  int count = 0;
+  if (!profile) {
+    return count;
+  }
+  for (int bin = 1; bin <= profile->GetNbinsX(); ++bin) {
+    const double x = profile->GetXaxis()->GetBinCenter(bin);
+    if (x < xmin || x > xmax || profile->GetBinEntries(bin) <= 0.0 ||
+        !std::isfinite(profile->GetBinContent(bin))) {
+      continue;
+    }
+    ++count;
+  }
+  return count;
+}
+
 std::unique_ptr<TF1> FitTimewalkProfile(TProfile *profile,
                                         const FitRange &fit_range = FitRange{},
                                         TimewalkFitModel fit_model = TimewalkFitModel::Pol1)
@@ -1724,39 +1762,78 @@ std::unique_ptr<TF1> FitTimewalkProfile(TProfile *profile,
 
   const double xmin = fit_range.enabled ? fit_range.xmin : profile->GetXaxis()->GetBinLowEdge(first_bin);
   const double xmax = fit_range.enabled ? fit_range.xmax : profile->GetXaxis()->GetBinUpEdge(last_bin);
+  double fit_xmin = xmin;
+  double fit_xmax = xmax;
+  if (!(fit_xmax > fit_xmin)) {
+    return nullptr;
+  }
+  if (fit_model == TimewalkFitModel::InversePower) {
+    if (!(fit_xmin > 0.0)) {
+      fit_xmin = profile->GetXaxis()->GetBinCenter(first_bin);
+    }
+    if (fit_xmin <= 10.0 && fit_xmax > 10.1) {
+      fit_xmin = 10.001;
+    }
+    if (!(fit_xmin > 0.0) || !(fit_xmax > fit_xmin) || CountProfileFitBins(profile, fit_xmin, fit_xmax) < 3) {
+      return nullptr;
+    }
+  }
   std::unique_ptr<TF1> fit;
   std::string fit_options = "QNR";
   if (fit_model == TimewalkFitModel::Pol1Plateau) {
     fit = std::make_unique<TF1>((std::string(profile->GetName()) + "_pol1_plateau").c_str(),
                                 "x<[2] ? [0]+[1]*x : [0]+[1]*[2]",
-                                xmin,
-                                xmax);
+                                fit_xmin,
+                                fit_xmax);
     auto seed = EstimateLinExpPlateauSeed(profile, xmin, xmax);
     fit->SetParameters(seed.p0, seed.p1, seed.x0);
     fit->SetParNames("p0", "p1", "x0");
-    fit->SetParLimits(2, xmin + 0.1, xmax - 0.1);
+    fit->SetParLimits(2, fit_xmin + 0.1, fit_xmax - 0.1);
     // The profile has tiny statistical errors in highly populated bins; equal-bin weights better follow the shape.
     fit_options = "QNRW";
   } else if (fit_model == TimewalkFitModel::LinExpPlateau) {
     fit = std::make_unique<TF1>((std::string(profile->GetName()) + "_lin_exp_plateau").c_str(),
                                 "x<[2] ? [0]+[1]*x : [4]+([0]+[1]*[2]-[4])*exp(-(x-[2])/[3])",
-                                xmin,
-                                xmax);
-    auto seed = EstimateLinExpPlateauSeed(profile, xmin, xmax);
+                                fit_xmin,
+                                fit_xmax);
+    auto seed = EstimateLinExpPlateauSeed(profile, fit_xmin, fit_xmax);
     fit->SetParameters(seed.p0, seed.p1, seed.x0, seed.tau, seed.plateau);
     fit->SetParNames("p0", "p1", "x0", "tau", "plateau");
-    fit->SetParLimits(2, xmin + 0.1, xmax - 0.1);
+    fit->SetParLimits(2, fit_xmin + 0.1, fit_xmax - 0.1);
     fit->SetParLimits(3, 0.03, 10.0);
     fit->SetParLimits(4, -5.0, 5.0);
     // The profile has tiny statistical errors in highly populated bins; equal-bin weights better follow the shape.
     fit_options = "QNRW";
+  } else if (fit_model == TimewalkFitModel::InversePower) {
+    fit = std::make_unique<TF1>((std::string(profile->GetName()) + "_inverse_power").c_str(),
+                                "[0]+[1]/pow(x-[2],[3])",
+                                fit_xmin,
+                                fit_xmax);
+    ConfigureInversePowerFit(*fit, fit_xmin);
+    fit_options = "QNRWS";
+    auto fit_result = profile->Fit(fit.get(), fit_options.c_str());
+    if (!FitResultIsUsable(fit_result, 3)) {
+      auto fallback = std::make_unique<TF1>((std::string(profile->GetName()) + "_inverse_power_p3fixed").c_str(),
+                                            "[0]+[1]/pow(x-[2],[3])",
+                                            fit_xmin,
+                                            fit_xmax);
+      ConfigureInversePowerFit(*fallback, fit_xmin);
+      fallback->FixParameter(3, 1.0);
+      fit_result = profile->Fit(fallback.get(), fit_options.c_str());
+      if (!FitResultIsUsable(fit_result, 2)) {
+        return nullptr;
+      }
+      fit = std::move(fallback);
+    }
   } else {
-    fit = std::make_unique<TF1>((std::string(profile->GetName()) + "_pol1").c_str(), "pol1", xmin, xmax);
+    fit = std::make_unique<TF1>((std::string(profile->GetName()) + "_pol1").c_str(), "pol1", fit_xmin, fit_xmax);
   }
   fit->SetLineColor(kRed + 1);
   fit->SetLineWidth(2);
   fit->SetNpx(200);
-  profile->Fit(fit.get(), fit_options.c_str());
+  if (fit_model != TimewalkFitModel::InversePower) {
+    profile->Fit(fit.get(), fit_options.c_str());
+  }
   return fit;
 }
 
@@ -1919,6 +1996,11 @@ std::map<int, TimewalkCorrection> BuildTimewalkCorrections(const std::vector<Run
       correction.p3 = fit->GetParameter(3);
       correction.p4 = fit->GetParameter(4);
       correction.baseline = correction.p4;
+    } else if (fit_model == TimewalkFitModel::InversePower && fit->GetNpar() >= 4) {
+      correction.p2 = fit->GetParameter(2);
+      correction.p3 = fit->GetParameter(3);
+      correction.p4 = 0.0;
+      correction.baseline = correction.p0;
     } else {
       const double baseline_tot = correction.fit_range.enabled ? correction.fit_range.xmax : accumulated->GetXaxis()->GetXmax();
       correction.baseline = correction.EvalNs(baseline_tot);
@@ -1931,6 +2013,9 @@ std::map<int, TimewalkCorrection> BuildTimewalkCorrections(const std::vector<Run
     } else if (fit_model == TimewalkFitModel::LinExpPlateau) {
       std::cout << "linear p0=" << correction.p0 << " p1=" << correction.p1 << ", x0=" << correction.p2
                 << ", tau=" << correction.p3 << ", plateau=" << correction.p4;
+    } else if (fit_model == TimewalkFitModel::InversePower) {
+      std::cout << "p0=" << correction.p0 << " p1=" << correction.p1 << " p2=" << correction.p2
+                << " p3=" << correction.p3 << " (f(ToT)=p0+p1/(ToT-p2)^p3)";
     } else {
       std::cout << "dt = " << correction.p0 << " + " << correction.p1 << " * " << g_tot_quantity_label;
     }
@@ -4661,6 +4746,85 @@ void DrawCorrectedAccumulatedTimewalk(TCanvas &canvas,
   canvas.SetRightMargin(0.05);
 }
 
+const TH2D *FindCorrectedAccumulatedTimewalkHist(const std::vector<std::unique_ptr<TH2D>> &histograms, int channel)
+{
+  const std::string name = "h_dt_corr_vs_tot_accum_ch" + std::to_string(channel);
+  for (const auto &hist : histograms) {
+    if (hist && std::string(hist->GetName()) == name) {
+      return hist.get();
+    }
+  }
+  return nullptr;
+}
+
+void DrawTimewalkProjectionBeforeAfter(TCanvas &canvas,
+                                       const std::vector<RunResult> &results,
+                                       const std::vector<std::unique_ptr<TH2D>> &corrected_accumulated_histograms,
+                                       const std::vector<int> &sensor_channels,
+                                       const std::string &out_pdf)
+{
+  canvas.SetRightMargin(0.05);
+  for (int ch : sensor_channels) {
+    auto before_2d = MakeAccumulatedTimewalkHist(results, ch);
+    const TH2D *after_2d = FindCorrectedAccumulatedTimewalkHist(corrected_accumulated_histograms, ch);
+    if ((!before_2d || before_2d->GetEntries() <= 0.0) && (!after_2d || after_2d->GetEntries() <= 0.0)) {
+      continue;
+    }
+
+    std::unique_ptr<TH1D> before;
+    std::unique_ptr<TH1D> after;
+    if (before_2d && before_2d->GetEntries() > 0.0) {
+      before.reset(static_cast<TH1D *>(
+          before_2d->ProjectionY(("h_dt_projection_before_tw_ch" + std::to_string(ch)).c_str())));
+      before->SetDirectory(nullptr);
+      before->SetLineColor(kGray + 2);
+      before->SetLineWidth(2);
+    }
+    if (after_2d && after_2d->GetEntries() > 0.0) {
+      after.reset(static_cast<TH1D *>(
+          after_2d->ProjectionY(("h_dt_projection_after_tw_ch" + std::to_string(ch)).c_str())));
+      after->SetDirectory(nullptr);
+      after->SetLineColor(kRed + 1);
+      after->SetLineWidth(2);
+    }
+
+    canvas.Clear();
+    if (auto *pad = static_cast<TPad *>(canvas.cd())) {
+      pad->SetLogx(false);
+      pad->SetLogy(false);
+      pad->SetLogz(false);
+    }
+    THStack stack(("hs_dt_projection_tw_ch" + std::to_string(ch)).c_str(),
+                  ("Accumulated #Deltat projection before/after timewalk ch" + std::to_string(ch)).c_str());
+    if (before) {
+      before->SetTitle("before TW");
+      stack.Add(before.get());
+    }
+    if (after) {
+      after->SetTitle("after TW");
+      stack.Add(after.get());
+    }
+    stack.Draw("nostack hist");
+    if (stack.GetXaxis()) {
+      stack.GetXaxis()->SetTitle("#Deltat [ns]");
+    }
+    if (stack.GetYaxis()) {
+      stack.GetYaxis()->SetTitle("entries");
+    }
+    TLegend legend(0.68, 0.75, 0.90, 0.88);
+    legend.SetBorderSize(0);
+    legend.SetFillStyle(0);
+    if (before) {
+      legend.AddEntry(before.get(), "before TW", "l");
+    }
+    if (after) {
+      legend.AddEntry(after.get(), "after TW", "l");
+    }
+    legend.Draw();
+    canvas.Print(out_pdf.c_str());
+  }
+}
+
 void WriteTextSummary(const std::string &path,
                       const std::vector<RunResult> &results,
                       const std::vector<int> &sensor_channels,
@@ -4747,10 +4911,10 @@ void WriteTextSummary(const std::string &path,
 	  out << "# h_interhit_leading_* histograms show leading-hit intervals t_i-t_{i-1} per channel before analysis cuts\n";
 	  out << "# h_interhit_full_selection_* histograms show the same intervals after the full timewalk selection\n";
 	  out << "# h_duration_vs_prev_interhit_* histograms show hit duration/ToT versus interval from the previous leading hit\n";
-	  out << "# h_trigger_candidate_interhit_*, h_trigger_after_veto_interhit_*, and h_trigger_clean_interhit_* compare trigger-channel intervals before veto, after veto, and after period cleanup\n";
-	  out << "# trigger_veto_ns: " << trigger_deadtime_ns
-	      << " ns, applied after each accepted trigger candidate before period cleanup\n";
-	  out << "# h_dt_corr_vs_tot_accum_ch* histograms use all corrected events accumulated over all intensities\n";
+		  out << "# h_trigger_candidate_interhit_*, h_trigger_after_veto_interhit_*, and h_trigger_clean_interhit_* compare trigger-channel intervals before veto, after veto, and after period cleanup\n";
+		  out << "# trigger_veto_ns: " << trigger_deadtime_ns
+		      << " ns, applied after each accepted trigger candidate before period cleanup\n";
+		  out << "# h_dt_corr_vs_tot_accum_ch* histograms use all corrected events accumulated over all intensities; PDF also overlays #Deltat projections before/after TW\n";
 		  out << "# h_dt_uncorr_ch*_ch* and h_dt_corr_ch*_ch* histograms compare channel-channel coincidences before/after timewalk in ["
 		      << kCorrectedCoincidenceDtMinNs << ", " << kCorrectedCoincidenceDtMaxNs
 		      << "] ns, matched through the same clean trigger/event selection and overlaid in a THStack in the PDF\n";
@@ -4785,6 +4949,9 @@ void WriteTextSummary(const std::string &path,
 	      out << " correction_ns=linear/exponential-plateau"
 	          << " p0=" << correction.p0 << " p1=" << correction.p1 << " x0=" << correction.p2
 	          << " tau=" << correction.p3 << " plateau=" << correction.p4;
+	    } else if (correction.model == TimewalkFitModel::InversePower) {
+	      out << " correction_ns=(" << correction.p0 << " + " << correction.p1
+	          << "/pow(ToT-" << correction.p2 << "," << correction.p3 << "))";
 	    } else {
 	      out << " correction_ns=(" << correction.p0 << " + " << correction.p1 << "*" << g_tot_quantity_label << ")";
     }
@@ -4840,8 +5007,8 @@ void laser_intensity_scan_rdf(const char *runlist_path = "help",
                               double trigger_period_ns = 1000000.0,
                               double trigger_period_tolerance_ns = 50000.0,
                               bool signed_dt = false,
-                              const char *timewalk_fit_ranges_csv = "17:0:30,19:0:30",
-                              const char *timewalk_fit_model_name = "pol1-plateau",
+                              const char *timewalk_fit_ranges_csv = "17:10:30,19:10:30",
+                              const char *timewalk_fit_model_name = "inverse-power",
                               const char *dt_tot_cuts_csv = "",
                               const char *trigger_tot_window_csv = "",
                               const char *spill_range_csv = "",
@@ -4926,7 +5093,7 @@ void laser_intensity_scan_rdf(const char *runlist_path = "help",
   auto tdc_selection = ParseTdcSelectionCsv(tdc_selection_csv ? tdc_selection_csv : "");
   event_reference_min_channels = std::max(1, event_reference_min_channels);
   const auto timewalk_fit_model =
-      ParseTimewalkFitModel(timewalk_fit_model_name ? timewalk_fit_model_name : "pol1-plateau");
+      ParseTimewalkFitModel(timewalk_fit_model_name ? timewalk_fit_model_name : "inverse-power");
 
   analysis_time::FineCalib fine_calib;
   if (fine_calib_path && fine_calib_path[0] != '\0') {
@@ -5192,7 +5359,7 @@ void laser_intensity_scan_rdf(const char *runlist_path = "help",
 	      const auto &correction = kv.second;
 	      TParameter<int>(("timewalk_corr_valid_ch" + std::to_string(ch)).c_str(), correction.valid ? 1 : 0).Write();
 	      TParameter<int>(("timewalk_corr_model_ch" + std::to_string(ch)).c_str(),
-	                      static_cast<int>(correction.model))
+	                      TimewalkFitModelId(correction.model))
 	          .Write();
 	      TParameter<double>(("timewalk_corr_p0_ch" + std::to_string(ch)).c_str(), correction.p0).Write();
 	      TParameter<double>(("timewalk_corr_p1_ch" + std::to_string(ch)).c_str(), correction.p1).Write();
@@ -5319,16 +5486,21 @@ void laser_intensity_scan_rdf(const char *runlist_path = "help",
 	    DrawGraphs(canvas, tot_rms_graphs, tot_labels, g_tot_quantity_label + " RMS", "RMS " + g_tot_axis_label,
 	               out_pdf);
 	    DrawAccumulatedCorrectionOverlay(canvas, timewalk_corrections, sensor_channels, max_duration_ns, out_pdf);
-	    DrawAccumulatedTimewalkFits(canvas,
-	                                results,
-	                                sensor_channels,
-	                                timewalk_fit_ranges,
-	                                timewalk_fit_model,
-	                                dt_tot_cuts,
-	                                RunPlotGroup::Results,
-	                                out_pdf);
-	    DrawCorrectedAccumulatedTimewalk(canvas, corrected_accumulated_timewalk_histograms, out_pdf);
-	    DrawAccumulatedCoincidenceBeforeAfter(canvas, results, sensor_channels, out_pdf);
+		    DrawAccumulatedTimewalkFits(canvas,
+		                                results,
+		                                sensor_channels,
+		                                timewalk_fit_ranges,
+		                                timewalk_fit_model,
+		                                dt_tot_cuts,
+		                                RunPlotGroup::Results,
+		                                out_pdf);
+		    DrawCorrectedAccumulatedTimewalk(canvas, corrected_accumulated_timewalk_histograms, out_pdf);
+		    DrawTimewalkProjectionBeforeAfter(canvas,
+		                                      results,
+		                                      corrected_accumulated_timewalk_histograms,
+		                                      sensor_channels,
+		                                      out_pdf);
+		    DrawAccumulatedCoincidenceBeforeAfter(canvas, results, sensor_channels, out_pdf);
 	    for (const auto &result : results) {
 	      DrawRunHistograms(canvas,
 	                        result,

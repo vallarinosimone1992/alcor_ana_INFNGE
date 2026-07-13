@@ -105,6 +105,8 @@ inline std::vector<std::string> CollectDecodedFiles(const std::string &dir)
 inline std::vector<std::string> FindDecodedDirs(const std::string &input, int maxdepth = 3)
 {
   std::vector<std::string> decoded_dirs;
+  // Convenience resolver used by ROOT macros; shell scripts perform their own
+  // quoted discovery before invoking compiled helper binaries.
   std::string cmd = "find -L '" + input + "' -maxdepth " + std::to_string(maxdepth) +
                     " -type d -name decoded 2>/dev/null";
   TString output = gSystem->GetFromPipe(cmd.c_str());

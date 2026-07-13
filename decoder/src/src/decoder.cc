@@ -15,6 +15,8 @@
 #include "TTree.h"
 
 bool verbose = false;
+// Decoder state is global by design because each invocation processes one raw
+// FIFO stream; do not reuse this state across interleaved FIFO streams.
 int integrated_rollover = 0;
 int integrated_spill = 0;
 long long integrated_hits = 0;

@@ -125,6 +125,19 @@ If a diagonal `dt`/`ToT` selection is used, `--dt-tot-cut-direction below`
 keeps `dt <= DT0 + SLOPE*ToT` and is the default; use `above` only to keep the
 opposite side of the line.
 
+The default timewalk model is now `inverse-power`. The macro fills the raw
+`TH2D(dt vs ToT)`, builds a `TProfile` along ToT, and fits the profile with:
+
+```text
+f(ToT) = p0 + p1 / pow(ToT - p2, p3)
+```
+
+The applied correction is `t_corr = t_raw - f(ToT)`. The default fit range is
+`17:10:30,19:10:30`, so that the effective threshold parameter `p2` stays below
+the fit domain. If the free-exponent fit fails or has poor covariance quality,
+the macro retries with `p3 = 1`. The older models remain selectable with
+`--timewalk-fit-model pol1`, `pol1-plateau`, or `lin-exp-plateau`.
+
 ```bash
 script/run_timewalk_calibration.sh \
   --mode trigger \
@@ -154,6 +167,10 @@ script/run_timewalk_calibration.sh \
 ```
 
 This second mode does not extract an absolute timewalk correction by itself. Without a timing reference, `ToT(intensity)` is observable, but the absolute leading-edge delay versus `ToT` is underconstrained.
+
+The timewalk ROOT output stores the raw `TH2D`, the `TProfile`, the fitted
+`TF1`, corrected `TH2D` maps, and before/after `dt` projections. The PDF puts
+the main results first and the cut/trigger diagnostics at the end.
 
 Practical options for the future 8-channel setup:
 

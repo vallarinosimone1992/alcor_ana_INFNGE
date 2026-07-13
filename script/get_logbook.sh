@@ -21,6 +21,7 @@ script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 qa_dir="${ALCOR_ANA_GE:-$(cd "${script_dir}/.." && pwd)}"
 url="https://docs.google.com/spreadsheets/d/1tWsHLoS6gbMfNyLN3z7DKl7RX0N3hX3YGDwn4ahgZuA/export?format=csv"
 output="${qa_dir}/config/logbook.csv"
+output_set=0
 json_output=""
 write_json=1
 from_csv=""
@@ -51,10 +52,12 @@ while [ "$#" -gt 0 ]; do
     -o|--output)
       need_arg "$@"
       output=${2:-}
+      output_set=1
       shift 2
       ;;
     --output=*)
       output=${1#*=}
+      output_set=1
       shift
       ;;
     -j|--json-output)
@@ -88,6 +91,10 @@ while [ "$#" -gt 0 ]; do
 done
 
 if [ -n "${from_csv}" ]; then
+  if [ "${output_set}" -eq 1 ]; then
+    echo "--output cannot be used together with --from-csv; pass --json-output for the converted JSON path" >&2
+    exit 1
+  fi
   output="${from_csv}"
   if [ ! -s "${output}" ]; then
     echo "CSV logbook not found: ${output}" >&2
